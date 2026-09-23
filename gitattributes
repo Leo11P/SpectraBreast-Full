@@ -1,0 +1,10 @@
+# Force LF line endings for scripts, regardless of the checking-out OS's
+# core.autocrlf setting. Shell scripts with CRLF endings fail on Linux
+# (Mufasa) with errors like "$'\r': command not found".
+*.sh    text eol=lf
+*.def   text eol=lf
+*.py    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf

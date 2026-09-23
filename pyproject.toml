@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spectra"
+version = "0.2.0"
+description = "Unified pipeline: MASt3R-SfM 3D reconstruction (Vision) + HSI→Mesh registration."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "SpectraBreast" }]
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pyyaml>=6.0",
+    "pyaml>=25.0",
+    "pydantic>=2.8",
+    "typer>=0.12",
+    "rich>=13.0",
+    "tqdm>=4.66",
+    "trimesh>=4.0",
+    "rtree>=1.0",
+    "pillow>=10.0",
+    "einops>=0.8",
+    "gradio>=6.0",
+    "huggingface-hub>=0.20",
+    "jaxtyping>=0.3",
+    "open3d>=0.19",
+    "opencv-contrib-python>=4.8",
+    "rerun-sdk>=0.30",
+    "roma>=1.5",
+    "safetensors>=0.4",
+    "textual>=0.60",
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "openpyxl>=3.1",
+    "pip>=26.1.2",
+]
+
+[project.optional-dependencies]
+gpu-raycast = ["cupy-cuda12x>=12.0"]
+
+[project.scripts]
+spectra = "spectra.cli:main"
+
+[tool.setuptools]
+packages = [
+    "spectra",
+    "spectra.vision",
+    "spectra.vision.backends",
+    "spectra.registration",
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130" }
+]
+torchvision = [
+  { index = "pytorch-cu130" }
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

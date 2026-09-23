@@ -1,0 +1,268 @@
+# =============================================================================
+# SPECTRA — UNIFIED CONFIG (vision + registration)
+# =============================================================================
+# LAYOUT CONVENTION
+#
+#   Inputs — stage first, sample second. Identical for every registration
+#   mode, batch included.
+#
+#     DATA/
+#       input_vision/<sample>[_<device>]/    e.g. SB021_iphone, SB021_realsense
+#         rgb/                               images (or directly in the folder)
+#         poses/                             optional — pose_0000.txt, ...
+#         camera_parameters/                 optional — intrinsics.npy, ...
+#       input_registration/<sample>/
+#         <sample>_raw.hdr                   ENVI cube (+ its .img/.raw)
+#         <sample>_raw.png                   ROI mode only
+#
+#   When several `<sample>_*` vision folders exist, the suffix containing
+#   "iphone" wins; otherwise the first alphabetically.
+#
+#   Outputs — grouped by run date, then by sample.
+#
+#     RESULTS/<dd-mm-yyyy>/<sample>/vision/
+#     RESULTS/<dd-mm-yyyy>/<sample>/registration/
+#     RESULTS/<dd-mm-yyyy>/_batch/batch_summary.xlsx
+#
+#   Re-running any command on the same day OVERWRITES that day's stage folder.
+#
+# ABSOLUTE PATHS
+#
+#   Every path below is auto-derived from `sample_name` while it is `null`.
+#   Set any of them — relative or absolute — and that value is used verbatim
+#   and never rewritten. The convention is a default, not a constraint.
+#
+# UNITS
+#
+#   Marker lengths are in MILLIMETRES everywhere. Render resolutions are in
+#   mm/px. The 3D pipeline works internally in metres and converts at the
+#   boundary.
+# =============================================================================
+
+# Sample being processed. Drives every auto-derived path — spell it exactly as
+# the folder names under DATA/.
+sample_name: "SAMPLE1"
+
+# Roots that drive default path resolution. Relative (from cwd) or absolute.
+data_root:    "DATA"
+results_root: "RESULTS"
+
+# Run-date folder inserted between results_root and sample_name, dd-mm-yyyy.
+# null = today. Pin an earlier date to run registration against that day's
+# vision outputs.
+results_date: null
+
+# Which stage(s) `spectra full` runs. The standalone sub-commands
+# `spectra vision` and `spectra registration` ignore this.
+stages: ["vision", "registration"]
+
+# =============================================================================
+# VISION (MASt3R-SfM + ArUco)
+# =============================================================================
+vision:
+  input:
+    # null → derived from sample_name:
+    #   rgb_dir           = DATA/input_vision/<sample>[_<device>]/rgb
+    #                       (or the sample folder itself if it holds images)
+    #   pose_dir          = DATA/input_vision/<sample>[_<device>]/poses
+    #   camera_params_dir = DATA/input_vision/<sample>[_<device>]/camera_parameters
+    # pose_dir and camera_params_dir are only filled in if the folder exists.
+    rgb_dir:           null
+    pose_dir:          null
+    camera_params_dir: null
+
+  output:
+    # null → RESULTS/<dd-mm-yyyy>/<sample>, with run_name "vision", i.e.
+    #        RESULTS/<dd-mm-yyyy>/<sample>/vision/
+    root:                        null
+    run_name:                    null
+    update_most_recent_symlink:  false
+    z_axis_points_down:          true
+    # Replace an existing run folder instead of suffixing it _01, _02, ...
+    # Keep this true: the next stage reads the mesh from the un-suffixed path.
+    overwrite_existing_run:      true
+    # Delete the large intermediate .mast3r_sfm_cache/ when the run finishes.
+    clean_sfm_cache:             true
+
+  aruco:
+    # Case-insensitive; normalized to lowercase. Registration inherits it.
+    dictionary:             4x4_50
+    # PHYSICAL marker edge length in MILLIMETRES. Single source of truth for
+    # the whole pipeline — this sets the metric scale of the reconstruction,
+    # and registration inherits it. Measure it properly.
+    marker_edge_length_mm:  25.0
+    origin_marker_id:       null
+    min_views_per_marker:   2
+    align_to_aruco:         true
+    max_sim3_scale_deviation_when_poses_known: 0.05
+    detection_draw_scale:   2.0
+    bundle_adjustment:      false
+    ba_max_iters:           1000
+    ba_lr:                  0.005
+    ba_huber_delta_px:      2.0
+    ba_cam_prior_sigma_m:   0.10
+    ba_cam_prior_sigma_deg: 5.0
+    reject_views_by_alignment_error: false
+    max_view_alignment_reproj_rmse_px: 15.0
+    min_kept_views: 2
+    reject_views_with_no_markers: false
+
+  surface:
+    grid_step: 0.0
+    fill_iters: 2
+    smooth_iters: 2
+    min_neighbors: 3
+    max_resolution: 3072
+    conf_threshold_percentile: 50.0
+
+  mast3r:
+    # Hugging Face repo id (downloaded on first run) or a local .pth path.
+    model_name: naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric
+    pipeline_variant: sfm
+    scene_graph: auto
+    # Only needed when scene_graph contains "retrieval".
+    retrieval_model: null
+    sfm_subsample: 4
+    sfm_lr1: 0.07
+    sfm_niter1: 300
+    sfm_lr2: 0.01
+    sfm_niter2: 300
+    sfm_opt_depth: true
+    sfm_shared_intrinsics: true
+    sfm_matching_conf_thr: 5.0
+    sfm_min_conf_thr: 1.5
+    sfm_clean_depth: true
+    image_size: 512
+    neighbor_window: 2
+    desc_conf_thr: 0.1
+    dense_conf_thr: 12.0
+    voxel_size: 0.0012
+    max_points: 2000000
+    pixel_tol: 1.5
+    max_matches_per_pair: 50000
+    pose_refine_iters: 1
+    pose_refine_lr: 0.0
+    pose_refine_lr_min: 1.0e-05
+    pose_prior_sigma_deg: 1.0
+    pose_prior_sigma_m: 0.01
+    pose_prior_weight: 0.06
+    pose_refine_log_every: 25
+    pose_refine_max_drot_deg: 8.0
+    pose_refine_max_dt_m: 0.06
+    dense_refine_iters: 1
+    dense_refine_lr: 0.0
+    confidence_percentile: 99.0
+
+  rerun:
+    # Keep false for SLURM / batch jobs: Rerun blocks on a viewer connection.
+    enabled: false
+    grpc_port: 9876
+    no_wait: false
+    log_cloud_rgb: false
+    log_cloud_confidence: false
+    log_cameras: false
+    log_camera_aruco_images: false
+    log_camera_confidence_images: false
+    log_aruco_3d: false
+    log_surface_mesh: false
+    log_surface_cloud_open3d_web: false
+    open3d_web_visualizer_port: 8888
+    open3d_web_show_ui: false
+    pointcloud_resample_factor: 0.25
+    save_rrd: false
+    save_rbl: false
+    rerun_subdir: rerun
+    rrd_basename: spectra.rrd
+    rbl_basename: spectra.rbl
+
+# =============================================================================
+# REGISTRATION (HSI → mesh)
+# =============================================================================
+registration:
+  # Execution mode.
+  #   single : standard pipeline — ArUcos visible in the HSI cube itself
+  #   roi    : dual HSI — LiveView PNG with ArUcos + ROI cube without them
+  #   batch  : every sample under DATA/input_registration/
+  #   sweep  : one run per (res_reg, res_pc) pair, best pair kept
+  mode: "single"
+
+  # null → derived from sample_name + results_date:
+  #   hsi_hdr      = DATA/input_registration/<sample>/<sample>_raw.hdr
+  #   liveview_png = DATA/input_registration/<sample>/<sample>_raw.png  (ROI only)
+  #   mesh         = RESULTS/<dd-mm-yyyy>/<sample>/vision/surface_mesh.ply
+  #   aruco_json   = RESULTS/<dd-mm-yyyy>/<sample>/vision/aruco_markers_3d.json
+  #   output_dir   = RESULTS/<dd-mm-yyyy>/<sample>/registration
+  #
+  # mesh / aruco_json fall back to the most recent dated vision run when the
+  # current date has none, so registration-only runs keep working.
+  paths:
+    hsi_hdr:      null
+    mesh:         null
+    aruco_json:   null
+    liveview_png: null
+    output_dir:   null
+
+  detection:
+    hsi_extraction_method: "mean"     # "mean" | "visible_band" | "pca"
+    # Both of these are INHERITED from vision.aruco when null. Set them only
+    # to deliberately override — they describe the same physical markers.
+    aruco_dict:            null       # null → vision.aruco.dictionary
+    marker_edge_length_mm: null       # null → vision.aruco.marker_edge_length_mm
+    use_subpix:            true
+    subpix_winsize:        2
+    equalize_method:       "clahe"    # "global" | "clahe" | "none"
+    tune_detector:         true       # permissive DetectorParameters
+
+  roi:
+    method:         "sift"
+    min_matches:    20
+    ransac_thresh:  3.0
+    lowe_ratio:     0.75
+    fallback_orb:   true
+    save_match_viz: true
+
+  render:
+    resolution_mm_per_px:     0.5   # final mesh / point-cloud resolution
+    resolution_reg_mm_per_px: 1.0   # resolution used for registration only
+    margin_mm:                10.0
+    ray_chunk_size:           16384
+    face_chunk_size:          2048
+    sort_rays_for_culling:    true
+
+  pointcloud:
+    border_px:        2
+    reflectance_norm: true
+    pc_chunk_size:    100000
+
+  export:
+    # All false writes diagnostics only — no point cloud on disk.
+    save_pointcloud: true
+    ply:             true
+    npy:             true
+    csv:             false
+    csv_max_points:  500000
+    save_images:     true
+
+  # ------------------------------------------------------------------
+  # mode == "batch"
+  # Scans DATA/input_registration/<sample>/<sample>_raw.hdr. Mesh + ArUco come
+  # from RESULTS/<dd-mm-yyyy>/<sample>/vision/. Aggregate Excel lands in
+  # RESULTS/<dd-mm-yyyy>/_batch/batch_summary.xlsx.
+  # ------------------------------------------------------------------
+  batch:
+    roi_mode:        false   # true → look for <sample>_raw.png next to the .hdr
+    # Optional regex filter on sample folder names (e.g. "^SB\\d+").
+    sample_regex:    null
+
+  # ------------------------------------------------------------------
+  # mode == "sweep"
+  # Each [res_reg, res_pc] pair in mm/px. The winning pair is re-run into
+  # registration/ so the final artifacts belong to it.
+  # ------------------------------------------------------------------
+  sweep:
+    roi_mode: false
+    resolution_pairs:
+      - [5.0, 0.5]
+      - [2.0, 0.5]
+      - [1.0, 0.5]
+      - [0.5, 0.5]
