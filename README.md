@@ -425,11 +425,32 @@ Checkerboard intrinsic calibration. Writes `intrinsics.npy` and
 | `--checkerboard-rows` INT | `7` | Inner corners per column |
 | `--square-size-m` FLOAT | `0.024` | Square edge in metres |
 
+### `spectra acquire`
+
+Fairino FR5 + RealSense acquisition with visual servoing, through the `spectra`
+console script. Same behaviour as `acquire.py` below, but it needs the full
+environment of §1.3 (the `spectra` package imports torch / MASt3R).
+
+```bash
+uv run spectra acquire --mode verify
+uv run spectra acquire --mode dry-run
+uv run spectra acquire --sample SB021
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-c`, `--config` PATH | `configs/default.yaml` | Unified YAML (needs an `acquisition:` section) |
+| `-m`, `--mode` TEXT | `run` | `run` \| `verify` \| `dry-run` \| `reset` (see `--verify` / `--dry-run` / `--reset` below) |
+| `--sample` TEXT | from YAML | Override `sample_name`; output goes to `DATA/input_vision/<sample>/` |
+| `--ip` TEXT | `acquisition.robot.ip` | Robot controller IP |
+| `--no-viz` | off | Disable the Rerun viewer |
+| `--overwrite` | off | Replace an existing acquisition for the same sample |
+
 ### `acquire.py` (robotic acquisition)
 
-Fairino FR5 + RealSense acquisition with visual servoing. Runs on the robot PC,
-not through the `spectra` console script, and does not import the `spectra`
-package (no torch / MASt3R needed there). Invoke it from the repo root:
+The same acquisition as a standalone script. Runs on the robot PC without
+importing the `spectra` package (no torch / MASt3R needed there, see §1.7).
+Invoke it from the repo root:
 
 ```bash
 python spectra/acquisition/acquire.py --config configs/default.yaml --verify

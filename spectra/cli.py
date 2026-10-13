@@ -8,6 +8,7 @@ Top-level commands::
     spectra detect        # standalone 2D ArUco detection (unchanged)
     spectra viewer        # local 3D viewer (unchanged)
     spectra calibrate-intrinsics  # checkerboard calibration (unchanged)
+    spectra acquire       # robotic acquisition (Fairino FR5 + RealSense)
 
 `vision` and `recon` are aliases. Vision-only YAML configs from the legacy
 repo (top-level fields without a `vision:` wrapper) are still accepted by
@@ -228,6 +229,61 @@ def full_cmd(
     from .orchestrator import run_full
 
     run_full(cfg, force_cpu=force_cpu, force_vision=force_vision, dry_run=dry_run)
+
+
+# =============================================================================
+# acquire — thin wrapper around spectra/acquisition/acquire.py
+# =============================================================================
+
+_ACQUIRE_MODES = {
+    "run": [],                 # full acquisition (robot moves)
+    "verify": ["--verify"],    # check the transformation chain, robot does not move
+    "dry-run": ["--dry-run"],  # bootstrap + pose generation, robot does not move
+    "reset": ["--reset"],      # reset robot errors and exit
+}
+
+
+@app.command("acquire")
+def acquire_cmd(
+    config: Path = typer.Option(Path("configs/default.yaml"), "--config", "-c", exists=True,
+                                readable=True, help="Unified YAML (needs an `acquisition:` section)."),
+    mode: str = typer.Option("run", "--mode", "-m",
+                             help="run | verify | dry-run | reset"),
+    sample: Optional[str] = typer.Option(None, "--sample",
+                                          help="Override sample_name: output in DATA/input_vision/<sample>/."),
+    ip: Optional[str] = typer.Option(None, "--ip", help="Robot controller IP (default: acquisition.robot.ip)."),
+    no_viz: bool = typer.Option(False, "--no-viz", help="Disable the Rerun viewer."),
+    overwrite: bool = typer.Option(False, "--overwrite",
+                                    help="Replace an existing acquisition for the same sample."),
+) -> None:
+    """Robotic acquisition: same behaviour as `python spectra/acquisition/acquire.py`."""
+    if mode not in _ACQUIRE_MODES:
+        raise typer.BadParameter(f"--mode must be one of {list(_ACQUIRE_MODES)}, got {mode!r}")
+    argv = ["--config", str(config), *_ACQUIRE_MODES[mode]]
+    if sample:
+        argv += ["--sample", sample]
+    if ip:
+        argv += ["--ip", ip]
+    if no_viz:
+        argv.append("--no-viz")
+    if overwrite:
+        argv.append("--overwrite")
+
+    # acquire.py is a standalone script (flat sibling imports, robot SDK in its
+    # folder): load it by path and hand it the equivalent argv.
+    import importlib.util
+    import sys
+
+    script = Path(__file__).resolve().parent / "acquisition" / "acquire.py"
+    spec = importlib.util.spec_from_file_location("spectra_acquire_script", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    old_argv = sys.argv
+    sys.argv = [str(script), *argv]
+    try:
+        module.main()
+    finally:
+        sys.argv = old_argv
 
 
 # =============================================================================
