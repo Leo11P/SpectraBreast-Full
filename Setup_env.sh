@@ -1,10 +1,10 @@
 #!/bin/bash
-# setup_env.sh — da eseguire UNA VOLTA sul nodo di login di Mufasa (NON via sbatch)
+# Setup_env.sh — da eseguire UNA VOLTA sul nodo di login di Mufasa (NON via sbatch)
 # Crea il virtual environment uv usando mast3r e asmk gia' clonati DENTRO la repo.
 #
 # Uso:
-#   cd ~/SpectraBreast-Vision
-#   bash setup_env.sh
+#   cd ~/SpectraBreast-Full
+#   bash Setup_env.sh
 
 set -euo pipefail
 
@@ -14,7 +14,7 @@ echo "  User    : ${USER}"
 echo "  Start   : $(date)"
 echo "=============================================="
 
-REPO_DIR="${HOME}/SpectraBreast-Vision"
+REPO_DIR="${HOME}/SpectraBreast-Full"
 cd "${REPO_DIR}"
 
 # --- Cache nella home (mai in /tmp) ------------------------------------------

@@ -47,8 +47,8 @@ configurable.
 ### 1.1 Clone the repo
 
 ```bash
-git clone https://github.com/Leo11P/SpectraBreast-Vision.git
-cd SpectraBreast-Vision
+git clone https://github.com/Leo11P/SpectraBreast-Full.git
+cd SpectraBreast-Full
 ```
 
 ### 1.2 Clone MASt3R and ASMK into the repo
@@ -64,7 +64,7 @@ git clone https://github.com/jenicek/asmk.git mast3r/asmk
 Resulting layout:
 
 ```
-SpectraBreast-Vision/
+SpectraBreast-Full/
   mast3r/
     dust3r/
       croco/
@@ -96,8 +96,8 @@ uv run pip install -e mast3r/asmk
 ### 1.5 Make `mast3r` importable outside the pipeline
 
 The pipeline injects `mast3r/` into `sys.path` itself, so this step is not
-needed to *run* the pipeline. It **is** needed for `preflight_check.sh` and for
-any interactive `import mast3r`:
+needed to *run* the pipeline. It **is** needed for any interactive
+`import mast3r` (e.g. from a Python shell or a notebook):
 
 ```bash
 uv run pip install -e mast3r/ --no-deps
@@ -106,7 +106,7 @@ uv run pip install -e mast3r/ --no-deps
 Alternatively, put it on `PYTHONPATH` permanently:
 
 ```bash
-echo 'export PYTHONPATH="$HOME/SpectraBreast-Vision/mast3r:$HOME/SpectraBreast-Vision/mast3r/dust3r:$PYTHONPATH"' >> ~/.bashrc
+echo 'export PYTHONPATH="$HOME/SpectraBreast-Full/mast3r:$HOME/SpectraBreast-Full/mast3r/dust3r:$PYTHONPATH"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
@@ -145,6 +145,65 @@ never used, and `vision.mast3r.retrieval_model` can stay `null`. If you do
 enable retrieval, set it to the ASMK codebook checkpoint path or the pipeline
 raises at pair-construction time.
 
+### 1.7 Robotic acquisition assets (robot PC only)
+
+Only needed on the PC that drives the robot (`acquire.py`). Vision and
+Registration never use them, so skip this on Mufasa.
+
+The robot PC does **not** need the full environment of §1.3 (no torch, no
+MASt3R): `acquire.py` never imports the `spectra` package. A plain virtual
+environment with these packages is enough:
+
+```bash
+python -m venv .venv-acq
+.venv-acq\Scripts\activate            # Windows  (Linux: source .venv-acq/bin/activate)
+pip install "numpy>=1.24" "opencv-python>=4.8" "PyYAML>=6.0" "pyrealsense2>=2.54" \
+            "trimesh>=4.0" "python-fcl>=0.7" "rerun-sdk>=0.20"
+```
+
+`pyrealsense2` drives the RealSense, `trimesh` + `python-fcl` the collision
+checks, `rerun-sdk` the live viewer. The Fairino SDK is not on PyPI: it is the
+`Robot.py` copied below (pure Python, standard library only).
+
+The Fairino Python SDK and the FR5 URDF + meshes are **not** committed (they
+are in `.gitignore`), so copy them into `spectra/acquisition/` by hand, e.g.
+from the lab copy in `Fairino/VisuoServoing/`:
+
+```bash
+# Fairino Python SDK — only Robot.py is needed (no __init__.py, no build/)
+mkdir -p spectra/acquisition/fairino
+cp <FAIRINO>/fairino/Robot.py spectra/acquisition/fairino/
+
+# FR5 URDF + meshes — keep the fairino_description/ folder name, the URDF
+# references its meshes as package://fairino_description/meshes/...
+mkdir -p spectra/acquisition/fairino_description/urdf spectra/acquisition/fairino_description/meshes
+cp <FAIRINO>/fairino_description/urdf/fairino5_v6.urdf spectra/acquisition/fairino_description/urdf/
+cp -r <FAIRINO>/fairino_description/meshes/fairino5_v6 spectra/acquisition/fairino_description/meshes/
+```
+
+Resulting layout:
+
+```
+spectra/acquisition/
+  acquire.py
+  ...
+  fairino/
+    Robot.py
+  fairino_description/
+    urdf/
+      fairino5_v6.urdf
+    meshes/
+      fairino5_v6/
+        base_link.STL  shoulder_link.STL  upperarm_link.STL  forearm_link.STL
+        wrist1_link.STL  wrist2_link.STL  wrist3_link.STL
+```
+
+The paths are not configurable by default: `acquire.py` imports `fairino` from
+its own folder, and collision checks + Rerun viz look for
+`fairino_description/` there. To keep URDF + meshes elsewhere, set
+`acquisition.collision.repo_dir` and `acquisition.viz.repo_dir` to the folder
+that **contains** `fairino_description/`.
+
 ---
 
 ## 2. Mufasa Setup
@@ -167,8 +226,8 @@ clone them first — same commands as [1.1](#11-clone-the-repo) and
 
 ```bash
 cd ~
-git clone https://github.com/Leo11P/SpectraBreast-Vision.git
-cd SpectraBreast-Vision
+git clone https://github.com/Leo11P/SpectraBreast-Full.git
+cd SpectraBreast-Full
 git clone --recursive https://github.com/naver/mast3r.git mast3r
 git clone https://github.com/jenicek/asmk.git mast3r/asmk
 ```
@@ -179,7 +238,7 @@ git clone https://github.com/jenicek/asmk.git mast3r/asmk
 bash Setup_env.sh        # run on the LOGIN node, NOT via sbatch
 ```
 
-`Setup_env.sh` assumes the repo is exactly at `~/SpectraBreast-Vision`. It
+`Setup_env.sh` assumes the repo is exactly at `~/SpectraBreast-Full`. It
 installs `uv` if absent (no `sudo` needed), checks that `mast3r/` and
 `mast3r/asmk/` exist, runs `uv sync`, installs the MASt3R and dust3r
 requirements, cythonizes and installs ASMK, then smoke-tests `torch`, CUDA
@@ -212,7 +271,8 @@ This is the layout the auto-derivation in `spectra/orchestrator.py` expects:
 DATA/
 ├── input_vision/
 │   └── <sample>/
-│       ├── *.jpg | *.png | *.bmp | *.tif | *.tiff | *.webp   ← RGB images, directly here
+│       ├── rgb/                                              ← RGB images
+│       │   └── *.jpg | *.png | *.bmp | *.tif | *.tiff | *.webp
 │       ├── poses/                                            ← optional
 │       │   ├── pose_0000.txt
 │       │   ├── pose_0001.txt
@@ -228,31 +288,39 @@ DATA/
         └── <sample>_raw.png        ← LiveView RGB, ROI mode only
 ```
 
-
+- If `<sample>/` has no `rgb/` subfolder, the images are read directly from
+  `<sample>/`.
+- The vision folder may carry a device suffix, `<sample>_<device>/` (e.g.
+  `SB021_iphone`, `SB021_realsense`). An exact `<sample>/` wins; otherwise the
+  suffix containing `iphone`, otherwise the first alphabetically.
 
 ### 3.2 Layout for `batch` mode
 
-Batch discovery (`spectra/registration/batch.py`) uses a **different, flipped
-layout** — sample first, stage second:
+Batch discovery (`spectra/registration/batch.py`) uses the **same** layout as
+§3.1: it scans every subdirectory of `DATA/input_registration/`:
 
 ```
 DATA/
-└── <sample>/
-    └── input_registration/
+└── input_registration/
+    └── <sample>/
         ├── <sample>_raw.hdr
         └── <sample>_raw.png        ← only when registration.batch.roi_mode: true
 ```
 
-Batch scans every immediate subdirectory of `data_root`, optionally filtered by
-`registration.batch.sample_regex`, and skips any sample missing its `.hdr`,
-`surface_mesh.ply` or `aruco_markers_3d.json` (with a printed reason). Mesh and
-ArUco JSON are always read from `RESULTS/<sample>/vision/`.
+Samples are optionally filtered by `registration.batch.sample_regex`, and any
+sample missing its `.hdr`, `surface_mesh.ply` or `aruco_markers_3d.json` is
+skipped (with a printed reason). Mesh and ArUco JSON are read from
+`RESULTS/<dd-mm-yyyy>/<sample>/vision/` for `results_date` (today by default),
+falling back to the most recent dated run that has both files.
 
 ### 3.3 Pose file format
 
 One file per image, named `pose_*.txt`, sorted lexicographically and zipped
-against the sorted image list. Each file holds **6 whitespace-separated
-numbers** on one line:
+against the sorted image list. If the number of pose files differs from the
+number of images, **all** poses are ignored (Vision prints a `[WARNING]` and
+runs RGB-only SfM). Each file holds **6 whitespace-separated numbers** on one
+line — the **end-effector (flange)** pose in the world/robot-base frame, which
+Vision composes with `camera_parameters/camera2ee.npy` (identity if absent):
 
 ```
 X Y Z ROLL PITCH YAW
@@ -314,10 +382,76 @@ Vision → Registration on one sample.
 | `--force-vision` | off | Re-run Vision even if its outputs exist |
 | `--dry-run` | off | Print the plan, run nothing |
 
-**Vision is skipped automatically** when both `RESULTS/<sample>/vision/surface_mesh.ply`
-and `RESULTS/<sample>/vision/aruco_markers_3d.json` already exist. Use
+**Vision is skipped automatically** when both `RESULTS/<dd-mm-yyyy>/<sample>/vision/surface_mesh.ply`
+and `RESULTS/<dd-mm-yyyy>/<sample>/vision/aruco_markers_3d.json` already exist
+for `results_date` (today by default). Use
 `--force-vision` to override. Which stages run at all is also gated by the
 `stages:` list in the YAML — `spectra vision` and `spectra registration` ignore it.
+
+### `spectra detect`
+
+2D ArUco detection only (no reconstruction) — quick check that markers are
+visible in a folder of images.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `INPUT_FOLDER` | required | Folder of RGB images |
+| `OUTPUT_FOLDER` | required | Receives `json/` and `annotated/` |
+| `--dict` TEXT | `4x4_50` | ArUco dictionary |
+| `--draw-scale` FLOAT | `2.0` | Scale of the drawn markers in `annotated/` |
+
+### `spectra viewer`
+
+Local 3D viewer (Gradio) for the runs under a results folder.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-r`, `--results-dir` PATH | `RESULTS` | Folder to browse |
+| `--host` TEXT | `127.0.0.1` | Bind address |
+| `--port` INT | `7860` | Port |
+| `--share` / `--no-share` | off | Public Gradio link |
+| `--no-browser` | off | Do not open the browser |
+
+### `spectra calibrate-intrinsics`
+
+Checkerboard intrinsic calibration. Writes `intrinsics.npy` and
+`distortions.npy`, the files expected in `camera_parameters/` (§3.1).
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--image-dir` PATH | `checkerboard` | Checkerboard images |
+| `--output-dir` PATH | `intrinsics` | Output folder |
+| `--checkerboard-cols` INT | `10` | Inner corners per row |
+| `--checkerboard-rows` INT | `7` | Inner corners per column |
+| `--square-size-m` FLOAT | `0.024` | Square edge in metres |
+
+### `acquire.py` (robotic acquisition)
+
+Fairino FR5 + RealSense acquisition with visual servoing. Runs on the robot PC,
+not through the `spectra` console script, and does not import the `spectra`
+package (no torch / MASt3R needed there). Invoke it from the repo root:
+
+```bash
+python spectra/acquisition/acquire.py --config configs/default.yaml --verify
+python spectra/acquisition/acquire.py --config configs/default.yaml --dry-run
+python spectra/acquisition/acquire.py --config configs/default.yaml --sample SB021
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--config` PATH | `configs/default.yaml` | Unified YAML (needs an `acquisition:` section) |
+| `--sample` TEXT | from YAML | Override `sample_name`; output goes to `DATA/input_vision/<sample>/` |
+| `--ip` TEXT | `acquisition.robot.ip` | Robot controller IP |
+| `--verify` | off | Check the transformation chain, robot does not move |
+| `--dry-run` | off | Bootstrap + pose generation, robot does not move |
+| `--no-viz` | off | Disable the Rerun viewer |
+| `--overwrite` | off | Replace an existing acquisition for the same sample |
+| `--reset` | off | Reset robot errors and exit |
+
+ArUco dictionary and marker edge length are read from `vision.aruco`. The
+Fairino SDK (`spectra/acquisition/fairino/`) and the FR5 URDF + meshes
+(`spectra/acquisition/fairino_description/`) are not versioned: copy them there
+locally before running.
 
 ---
 
@@ -329,7 +463,7 @@ Requires a CUDA GPU for MASt3R-SfM. Registration falls back to CPU raycasting
 Either prefix everything with `uv run`:
 
 ```bash
-cd ~/SpectraBreast-Vision
+cd ~/SpectraBreast-Full
 uv run spectra full --config configs/default.yaml
 ```
 
@@ -393,7 +527,7 @@ scancel <jobid>
 
 ```bash
 # from your local machine
-rsync -avz mufasa:~/SpectraBreast-Vision/RESULTS/SB021/ ./RESULTS/SB021/
+rsync -avz mufasa:~/SpectraBreast-Full/RESULTS/<dd-mm-yyyy>/SB021/ ./RESULTS/<dd-mm-yyyy>/SB021/
 ```
 
 Pull just the small artifacts (Excel reports, PNGs, JSON) when the point clouds
@@ -403,44 +537,49 @@ aren't needed — a full run's `RESULTS/` can be several GB.
 
 ## 7. Outputs
 
-Everything goes under `RESULTS/<sample>/`, one subfolder per stage.
+Everything goes under `RESULTS/<dd-mm-yyyy>/<sample>/`, one subfolder per
+stage. The date folder is the run day (or `results_date` when set); re-running
+the same stage on the same day overwrites it.
 
 ```
 RESULTS/
-└── SB021/
-    ├── vision/
-    │   ├── surface_mesh.ply                    ← consumed by Registration
-    │   ├── aruco_markers_3d.json               ← consumed by Registration
-    │   ├── cloud.ply                           fused RGB point cloud (CloudCompare)
-    │   ├── cloud.npz                            points / colors / confidence
-    │   ├── surface.ply                         surface point cloud, with normals
-    │   ├── surface.npz                         surface arrays
-    │   ├── camera_poses_output_frame.npy       [V,4,4] camera poses, output frame
-    │   ├── intrinsics_original_frame.npy       [V,3,3] K at original resolution
-    │   ├── intrinsics_network_frame.npy        [V,3,3] K at network resolution
-    │   ├── sim3_to_output_frame.npy            4×4 Sim(3), backend → output frame
-    │   ├── aruco_bundle_adjustment.json        per-marker/per-view reproj RMSE (if BA on)
-    │   ├── reconstruction_metadata.json        run summary — read this first
-    │   ├── timings.json                        per-phase wall-clock
-    │   ├── run.yaml / run.json                 fully resolved config for this run
-    │   ├── aruco_detections/
-    │   │   ├── json/                           per-image 2D detections
-    │   │   └── annotated/                      images with markers drawn
-    │   └── rerun/
-    │       └── spectra.rrd                     Rerun recording (if rerun.save_rrd)
-    │
-    ├── registration/
-    │   ├── spectral_pointcloud_SB021.ply             spectral cloud (export.ply)
-    │   ├── spectral_pointcloud_SB021_xyz.bin         float32 memmap, (N,3)
-    │   ├── spectral_pointcloud_SB021_spectra.bin     float32 memmap, (N,bands)
-    │   ├── spectral_pointcloud_SB021_wavelengths.npy wavelengths in nm
-    │   ├── spectral_pointcloud_SB021_meta.npy        int64 [N,3,N,bands] — memmap shapes
-    │   ├── SB021_registration_errors.xlsx            2D/3D errors + Timings sheet
-    │   ├── SB021_registration.png                    HSI + render overlay with ArUco
-    │   ├── SB021_coverage.png                        HSI → mesh coverage map
-    │   ├── SB021_render_pc_topview.png               orthographic top-view render
-    │   ├── SB021_render_pc_depth.npy                 depth map for that render
-    │   └── SB021_render_pc_turbo.png                 TURBO-colormapped depth
-    │
-    └── .mast3r_sfm_cache/                      intermediate SfM cache, safe to delete
+└── <dd-mm-yyyy>/
+    ├── _batch/batch_summary.xlsx               aggregate Excel (batch mode only)
+    └── SB021/
+        ├── vision/
+        │   ├── surface_mesh.ply                    ← consumed by Registration
+        │   ├── aruco_markers_3d.json               ← consumed by Registration
+        │   ├── cloud.ply                           fused RGB point cloud (CloudCompare)
+        │   ├── cloud.npz                            points / colors / confidence
+        │   ├── surface.ply                         surface point cloud, with normals
+        │   ├── surface.npz                         surface arrays
+        │   ├── camera_poses_output_frame.npy       [V,4,4] camera poses, output frame
+        │   ├── intrinsics_original_frame.npy       [V,3,3] K at original resolution
+        │   ├── intrinsics_network_frame.npy        [V,3,3] K at network resolution
+        │   ├── sim3_to_output_frame.npy            4×4 Sim(3), backend → output frame
+        │   ├── aruco_bundle_adjustment.json        per-marker/per-view reproj RMSE (if BA on)
+        │   ├── reconstruction_metadata.json        run summary — read this first
+        │   ├── timings.json                        per-phase wall-clock
+        │   ├── run.yaml / run.json                 fully resolved config for this run
+        │   ├── aruco_detections/
+        │   │   ├── json/                           per-image 2D detections
+        │   │   └── annotated/                      images with markers drawn
+        │   └── rerun/
+        │       └── spectra.rrd                     Rerun recording (if rerun.save_rrd)
+        │
+        ├── registration/
+        │   ├── spectral_pointcloud_SB021.ply             spectral cloud (export.ply)
+        │   ├── spectral_pointcloud_SB021_xyz.bin         float32 memmap, (N,3)
+        │   ├── spectral_pointcloud_SB021_spectra.bin     float32 memmap, (N,bands)
+        │   ├── spectral_pointcloud_SB021_wavelengths.npy wavelengths in nm
+        │   ├── spectral_pointcloud_SB021_meta.npy        int64 [N,3,N,bands] — memmap shapes
+        │   ├── SB021_registration_errors.xlsx            2D/3D errors + Timings sheet
+        │   ├── SB021_registration.png                    HSI + render overlay with ArUco
+        │   ├── SB021_coverage.png                        HSI → mesh coverage map
+        │   ├── SB021_render_pc_topview.png               orthographic top-view render
+        │   ├── SB021_render_pc_depth.npy                 depth map for that render
+        │   └── SB021_render_pc_turbo.png                 TURBO-colormapped depth
+        │
+        └── .mast3r_sfm_cache/                      intermediate SfM cache, safe to delete
+                                                    (removed automatically when vision.output.clean_sfm_cache: true)
 ```

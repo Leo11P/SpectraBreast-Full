@@ -254,6 +254,12 @@ class UnifiedConfig(BaseModel):
 
     vision:       VisionConfig       = Field(...)
     registration: RegistrationConfig = Field(default_factory=RegistrationConfig)
+    #: Robotic acquisition (``spectra/acquisition/acquire.py``). Kept as a
+    #: free-form mapping: it is consumed only by the acquisition script (which
+    #: runs on the robot PC) and never by vision/registration. ArUco dictionary
+    #: and marker edge length are NOT repeated here — acquisition reads them
+    #: from ``vision.aruco`` (single source of truth).
+    acquisition:  Optional[dict[str, Any]] = None
 
     @field_validator("results_date")
     @classmethod

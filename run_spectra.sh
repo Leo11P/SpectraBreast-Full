@@ -21,7 +21,7 @@ echo "  Node    : $(hostname)"
 echo "  Start   : $(date)"
 echo "=============================================="
 
-cd ~/SpectraBreast-Vision
+cd ~/SpectraBreast-Full
 
 export UV_CACHE_DIR="${HOME}/.cache/uv"
 export PIP_CACHE_DIR="${HOME}/.cache/pip"

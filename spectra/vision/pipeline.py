@@ -14,6 +14,7 @@ import importlib
 import json
 
 import os
+import sys
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -411,7 +412,20 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
         if cfg.rerun.save_rrd or cfg.rerun.save_rbl:
             rdir.mkdir(parents=True, exist_ok=True)
         rrd_path: Path | None = (rdir / cfg.rerun.rrd_basename).resolve() if cfg.rerun.save_rrd else None
-        init_rerun("Spectra_Reconstruction", int(cfg.rerun.grpc_port), rrd_path=rrd_path)
+        _log_flags = (
+            cfg.rerun.log_cloud_rgb, cfg.rerun.log_cloud_confidence, cfg.rerun.log_cameras,
+            cfg.rerun.log_camera_aruco_images, cfg.rerun.log_camera_confidence_images,
+            cfg.rerun.log_aruco_3d, cfg.rerun.log_surface_mesh,
+        )
+        if not any(_log_flags):
+            print("[yellow]Rerun: enabled, but every rerun.log_* flag is false: "
+                  "the recording will contain no data.[/yellow]")
+        init_rerun(
+            "Spectra_Reconstruction",
+            int(cfg.rerun.grpc_port),
+            rrd_path=rrd_path,
+            live_viewer=bool(cfg.rerun.live_viewer),
+        )
 
     _log_step("Step 2/6 - Detecting ArUco markers")
     _timer.begin("Step 2/6 - Detect ArUco markers")
@@ -750,7 +764,10 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
             confidence_percentile=cfg.mast3r.confidence_percentile,
             rerun_cfg=cfg.rerun,
         )
-        if not cfg.rerun.no_wait:
+        # Waiting only makes sense with a live viewer and a real terminal: under
+        # sbatch there is no stdin and input() would crash the run (EOFError).
+        interactive = sys.stdin is not None and sys.stdin.isatty()
+        if cfg.rerun.live_viewer and not cfg.rerun.no_wait and interactive:
             input("Data has been logged to Rerun. Open the viewer, then press Enter to exit.")
     print("Checking if we should log the surface cloud to Open3D")
     if cfg.rerun.log_surface_cloud_open3d_web:

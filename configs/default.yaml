@@ -57,6 +57,165 @@ results_date: null
 stages: ["vision", "registration"]
 
 # =============================================================================
+# ACQUISITION (Fairino FR5 + RealSense, visual servoing)
+# =============================================================================
+# Used only by `python spectra/acquisition/acquire.py` (robot PC). Vision and
+# registration ignore this section.
+#
+# Output: written straight into the folder Vision reads from, i.e.
+#   DATA/input_vision/<sample_name>/
+#     rgb/img_0001.png ...            RGB (8-bit, BGR->PNG)
+#     poses/pose_0001.txt ...         FLANGE pose in robot base: "x y z roll pitch yaw"
+#                                     (metres, radians, R = Rz(yaw) Ry(pitch) Rx(roll))
+#     camera_parameters/intrinsics.npy, distortions.npy, camera2ee.npy (hand-eye, metres),
+#                       intrinsics_source.json (factory or override, see camera.intrinsics)
+#     depth/, manifest.json, SHA256SUMS, _discarded/   (ignored by Vision)
+#
+# ArUco dictionary + marker edge length come from `vision.aruco` below: there
+# is exactly ONE value for the whole pipeline.
+acquisition:
+  robot:
+    ip: "192.168.58.2"
+    tool: 0            # 0 = flangia nuda (la hand-eye e' riferita alla flangia)
+    user: 0
+    vel: 10           # velocita' movimenti di raggiungimento (%) — TIENILA BASSA
+    dwell_s: 2.5       # sosta PRIMA DELLO SCATTO, solo DOPO che il servo ha
+                       # confermato la posa centrata (riduce il motion blur)
+    pointing_gate_deg: 15   # se alla 1a posa l'asse ottico e' oltre X deg dal
+                            # centroide -> ABORT (catena non corretta)
+    # Convenzione angoli [rx,ry,rz] del controller: 'AUTO' | 'XYZ' | 'ZYX'.
+    # 'AUTO' e' inaffidabile vicino al gimbal lock (determinala con --verify).
+    euler_order: ZYX
+
+  camera:
+    width: 1280
+    height: 800
+    fps: 10
+    n_avg_frames: 5
+    # Intrinsics used for solvePnP and saved into camera_parameters/.
+    #   null (default): RealSense factory intrinsics of the running color stream
+    #                   (always matching width/height).
+    #   override      : folder written by `spectra calibrate-intrinsics`
+    #                   (intrinsics.npy [+ distortions.npy]), an intrinsics.npy
+    #                   file, or a legacy JSON. Relative to the cwd. Aborts if it
+    #                   is >5% off the factory values (other resolution).
+    intrinsics: null
+    # MASTER depth: abilita lo STREAM depth della RealSense (allineato al color).
+    # Ogni layer decide col proprio 'depth:' se salvare la mappa depth.
+    depth: true
+
+  hand_eye:
+    # T_cam2gripper 4x4 (rotazione + traslazione in mm).
+    T_cam2gripper:
+    - [-0.0061915456, -0.0158428087, -0.9998553246, -72.2167749269]
+    - [ 0.9999753003,  0.0032277538, -0.0062434326,  10.2771824341]
+    - [ 0.0033262003, -0.9998692850,  0.0158224326,  25.3055715767]
+    - [ 0.0000000000,  0.0000000000,  0.0000000000,   1.0000000000]
+
+  camera_box:
+    # Ingombro fisico camera+adattatore (RealSense D456 + staffa): collisioni + viz.
+    length_mm: 124.0
+    width_mm: 26.0
+    height_mm: 29.0
+    support_extension_mm: 70.0
+    collision_margin_mm: 5.0
+
+  target:
+    n_bootstrap_frames: 8      # frame aggregati (mediana per-marker) nel bootstrap
+
+  visibility:
+    margin_px: 40
+    gimbal_lock_margin_deg: 8
+    margin_px_proportional: true
+    margin_ref_distance_mm: 150
+    margin_px_min: 25
+    margin_px_max: 180
+    min_marker_coverage: 0.0   # 0 = disattivato (solo centroide)
+
+  ik_retry:
+    enable: true
+    max_attempts: 24
+    roll_step_deg: 15
+    az_step_deg: 4
+    tilt_step_deg: 4
+    dist_frac: 0.06
+
+  servo:                       # ricentraggio closed-loop a ogni posa
+    enable: true
+    pixel_tol: 40
+    max_iters: 5
+    vel: 15
+    min_markers: 2
+    damping: 0.6
+    settle_before_detect_s: 0.4
+    detect_retries: 4
+
+  collision:
+    enable: true
+    floor_margin_mm: 5
+    sample_tol_mm: [30, 30, 15]
+    path_samples: 12
+    validate_tol_mm: 5.0
+    validate_tol_deg: 1.5
+    validate_n_random: 8
+    native_backstop: true
+    native_level: [7, 7, 7, 7, 7, 7]
+    native_strategy: 2
+    # floor_per_link_mm: {shoulder_link: 40}
+    # repo_dir: null            # default: spectra/acquisition (URDF/mesh/collision_fr5)
+
+  viz:
+    enable: true
+    prelude_s: 5.0
+    target_tol_mm: [30, 30, 15]
+    poll_hz: 20
+    frustum_len_m: 0.025
+    memory_limit: "512MB"
+    show_floor: true
+    show_camera_frame: true
+    show_collision_boxes: true
+    camera_pinhole_distance_m: 0.06
+    # repo_dir: null            # default: spectra/acquisition
+
+  # tilt_deg: 0 = top-down, 90 = laterale. depth: salva o meno la depth per il layer.
+  layers:
+    - name: depth acquisition
+      distance_mm: 600
+      tilt_deg: 10
+      n_poses: 4
+      azimuth_span_deg: 360
+      azimuth_start_deg: 0
+      roll_deg: 0
+      depth: true
+
+    - name: top_down
+      distance_mm: 150
+      tilt_deg: 20
+      n_poses: 4
+      azimuth_span_deg: 360
+      azimuth_start_deg: 0
+      roll_deg: 0
+      depth: false
+
+    - name: mid_oblique
+      distance_mm: 120
+      tilt_deg: 40
+      n_poses: 6
+      azimuth_span_deg: 360
+      azimuth_start_deg: 20
+      roll_deg: 0
+      depth: false
+
+    - name: close_frontal
+      distance_mm: 100
+      tilt_deg: 60
+      n_poses: 15
+      azimuth_span_deg: 360
+      azimuth_start_deg: 0
+      roll_deg: 0
+      depth: false
+
+# =============================================================================
 # VISION (MASt3R-SfM + ArUco)
 # =============================================================================
 vision:
@@ -88,7 +247,7 @@ vision:
     # Case-insensitive; normalized to lowercase. Registration inherits it.
     dictionary:             4x4_50
     # PHYSICAL marker edge length in MILLIMETRES. Single source of truth for
-    # the whole pipeline — this sets the metric scale of the reconstruction,
+    # the whole pipeline (acquisition bootstrap/servo included) — this sets the metric scale of the reconstruction,
     # and registration inherits it. Measure it properly.
     marker_edge_length_mm:  25.0
     origin_marker_id:       null
@@ -154,23 +313,27 @@ vision:
     confidence_percentile: 99.0
 
   rerun:
-    # Keep false for SLURM / batch jobs: Rerun blocks on a viewer connection.
+    # true -> record the run to RESULTS/<dd-mm-yyyy>/<sample>/vision/rerun/spectra.rrd
+    # (open it later with `rerun spectra.rrd`). Safe on SLURM: no viewer needed.
     enabled: false
+    # true ONLY with a Rerun viewer running on this machine (live streaming on
+    # grpc_port). Keep false on Mufasa.
+    live_viewer: false
     grpc_port: 9876
-    no_wait: false
-    log_cloud_rgb: false
-    log_cloud_confidence: false
-    log_cameras: false
-    log_camera_aruco_images: false
-    log_camera_confidence_images: false
-    log_aruco_3d: false
-    log_surface_mesh: false
+    no_wait: false          # live_viewer only: do not wait for Enter at the end
+    log_cloud_rgb: true
+    log_cloud_confidence: true
+    log_cameras: true
+    log_camera_aruco_images: true
+    log_camera_confidence_images: true
+    log_aruco_3d: true
+    log_surface_mesh: true
     log_surface_cloud_open3d_web: false
     open3d_web_visualizer_port: 8888
     open3d_web_show_ui: false
     pointcloud_resample_factor: 0.25
-    save_rrd: false
-    save_rbl: false
+    save_rrd: true
+    save_rbl: true
     rerun_subdir: rerun
     rrd_basename: spectra.rrd
     rbl_basename: spectra.rbl

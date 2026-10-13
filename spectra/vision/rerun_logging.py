@@ -34,8 +34,17 @@ def init_rerun(
     grpc_port: int,
     *,
     rrd_path: str | Path | None = None,
+    live_viewer: bool = False,
 ) -> None:
-    """Initialize Rerun; optionally also stream the recording to ``*.rrd`` (multi-sink when supported)."""
+    """Initialize Rerun.
+
+    ``live_viewer=False`` (default, safe on SLURM): record ONLY to ``rrd_path``.
+    No network connection, nothing to wait for; the file is complete as soon
+    as :func:`rerun_flush` returns. Without ``rrd_path`` nothing is recorded.
+
+    ``live_viewer=True``: stream to a Rerun viewer on ``grpc_port`` and, if
+    ``rrd_path`` is given, also to the ``*.rrd`` file (multi-sink).
+    """
     if not HAS_RERUN:
         return
     try:
@@ -47,6 +56,18 @@ def init_rerun(
     rrd = Path(rrd_path) if rrd_path is not None else None
     if rrd is not None:
         rrd.parent.mkdir(parents=True, exist_ok=True)
+    if not live_viewer:
+        if rrd is None:
+            from rich import print as rprint  # type: ignore[import-not-found]
+
+            rprint(
+                "[yellow]Rerun: enabled, but save_rrd=false and live_viewer=false: "
+                "nothing will be recorded.[/yellow]"
+            )
+            return
+        rr.save(str(rrd))
+        return
+    if rrd is not None:
         p = str(rrd)
         gurl = f"rerun+http://127.0.0.1:{port}/proxy"
         set_sinks = getattr(rr, "set_sinks", None)
@@ -180,10 +201,17 @@ def send_blueprint(
 def rerun_flush() -> None:
     if not HAS_RERUN:
         return
+    def _flush(fn) -> None:
+        # bounded wait: never hang the job on a sink that cannot be reached
+        try:
+            fn(timeout_sec=120.0)
+        except TypeError:  # older SDKs: no timeout argument
+            fn()
+
     try:
         flush_fn = getattr(rr, "flush", None)
         if callable(flush_fn):
-            flush_fn()
+            _flush(flush_fn)
             return
         for getter_name in ("get_data_recording", "get_global_data_recording"):
             getter = getattr(rr, getter_name, None)
@@ -191,10 +219,12 @@ def rerun_flush() -> None:
                 continue
             rec = getter()
             if rec is not None and hasattr(rec, "flush"):
-                rec.flush()
+                _flush(rec.flush)
                 return
-    except Exception:
-        pass
+    except Exception as exc:
+        from rich import print as rprint  # type: ignore[import-not-found]
+
+        rprint(f"[yellow]Rerun: flush failed ({exc!r}).[/yellow]")
 
 
 def log_camera(

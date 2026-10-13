@@ -338,8 +338,18 @@ class RerunConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = Field(default=True)
+    live_viewer: bool = Field(
+        default=False,
+        description=(
+            "Stream to a running Rerun viewer on grpc_port (and to the .rrd if save_rrd). "
+            "False = record only to the .rrd file: no network, safe on SLURM."
+        ),
+    )
     grpc_port: int = Field(default=9876, ge=1, le=65535)
-    no_wait: bool = Field(default=False, description="Do not block on user input after logging.")
+    no_wait: bool = Field(
+        default=False,
+        description="Do not block on user input after logging (only used with live_viewer in a terminal).",
+    )
     log_cloud_rgb: bool = Field(default=True, description="Log fused RGB cloud under /points.")
     log_cloud_confidence: bool = Field(
         default=True,

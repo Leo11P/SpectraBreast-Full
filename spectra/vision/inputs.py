@@ -134,6 +134,15 @@ def load_gt_cameras(
                 T_ee_cam_t = torch.as_tensor(cam2ee, dtype=torch.float32, device=dev)
                 T_ee_cam_batch = T_ee_cam_t.unsqueeze(0).repeat(num_images, 1, 1)
                 T_world_cam = torch.matmul(T_world_ee, T_ee_cam_batch).detach().cpu().numpy().astype(np.float32)
+            else:
+                # Poses are zipped to images by sorted order, so a count
+                # mismatch makes every pose unusable. Say so instead of
+                # silently falling back to RGB-only SfM.
+                print(
+                    f"[WARNING] {pose_dir}: found {len(pose_files)} pose_*.txt for "
+                    f"{num_images} images -> GT poses IGNORED, running RGB-only SfM "
+                    f"(scale from ArUco only). Pose files must match images 1:1."
+                )
 
     if camera_params_dir is not None:
         cparams = Path(camera_params_dir)

@@ -1,5 +1,6 @@
 .cursor
 .venv
+.venv-acq
 *.ckpt
 *.pth
 *.pt
@@ -16,3 +17,30 @@ logs/
 vggt/
 mast3r/
 asmk/
+
+# data (input / output)
+DATA/
+RESULTS/
+input_data/
+*.hdr
+*.raw
+*.img
+*.rrd
+*.rbl
+*.xlsx
+
+# weights / checkpoints
+checkpoints/
+*.safetensors
+*.onnx
+
+# robot SDK, URDF, meshes
+spectra/acquisition/fairino/
+spectra/acquisition/fairino_description/
+fairino/
+fairino_description/
+*.urdf
+*.stl
+*.STL
+*.dae
+*.pyd
