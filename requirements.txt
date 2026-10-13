@@ -153,3 +153,5 @@ wcwidth==0.6.0
 werkzeug==3.1.6
 widgetsnbextension==4.0.15
 zipp==3.23.0
+
+matplotib>=5
