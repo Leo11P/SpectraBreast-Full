@@ -41,7 +41,7 @@ from textual.widgets import (
     TextArea,
 )
 
-from .config import ReconstructionConfig, load_config
+from .config import ReconstructionConfig, load_config, with_default_marker_edge
 
 
 DEFAULT_YAML = """\
@@ -57,7 +57,6 @@ output:
 
 aruco:
   dictionary: 4x4_50
-  marker_edge_length_mm: 25.0
   origin_marker_id: null
   min_views_per_marker: 2
   align_to_aruco: true
@@ -204,8 +203,8 @@ class ReconstructionTUI(App[None]):
     def _parse_config(self) -> Optional[ReconstructionConfig]:
         try:
             data = yaml.safe_load(self._current_yaml()) or {}
-            return ReconstructionConfig.model_validate(data)
-        except (yaml.YAMLError, ValidationError) as exc:
+            return ReconstructionConfig.model_validate(with_default_marker_edge(data, "TUI config"))
+        except (yaml.YAMLError, ValidationError, ValueError) as exc:
             self.status_text = f"Config invalid: {exc}"
             self._log(f"[red]Config invalid:[/red] {exc}")
             return None

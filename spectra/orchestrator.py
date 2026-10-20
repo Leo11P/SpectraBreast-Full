@@ -11,11 +11,21 @@ Responsibilities
    outputs for the current run date already exist, the vision stage is
    skipped automatically (``--force-vision`` overrides).
 
-3. **Cross-stage I/O.** After vision runs, the orchestrator injects the
-   freshly-produced ``surface_mesh.ply`` and ``aruco_markers_3d.json`` into
-   the registration config, along with the single source of truth for the
-   ArUco marker size and dictionary, so registration always sees the right
-   inputs.
+3. **Cross-stage I/O.** Which vision run registration consumes
+   (``surface_mesh.ply`` + ``aruco_markers_3d.json``), unless the user set
+   ``registration.paths.mesh`` / ``aruco_json`` explicitly:
+
+   * ``spectra full`` with the vision stage: exactly the run that vision just
+     produced (or, when vision was skipped, the run for this date that caused
+     the skip). Never a fallback: if those files are missing, it is an error.
+   * ``spectra registration`` (or ``full`` without the vision stage): this
+     date's run if complete, else the most recent dated run that is, with a
+     visible warning naming the run that was picked.
+
+   The ArUco marker edge length has ONE source: ``vision.aruco.marker_edge_length_mm``.
+   Registration always inherits it (setting it under ``registration:`` is
+   rejected), and refuses a vision run whose ``aruco_markers_3d.json`` was
+   built with a different edge length.
 
 Layout convention
 =================
@@ -51,6 +61,8 @@ ignore the convention entirely.
 
 from __future__ import annotations
 
+import json
+import math
 import time
 from datetime import datetime
 from pathlib import Path
@@ -250,6 +262,33 @@ def vision_outputs_present(
     return vision_dir_complete(vision_output_dir(results_root, sample, date))
 
 
+def check_marker_edge(aruco_json: Path, marker_edge_length_mm: float) -> None:
+    """Refuse a vision run reconstructed with a different marker edge length.
+
+    The mesh and the 3D markers are metric-scaled by the edge length vision
+    used (recorded as ``edge_length_m`` in ``aruco_markers_3d.json``), so
+    registering them against a different ``vision.aruco.marker_edge_length_mm``
+    would silently mix two scales.
+    """
+    aruco_json = Path(aruco_json)
+    if not aruco_json.is_file():
+        return  # reported as missing by the registration input validation
+    recorded_m = json.loads(aruco_json.read_text(encoding="utf-8")).get("edge_length_m")
+    if recorded_m is None:
+        raise ValueError(
+            f"{aruco_json} does not record the marker edge length (edge_length_m); "
+            "re-run vision for this sample."
+        )
+    recorded_mm = float(recorded_m) * 1000.0
+    if not math.isclose(recorded_mm, float(marker_edge_length_mm), rel_tol=1e-6):
+        raise ValueError(
+            f"Marker edge mismatch: the vision run {aruco_json.parent} was built with "
+            f"{recorded_mm:g} mm markers, but vision.aruco.marker_edge_length_mm is "
+            f"{float(marker_edge_length_mm):g} mm. Re-run vision for this sample, or "
+            "point registration at a vision run made with the same marker size."
+        )
+
+
 # =============================================================================
 # Path resolution
 # =============================================================================
@@ -263,15 +302,29 @@ def _is_unset(value: Any) -> bool:
     return False
 
 
-def resolve_unified_paths(cfg: UnifiedConfig) -> UnifiedConfig:
+def resolve_unified_paths(
+    cfg: UnifiedConfig,
+    *,
+    vision_dir: Optional[Path] = None,
+    resolve_vision_handoff: bool = True,
+) -> UnifiedConfig:
     """Fill in every unset path and inherited marker parameter.
 
     Covers ``vision.input.*``, ``vision.output.*`` and ``registration.paths.*``
-    using the layout convention, plus the ArUco marker size and dictionary,
-    which registration inherits from ``vision.aruco`` unless overridden.
+    using the layout convention, plus the ArUco marker size (always taken from
+    ``vision.aruco``) and dictionary (inherited from ``vision.aruco`` unless
+    overridden).
+
+    ``registration.paths.mesh`` / ``aruco_json``, when unset, come from:
+
+    * ``vision_dir`` if given (``spectra full``: the run vision just made);
+    * nothing, if ``resolve_vision_handoff`` is False (left unset, so a later
+      call can still fill them — used before vision has run);
+    * otherwise this date's vision run, falling back to the most recent
+      complete one (``spectra registration``).
 
     Returns a new ``UnifiedConfig``; the input is not mutated. Explicitly-set
-    values — including absolute paths — are always left untouched.
+    paths — including absolute paths — are always left untouched.
     """
     sample = cfg.sample_name
     date = cfg.results_date
@@ -306,10 +359,14 @@ def resolve_unified_paths(cfg: UnifiedConfig) -> UnifiedConfig:
             default_hsi_hdr_path(cfg.data_root, sample)
         )
 
-    # mesh + aruco come from a vision run: this day's if present, else the
-    # most recent one that has them.
-    if _is_unset(r_paths.mesh) or _is_unset(r_paths.aruco_json):
-        vision_dir, _ = find_vision_dir(cfg.results_root, sample, date)
+    # mesh + aruco come from a vision run (see the docstring for which one).
+    # Never resolved before vision has run in `spectra full`: an unset path is
+    # treated as "not chosen yet", and a stale fallback written here would be
+    # mistaken for a user-set path later on.
+    if resolve_vision_handoff and (_is_unset(r_paths.mesh) or _is_unset(r_paths.aruco_json)):
+        if vision_dir is None:
+            vision_dir, _ = find_vision_dir(cfg.results_root, sample, date)
+        vision_dir = Path(vision_dir)
         if _is_unset(r_paths.mesh):
             overrides["registration.paths.mesh"] = str(vision_dir / "surface_mesh.ply")
         if _is_unset(r_paths.aruco_json):
@@ -335,13 +392,13 @@ def resolve_unified_paths(cfg: UnifiedConfig) -> UnifiedConfig:
         )
 
     # ------- marker geometry: one source of truth -------------------------
-    # The HSI cube and the 3D reconstruction see the SAME physical markers,
-    # so registration inherits both size and dictionary from vision unless
-    # the user overrode them explicitly.
-    if cfg.registration.detection.marker_edge_length_mm is None:
-        overrides["registration.detection.marker_edge_length_mm"] = float(
-            cfg.vision.aruco.marker_edge_length_mm
-        )
+    # The HSI cube and the 3D reconstruction see the SAME physical markers.
+    # The edge length is ALWAYS vision.aruco.marker_edge_length_mm (setting it
+    # under `registration:` is rejected at load time); the dictionary is
+    # inherited unless overridden.
+    overrides["registration.detection.marker_edge_length_mm"] = float(
+        cfg.vision.aruco.marker_edge_length_mm
+    )
     if _is_unset(cfg.registration.detection.aruco_dict):
         overrides["registration.detection.aruco_dict"] = cfg.vision.aruco.dictionary
 
@@ -360,7 +417,8 @@ def run_vision_stage(
     """Run only the vision stage. Returns ``{"run_dir": Path, "skipped": False}``."""
     from .vision.pipeline import run_reconstruction
 
-    cfg = resolve_unified_paths(cfg)
+    # Vision does not consume the registration handoff paths: leave them unset.
+    cfg = resolve_unified_paths(cfg, resolve_vision_handoff=False)
     sample = sample_name or cfg.sample_name
     print(f"\n[orchestrator] Vision stage for sample={sample!r}")
     t0 = time.time()
@@ -380,10 +438,24 @@ def run_registration_stage(
     """Run only the registration stage (mode is read from cfg.registration.mode)."""
     from .registration.runner import run_registration
 
+    # Paths already set (by `run_full`, or by the user) are kept; unset ones
+    # fall back to the most recent complete vision run.
     cfg = resolve_unified_paths(cfg)
     sample = sample_name or cfg.sample_name
     print(f"\n[orchestrator] Registration stage for sample={sample!r} "
           f"(mode={cfg.registration.mode!r})")
+    print(f"[orchestrator] Marker edge (vision.aruco.marker_edge_length_mm): "
+          f"{cfg.vision.aruco.marker_edge_length_mm:g} mm")
+    if cfg.registration.mode != "batch":
+        # batch picks (and checks) each sample's vision run in discover_samples
+        mesh_dir = Path(cfg.registration.paths.mesh).parent
+        expected = vision_output_dir(cfg.results_root, sample, cfg.results_date)
+        if mesh_dir == expected:
+            print(f"[orchestrator] Vision run used by registration: {mesh_dir}")
+        else:
+            print(f"[orchestrator] WARNING: registration uses the vision run in {mesh_dir}, "
+                  f"not this run date's ({expected}).")
+        check_marker_edge(cfg.registration.paths.aruco_json, cfg.vision.aruco.marker_edge_length_mm)
     t0 = time.time()
     result = run_registration(
         cfg.registration,
@@ -433,7 +505,10 @@ def run_full(
     dict
         ``{"vision": ..., "registration": ..., "sample": ..., "skipped_vision": bool}``
     """
-    cfg = resolve_unified_paths(cfg)
+    # The registration handoff (mesh / aruco_json) is NOT resolved here: vision
+    # has not run yet, so this date's folder may be missing and the fallback
+    # would pick an older run. It is filled in after vision, below.
+    cfg = resolve_unified_paths(cfg, resolve_vision_handoff=False)
     sample = sample_name or cfg.sample_name
     date = cfg.results_date or today_folder()
 
@@ -472,9 +547,24 @@ def run_full(
         print("[orchestrator] Vision stage disabled (not in cfg.stages).")
 
     if do_registration:
-        # Re-resolve so registration picks up the vision run that just
-        # finished (mesh / aruco_json are derived from the run date).
-        cfg = resolve_unified_paths(cfg)
+        if do_vision:
+            # Registration consumes exactly the vision run of THIS invocation
+            # (just produced, or the one for this date that caused the skip).
+            # No fallback to an older run: a missing output is an error.
+            # Paths set explicitly by the user are still left untouched.
+            vision_dir = Path(out["vision"].get(
+                "run_dir", vision_output_dir(cfg.results_root, sample, cfg.results_date)))
+            needs_handoff = (_is_unset(cfg.registration.paths.mesh)
+                             or _is_unset(cfg.registration.paths.aruco_json))
+            if needs_handoff and not dry_run and not vision_dir_complete(vision_dir):
+                raise FileNotFoundError(
+                    f"Vision run {vision_dir} has no surface_mesh.ply + aruco_markers_3d.json; "
+                    "refusing to register against an older vision run."
+                )
+            cfg = resolve_unified_paths(cfg, vision_dir=vision_dir)
+        else:
+            # Registration only: this date's vision run, else the most recent one.
+            cfg = resolve_unified_paths(cfg)
         if dry_run:
             print("[orchestrator][dry-run] Would run registration stage.")
             out["registration"] = {"dry_run": True}
@@ -504,6 +594,7 @@ __all__ = [
     "DATE_FOLDER_FORMAT",
     "PREFERRED_VISION_SUFFIXES",
     "batch_summary_dir",
+    "check_marker_edge",
     "default_hsi_hdr_path",
     "default_liveview_png_path",
     "find_vision_dir",

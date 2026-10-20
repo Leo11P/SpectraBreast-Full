@@ -253,6 +253,7 @@ def run_registration(
                 roi_mode=bool(cfg.batch.roi_mode),
                 sample_regex=cfg.batch.sample_regex,
                 results_date=results_date,
+                marker_edge_length_mm=cfg.detection.marker_edge_length_mm,
             )
         print("\n[Dry-run] Configuration valid; pipeline NOT executed.")
         return {"dry_run": True}

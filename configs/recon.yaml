@@ -19,7 +19,7 @@ output:
 
 aruco:
   dictionary: 4x4_50
-  marker_edge_length_mm: 68.0
+  # marker_edge_length_mm: NOT set here — read from configs/default.yaml
   origin_marker_id: null
   min_views_per_marker: 2
   align_to_aruco: true

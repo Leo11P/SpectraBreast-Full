@@ -1530,9 +1530,19 @@ def load_config(path, sample=None):
     cfg = copy.deepcopy(acq)
 
     vision = full.get("vision") or {}
-    va = vision.get("aruco") or {}
+    va = dict(vision.get("aruco") or {})
+    # Same rule as the pipeline: the marker edge length is set ONLY in the
+    # repo's configs/default.yaml; any other config gets it from there.
+    if os.path.abspath(path) != os.path.abspath(DEFAULT_CONFIG):
+        if va.get("marker_edge_length_mm") is not None:
+            raise SystemExit(f"[config] {path}: vision.aruco.marker_edge_length_mm cannot be "
+                             f"set here, only in {DEFAULT_CONFIG}")
+        with open(DEFAULT_CONFIG, "r", encoding="utf-8") as f:
+            dflt = yaml.safe_load(f) or {}
+        va["marker_edge_length_mm"] = ((dflt.get("vision") or {}).get("aruco") or {}).get(
+            "marker_edge_length_mm")
     if va.get("marker_edge_length_mm") is None:
-        raise SystemExit(f"[config] vision.aruco.marker_edge_length_mm missing in {path}")
+        raise SystemExit(f"[config] vision.aruco.marker_edge_length_mm missing in {DEFAULT_CONFIG}")
     dict_name = str(va.get("dictionary", "4x4_50")).strip()
     if not dict_name.upper().startswith("DICT_"):
         dict_name = "DICT_" + dict_name.upper()
@@ -1591,6 +1601,12 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="bootstrap + pose generation, but does NOT move the robot")
     ap.add_argument("--reset", action="store_true", help="ResetAllError and exit")
+    sub = ap.add_mutually_exclusive_group()
+    sub.add_argument("--submit", dest="submit", action="store_true", default=None,
+                     help="after the acquisition, send the sample to Mufasa and run the "
+                          "pipeline there (default: acquisition.remote.submit_after_acquisition)")
+    sub.add_argument("--no-submit", dest="submit", action="store_false",
+                     help="do not send the sample to Mufasa after the acquisition")
     ap.add_argument("--no-viz", action="store_true",
                     help="disable the Rerun visualisation (poses/cube/live robot)")
     args = ap.parse_args()
@@ -1624,12 +1640,27 @@ def main():
                 return
             cfg["_dry_run"] = args.dry_run
             out_dir = cfg["_out_dir"]
-            run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir,
-                        use_viz=not args.no_viz)
+            _, n_saved = run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir,
+                                     use_viz=not args.no_viz)
         finally:
             rs.stop()
     finally:
         robot.close()
+
+    # ---- hand-off to Mufasa (robot and camera already released) ------------
+    submit = args.submit
+    if submit is None:
+        submit = bool((cfg.get("remote") or {}).get("submit_after_acquisition", False))
+    if submit and not args.dry_run and n_saved > 0:
+        import remote                                  # sibling module (ROOT on sys.path)
+        try:
+            remote.submit_sample(args.config, cfg["_sample"])
+        except (Exception, SystemExit) as e:
+            print(f"\n[remote] submission failed: {e}\nThe acquisition is safe in "
+                  f"{cfg['_out_dir']}. Retry with:\n  python spectra/acquisition/remote.py "
+                  f"--config {args.config} --sample {cfg['_sample']}")
+    elif submit and not args.dry_run and n_saved == 0:
+        print("[remote] nothing acquired: not submitting to Mufasa")
 
 
 if __name__ == "__main__":

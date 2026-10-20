@@ -38,7 +38,7 @@ from .config import (
 )
 from .vision.aruco import ARUCO_DICTIONARIES, detect_folder
 from .vision.calibration import calibrate_intrinsics
-from .vision.config import load_config as load_vision_only_config
+from .vision.config import DEFAULT_CONFIG_PATH, load_config as load_vision_only_config
 
 app = typer.Typer(
     add_completion=False,
@@ -97,6 +97,11 @@ def _apply_cli_overrides(cfg: UnifiedConfig, overrides: List[str]) -> UnifiedCon
     merged: dict[str, object] = {}
     for ov in overrides:
         key, value = _parse_override(ov)
+        if key.endswith("marker_edge_length_mm"):
+            raise typer.BadParameter(
+                f"--set {key} is not allowed: the marker edge length is set only in "
+                f"{DEFAULT_CONFIG_PATH} (vision.aruco.marker_edge_length_mm)."
+            )
         merged[key] = value
     return cfg.with_overrides(merged)
 
@@ -121,7 +126,7 @@ def _execute_vision(
 
     from .orchestrator import run_vision_stage, resolve_unified_paths
 
-    cfg = resolve_unified_paths(cfg)
+    cfg = resolve_unified_paths(cfg, resolve_vision_handoff=False)
     if dry_run:
         print("[bold]Dry-run — vision config resolved:[/bold]")
         print(cfg.vision.model_dump(mode="python"))
@@ -139,7 +144,7 @@ def vision_cmd(
     date: Optional[str] = typer.Option(None, "--date",
                                         help="Run-date folder dd-mm-yyyy under results_root (default: today)."),
     set_override: List[str] = typer.Option([], "--set", "-s",
-                                            help="Dotted override: --set vision.aruco.marker_edge_length_mm=30"),
+                                            help="Dotted override: --set vision.aruco.min_views_per_marker=3"),
     dry_run: bool = typer.Option(False, "--dry-run",
                                   help="Resolve paths and print the config without running."),
 ) -> None:
@@ -255,6 +260,9 @@ def acquire_cmd(
     no_viz: bool = typer.Option(False, "--no-viz", help="Disable the Rerun viewer."),
     overwrite: bool = typer.Option(False, "--overwrite",
                                     help="Replace an existing acquisition for the same sample."),
+    submit: Optional[bool] = typer.Option(None, "--submit/--no-submit",
+                                          help="Send the sample to Mufasa after the acquisition "
+                                               "(default: acquisition.remote.submit_after_acquisition)."),
 ) -> None:
     """Robotic acquisition: same behaviour as `python spectra/acquisition/acquire.py`."""
     if mode not in _ACQUIRE_MODES:
@@ -268,6 +276,8 @@ def acquire_cmd(
         argv.append("--no-viz")
     if overwrite:
         argv.append("--overwrite")
+    if submit is not None:
+        argv.append("--submit" if submit else "--no-submit")
 
     # acquire.py is a standalone script (flat sibling imports, robot SDK in its
     # folder): load it by path and hand it the equivalent argv.

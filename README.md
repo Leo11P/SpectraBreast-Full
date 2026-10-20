@@ -158,11 +158,11 @@ environment with these packages is enough:
 python -m venv .venv-acq
 .venv-acq\Scripts\activate            # Windows  (Linux: source .venv-acq/bin/activate)
 pip install "numpy>=1.24" "opencv-python>=4.8" "PyYAML>=6.0" "pyrealsense2>=2.54" \
-            "trimesh>=4.0" "python-fcl>=0.7" "rerun-sdk>=0.20"
+            "trimesh>=4.0" "python-fcl>=0.7" "rerun-sdk>=0.20" "paramiko>=3.0"
 ```
 
 `pyrealsense2` drives the RealSense, `trimesh` + `python-fcl` the collision
-checks, `rerun-sdk` the live viewer. The Fairino SDK is not on PyPI: it is the
+checks, `rerun-sdk` the live viewer, `paramiko` the hand-off to Mufasa. The Fairino SDK is not on PyPI: it is the
 `Robot.py` copied below (pure Python, standard library only).
 
 The Fairino Python SDK and the FR5 URDF + meshes are **not** committed (they
@@ -429,7 +429,9 @@ Checkerboard intrinsic calibration. Writes `intrinsics.npy` and
 
 Fairino FR5 + RealSense acquisition with visual servoing, through the `spectra`
 console script. Same behaviour as `acquire.py` below, but it needs the full
-environment of §1.3 (the `spectra` package imports torch / MASt3R).
+environment of §1.3 (the `spectra` package imports torch / MASt3R) plus the
+robot-PC extra: `uv sync --extra acquisition` (RealSense, collision checks,
+`paramiko` for the hand-off to Mufasa).
 
 ```bash
 uv run spectra acquire --mode verify
@@ -445,6 +447,7 @@ uv run spectra acquire --sample SB021
 | `--ip` TEXT | `acquisition.robot.ip` | Robot controller IP |
 | `--no-viz` | off | Disable the Rerun viewer |
 | `--overwrite` | off | Replace an existing acquisition for the same sample |
+| `--submit` / `--no-submit` | `acquisition.remote.submit_after_acquisition` | Send the sample to Mufasa after the acquisition (see `remote.py` below) |
 
 ### `acquire.py` (robotic acquisition)
 
@@ -468,11 +471,48 @@ python spectra/acquisition/acquire.py --config configs/default.yaml --sample SB0
 | `--no-viz` | off | Disable the Rerun viewer |
 | `--overwrite` | off | Replace an existing acquisition for the same sample |
 | `--reset` | off | Reset robot errors and exit |
+| `--submit` / `--no-submit` | `acquisition.remote.submit_after_acquisition` | Send the sample to Mufasa after the acquisition (see `remote.py` below) |
 
 ArUco dictionary and marker edge length are read from `vision.aruco`. The
 Fairino SDK (`spectra/acquisition/fairino/`) and the FR5 URDF + meshes
 (`spectra/acquisition/fairino_description/`) are not versioned: copy them there
 locally before running.
+
+### `remote.py` (hand-off to Mufasa)
+
+Runs on the robot PC. When `acquisition.remote.submit_after_acquisition` is
+true, `acquire.py` calls it at the end of every acquisition: it uploads
+`DATA/input_vision/<sample>/` (and `DATA/input_registration/<sample>/` if the
+HSI cube is there) to `acquisition.remote.runs_dir/<sample>_<timestamp>/` on
+Mufasa, checks the upload against `SHA256SUMS`, submits `spectra full` with
+`sbatch`, waits for the job and downloads `RESULTS/` into the local
+`results_root`. Without the HSI cube only Vision runs. Use it by hand to
+(re)submit a sample already on disk:
+
+```bash
+python spectra/acquisition/remote.py --sample SB021
+python spectra/acquisition/remote.py --sample SB021 --no-wait   # submit and return
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--config` PATH | `configs/default.yaml` | Unified YAML (needs `acquisition.remote`) |
+| `--sample` TEXT | from YAML | Sample folder under `DATA/input_vision/` |
+| `--no-wait` | off | Submit and return, do not wait for the job |
+| `--no-pull` | off | Do not download the results |
+
+Requirements: robot PC on the Polimi LAN or VPN, an SSH key authorised on
+Mufasa (`acquisition.remote.ssh_key_path`; `null` asks for the password), the
+repo cloned at `acquisition.remote.repo_dir` with `Setup_env.sh` done. The QOS
+allow one job at a time (`MaxSubmit=1`).
+
+The marker edge length is set only in `configs/default.yaml`
+(`vision.aruco.marker_edge_length_mm`; any other config or `--set` that sets it
+is rejected). Each submitted run carries its own copy of the local config,
+`<runs_dir>/<sample>_<timestamp>/run_config.yaml`, and the job points
+`SPECTRA_DEFAULT_CONFIG` at it: for that run it is the default config, so the
+`configs/default.yaml` of the repo on Mufasa is neither read nor modified and
+the two never need to be kept in sync by hand.
 
 ---
 

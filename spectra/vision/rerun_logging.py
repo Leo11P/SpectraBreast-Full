@@ -188,6 +188,12 @@ def send_blueprint(
         layout_children.append(rrb.Spatial2DView(name="Camera images", origin="/cameras"))
 
     if not layout_children:
+        from rich import print as rprint  # type: ignore[import-not-found]
+
+        rprint(
+            "[yellow]Rerun: no views enabled (all log_*/include_* flags false); "
+            "skipping blueprint send and .rbl save.[/yellow]"
+        )
         return
     if len(layout_children) == 1:
         blueprint = rrb.Blueprint(layout_children[0])

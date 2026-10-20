@@ -35,10 +35,16 @@ dependencies = [
     "torchvision>=0.17",
     "openpyxl>=3.1",
     "pip>=26.1.2",
+    "pyrealsense2>=2.59.1.11053",
+    "python-fcl>=0.7.0.11",
+    "paramiko>=5.0.0",
 ]
 
 [project.optional-dependencies]
 gpu-raycast = ["cupy-cuda12x>=12.0"]
+# Robot PC only (spectra acquire): RealSense, collision checks, hand-off to Mufasa.
+# Not needed on Mufasa: `uv sync --extra acquisition` on the robot PC.
+acquisition = ["pyrealsense2>=2.54", "python-fcl>=0.7", "paramiko>=3.0"]
 
 [project.scripts]
 spectra = "spectra.cli:main"

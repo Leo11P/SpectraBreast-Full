@@ -81,6 +81,7 @@ def discover_samples(
     roi_mode: bool,
     sample_regex: Optional[str] = None,
     results_date: Optional[str] = None,
+    marker_edge_length_mm: Optional[float] = None,
 ) -> list[dict]:
     """Return one dict per ready-to-run sample under ``data_root``.
 
@@ -93,9 +94,11 @@ def discover_samples(
     Mesh and ArUco JSON come from the vision run for ``results_date`` (today
     by default), falling back to the most recent dated run that has them, so
     a batch launched the day after a set of vision runs still finds them.
+    With ``marker_edge_length_mm``, a sample whose vision run was built with a
+    different marker edge length is skipped (see ``check_marker_edge``).
     Outputs go to ``<results_root>/<results_date>/<sample>/registration/``.
     """
-    from ..orchestrator import find_vision_dir, registration_output_dir
+    from ..orchestrator import check_marker_edge, find_vision_dir, registration_output_dir
 
     data_root = Path(data_root)
     results_root = Path(results_root)
@@ -119,7 +122,9 @@ def discover_samples(
 
         hdr = entry / f"{sample}_raw.hdr"
         png = entry / f"{sample}_raw.png"
-        vision_dir, _ = find_vision_dir(results_root, sample, results_date)
+        vision_dir, is_fallback = find_vision_dir(results_root, sample, results_date)
+        if is_fallback:
+            print(f"[batch] WARNING {sample}: no vision run for this date, using {vision_dir}")
         mesh = vision_dir / "surface_mesh.ply"
         aruco = vision_dir / "aruco_markers_3d.json"
 
@@ -135,6 +140,12 @@ def discover_samples(
         if missing:
             skipped.append((sample, "missing: " + ", ".join(missing)))
             continue
+        if marker_edge_length_mm is not None:
+            try:
+                check_marker_edge(aruco, marker_edge_length_mm)
+            except ValueError as exc:
+                skipped.append((sample, str(exc)))
+                continue
 
         pairs.append({
             "sample_name":       sample,
@@ -536,6 +547,7 @@ def run_batch(
         roi_mode=roi_mode,
         sample_regex=cfg.batch.sample_regex,
         results_date=results_date,
+        marker_edge_length_mm=cfg.detection.marker_edge_length_mm,
     )
     if not pairs:
         print("\n[batch] No ready samples found. Exiting.")

@@ -22,7 +22,7 @@ For ``spectra full`` (and for ``spectra registration`` after a successful
 :func:`spectra.orchestrator.resolve_unified_paths`.
 
 All loaders accept the same dotted-path override syntax as the legacy config
-(e.g. ``--set vision.aruco.marker_edge_length_mm=30``,
+(e.g. ``--set vision.aruco.min_views_per_marker=3``,
 ``--set registration.render.resolution_mm_per_px=1.0``).
 
 Marker geometry lives in ONE place: ``vision.aruco.marker_edge_length_mm`` and
@@ -45,6 +45,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .vision.aruco import ARUCO_DICTIONARIES as _ARUCO_VISION_DICTS
 
+#: The one registration key that must never be user-set (single marker source).
+REGISTRATION_MARKER_EDGE_KEY = "registration.detection.marker_edge_length_mm"
+
 
 # =============================================================================
 # Re-export Vision's existing pydantic classes UNCHANGED.
@@ -60,6 +63,7 @@ from .vision.config import (
     RerunConfig,
     SurfaceConfig,
 )
+from .vision.config import DEFAULT_CONFIG_PATH, with_default_marker_edge
 
 
 # =============================================================================
@@ -333,6 +337,18 @@ def load_unified_config(path: str | Path) -> UnifiedConfig:
         raise ValueError(
             f"Config {path} is missing a top-level `vision:` section. "
             "If you have a legacy vision-only config, wrap it under `vision:`."
+        )
+    # The marker edge length is set ONLY in configs/default.yaml: any other
+    # config (e.g. the run_config.yaml written by acquisition/remote.py) gets
+    # it from there, and must not set it itself.
+    if path.resolve() != DEFAULT_CONFIG_PATH:
+        data["vision"] = with_default_marker_edge(data["vision"], f"{path} (vision)")
+    reg_detection = (data.get("registration") or {}).get("detection") or {}
+    if reg_detection.get("marker_edge_length_mm") is not None:
+        raise ValueError(
+            f"Config {path}: {REGISTRATION_MARKER_EDGE_KEY} cannot be set. The marker "
+            f"edge length is set only in {DEFAULT_CONFIG_PATH} "
+            "(vision.aruco.marker_edge_length_mm); remove it from `registration.detection`."
         )
     return UnifiedConfig.model_validate(data)
 

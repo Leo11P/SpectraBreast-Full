@@ -39,9 +39,12 @@
 #   boundary.
 # =============================================================================
 
+
+
+
 # Sample being processed. Drives every auto-derived path — spell it exactly as
 # the folder names under DATA/.
-sample_name: "SAMPLE1"
+sample_name: "Tetta"
 
 # Roots that drive default path resolution. Relative (from cwd) or absolute.
 data_root:    "DATA"
@@ -56,11 +59,15 @@ results_date: null
 # `spectra vision` and `spectra registration` ignore this.
 stages: ["vision", "registration"]
 
+
+
+
+
 # =============================================================================
 # ACQUISITION (Fairino FR5 + RealSense, visual servoing)
 # =============================================================================
-# Used only by `python spectra/acquisition/acquire.py` (robot PC). Vision and
-# registration ignore this section.
+# Used only by `python spectra/acquisition/acquire.py` and `remote.py` (robot
+# PC). Vision and registration ignore this section.
 #
 # Output: written straight into the folder Vision reads from, i.e.
 #   DATA/input_vision/<sample_name>/
@@ -107,10 +114,11 @@ acquisition:
   hand_eye:
     # T_cam2gripper 4x4 (rotazione + traslazione in mm).
     T_cam2gripper:
-    - [-0.0061915456, -0.0158428087, -0.9998553246, -72.2167749269]
-    - [ 0.9999753003,  0.0032277538, -0.0062434326,  10.2771824341]
-    - [ 0.0033262003, -0.9998692850,  0.0158224326,  25.3055715767]
-    - [ 0.0000000000,  0.0000000000,  0.0000000000,   1.0000000000]
+    - [-0.6979648877, -0.0125032970, -0.7160228231, -57.3722216589,]
+    - [0.7161254414, -0.0079127539, -0.6979267443, -41.2358499795]
+    - [0.0030606730, -0.9998905220, 0.0144767535, 14.3508732906]
+    - [0.0000000000, 0.0000000000, 0.0000000000, 1.0000000000]
+
 
   camera_box:
     # Ingombro fisico camera+adattatore (RealSense D456 + staffa): collisioni + viz.
@@ -177,17 +185,34 @@ acquisition:
     camera_pinhole_distance_m: 0.06
     # repo_dir: null            # default: spectra/acquisition
 
+  # After a successful acquisition: upload DATA/input_vision/<sample>/ to
+  # Mufasa and submit `spectra full` as a SLURM job (spectra/acquisition/remote.py).
+  # Needs: robot PC on the Polimi LAN/VPN, an SSH key on Mufasa, `pip install paramiko`.
+  # Registration runs too only if DATA/input_registration/<sample>/<sample>_raw.hdr
+  # exists locally; otherwise vision only.
+  remote:
+    submit_after_acquisition: true     # override per run: --submit / --no-submit
+    host: "10.79.23.96"                # Mufasa login server
+    port: 22
+    user: "lpassoni"
+    ssh_key_path: 'C:\Users\leolu\.ssh\id_spectra_mufasa'   # null = ask for the password
+    repo_dir: "/home/lpassoni/SpectraBreast-Vision"    # cloned + `uv sync` done
+    runs_dir: "/home/lpassoni/spectra_runs"          # one folder per submission
+    # dir with sbatch/squeue/sacct (non-interactive SSH does not load it): `which sbatch`
+    slurm_bin_dirs: ["/opt/shared/sw/amd/gcc-13.3.0/slurm-25.05.4/bin"]
+    partition: jobs
+    qos: gpuwide                       # QOS have MaxSubmit=1: one job at a time
+    gres: "gpu:4g.20gb:1"              # must match the QOS GPU type
+    cpus: 8
+    mem: 64G
+    time: "12:00:00"
+    job_name: spectra
+    wait: true                         # wait for the job to finish ...
+    poll_s: 20
+    pull_results: true                 # ... and download RESULTS/ into results_root
+
   # tilt_deg: 0 = top-down, 90 = laterale. depth: salva o meno la depth per il layer.
   layers:
-    - name: depth acquisition
-      distance_mm: 600
-      tilt_deg: 10
-      n_poses: 4
-      azimuth_span_deg: 360
-      azimuth_start_deg: 0
-      roll_deg: 0
-      depth: true
-
     - name: top_down
       distance_mm: 150
       tilt_deg: 20
@@ -214,6 +239,10 @@ acquisition:
       azimuth_start_deg: 0
       roll_deg: 0
       depth: false
+
+
+
+
 
 # =============================================================================
 # VISION (MASt3R-SfM + ArUco)
@@ -249,7 +278,7 @@ vision:
     # PHYSICAL marker edge length in MILLIMETRES. Single source of truth for
     # the whole pipeline (acquisition bootstrap/servo included) — this sets the metric scale of the reconstruction,
     # and registration inherits it. Measure it properly.
-    marker_edge_length_mm:  25.0
+    marker_edge_length_mm:  6.8
     origin_marker_id:       null
     min_views_per_marker:   2
     align_to_aruco:         true
@@ -315,7 +344,7 @@ vision:
   rerun:
     # true -> record the run to RESULTS/<dd-mm-yyyy>/<sample>/vision/rerun/spectra.rrd
     # (open it later with `rerun spectra.rrd`). Safe on SLURM: no viewer needed.
-    enabled: false
+    enabled: true
     # true ONLY with a Rerun viewer running on this machine (live streaming on
     # grpc_port). Keep false on Mufasa.
     live_viewer: false
@@ -338,6 +367,11 @@ vision:
     rrd_basename: spectra.rrd
     rbl_basename: spectra.rbl
 
+
+
+
+
+
 # =============================================================================
 # REGISTRATION (HSI → mesh)
 # =============================================================================
@@ -347,7 +381,7 @@ registration:
   #   roi    : dual HSI — LiveView PNG with ArUcos + ROI cube without them
   #   batch  : every sample under DATA/input_registration/
   #   sweep  : one run per (res_reg, res_pc) pair, best pair kept
-  mode: "single"
+  mode: "sweep"
 
   # null → derived from sample_name + results_date:
   #   hsi_hdr      = DATA/input_registration/<sample>/<sample>_raw.hdr

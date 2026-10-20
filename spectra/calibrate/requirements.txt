@@ -1,0 +1,6 @@
+numpy>=1.24
+opencv-python>=4.8        # solvePnP, calibrateHandEye, calibrateCamera
+PyYAML>=6.0               # config.yaml
+pyrealsense2>=2.54        # Intel RealSense D456 (acquisition only)
+
+# Fairino SDK: included in src/fairino/Robot.py (pure Python, no install needed)

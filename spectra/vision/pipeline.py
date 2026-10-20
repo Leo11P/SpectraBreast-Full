@@ -89,6 +89,13 @@ def _log_surface_cloud_open3d_web(
     if surface.points.shape[0] == 0:
         print("[yellow]Skipping Open3D web viewer: surface cloud is empty.[/yellow]")
         return
+    if not sys.stdin.isatty():
+        print(
+            "[yellow]Skipping Open3D web viewer: stdin is not interactive "
+            "(e.g. a batch/SLURM job) — `open3d.visualization.draw()` blocks "
+            "until a window is closed, which never happens here.[/yellow]"
+        )
+        return
     try:
         o3d = importlib.import_module("open3d")
     except Exception as exc:
@@ -407,6 +414,11 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
     )
     backend_inputs.image_paths = canonical_paths
 
+    if cfg.rerun.enabled and not HAS_RERUN:
+        print(
+            "[yellow]rerun.enabled is true but rerun-sdk failed to import; "
+            "skipping all Rerun logging (no .rrd/.rbl will be written).[/yellow]"
+        )
     if cfg.rerun.enabled and HAS_RERUN:
         rdir = (run_dir / cfg.rerun.rerun_subdir).resolve()
         if cfg.rerun.save_rrd or cfg.rerun.save_rbl:

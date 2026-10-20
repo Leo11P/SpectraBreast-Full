@@ -238,7 +238,7 @@ class PipelineViz:
             # initial blueprint already WITHOUT the robot (phase 1): no robot flash
             # at startup. robot_name deterministic from the URDF (<robot name=...>).
             self.robot_name = "fairino5_v6_robot"
-            rr.init("spectra_acquire_viz", spawn=False,
+            rr.init("spectra_acquire_viz", spawn=True,
                     default_blueprint=self._blueprint(show_robot=False))
             rr.spawn(memory_limit=self.memory_limit)
             print(f"[viz] viewer live (tetto RAM {self.memory_limit})")
@@ -524,11 +524,11 @@ class PipelineViz:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-        self._hide_robot()
+        #self._hide_robot()
         if self.robot_viz is not None:
             try:
                 self.robot_viz.CloseRPC()
-            except Exception:
+            except Exception as e:
                 pass
             self.robot_viz = None
         print(f"[viz] phase 3: robot hidden; {self._n_photo} acquired poses "
