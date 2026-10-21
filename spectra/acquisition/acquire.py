@@ -396,13 +396,24 @@ def resolve_intrinsics(cfg, rs_cam):
 
 
 def load_T_cam2gripper(cfg):
-    """T_cam2gripper 4x4 (mm) from the yaml. Translation in mm. It links the camera
-    to the FLANGE (wrist3/controller flange): it must be consistent with the pose
-    used by the hand-eye calibration (here: controller flange, tool 0)."""
-    T = np.array(cfg["hand_eye"]["T_cam2gripper"], float)
+    """T_cam2gripper 4x4 (mm). It links the camera to the FLANGE (controller
+    flange, tool 0), like the hand-eye calibration. `hand_eye.T_cam2gripper`:
+    null -> output of `spectra calibrate` (camera_calibration/output/
+    calibration/cam2gripper.txt under data_root); a 4x4 list -> used as is."""
+    T = (cfg.get("hand_eye") or {}).get("T_cam2gripper")
+    if T is None:
+        path = os.path.join(cfg["_calib_dir"], "output", "calibration", "cam2gripper.txt")
+        if not os.path.isfile(path):
+            raise SystemExit(f"[hand-eye] {path} not found: run `spectra calibrate` (or "
+                             "--modality calibration calibrate), or set "
+                             "acquisition.hand_eye.T_cam2gripper to a 4x4 matrix.")
+        T, src = np.loadtxt(path), path
+    else:
+        src = "acquisition.hand_eye.T_cam2gripper"
+    T = np.array(T, float)
     if T.shape != (4, 4):
-        raise SystemExit("[hand-eye] T_cam2gripper must be 4x4.")
-    print(f"[hand-eye] t(mm) = {np.round(T[:3,3],2).tolist()}")
+        raise SystemExit(f"[hand-eye] T_cam2gripper must be 4x4 ({src}).")
+    print(f"[hand-eye] {src}: t(mm) = {np.round(T[:3,3],2).tolist()}")
     return T
 
 
@@ -1563,6 +1574,7 @@ def load_config(path, sample=None):
     cfg["_sample"] = str(sample)
     # relative to the cwd, like Vision: always launch from the repo root
     cfg["_out_dir"] = os.path.abspath(os.path.join(data_root, "input_vision", str(sample)))
+    cfg["_calib_dir"] = os.path.abspath(os.path.join(data_root, "camera_calibration"))
     print(f"[config] {path} | sample={sample} | aruco={dict_name} "
           f"L={cfg['aruco']['marker_length_mm']}mm | out={cfg['_out_dir']}")
     return cfg
@@ -1587,6 +1599,7 @@ def prepare_out_dir(out_dir, overwrite=False):
 
 
 def main():
+    """Returns the number of saved image/pose pairs (None for --verify / --reset)."""
     global _EULER
     ap = argparse.ArgumentParser(description="Layered acquisition (native Fairino FK)")
     ap.add_argument("--config", default=DEFAULT_CONFIG,
@@ -1601,12 +1614,6 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="bootstrap + pose generation, but does NOT move the robot")
     ap.add_argument("--reset", action="store_true", help="ResetAllError and exit")
-    sub = ap.add_mutually_exclusive_group()
-    sub.add_argument("--submit", dest="submit", action="store_true", default=None,
-                     help="after the acquisition, send the sample to Mufasa and run the "
-                          "pipeline there (default: acquisition.remote.submit_after_acquisition)")
-    sub.add_argument("--no-submit", dest="submit", action="store_false",
-                     help="do not send the sample to Mufasa after the acquisition")
     ap.add_argument("--no-viz", action="store_true",
                     help="disable the Rerun visualisation (poses/cube/live robot)")
     args = ap.parse_args()
@@ -1647,20 +1654,9 @@ def main():
     finally:
         robot.close()
 
-    # ---- hand-off to Mufasa (robot and camera already released) ------------
-    submit = args.submit
-    if submit is None:
-        submit = bool((cfg.get("remote") or {}).get("submit_after_acquisition", False))
-    if submit and not args.dry_run and n_saved > 0:
-        import remote                                  # sibling module (ROOT on sys.path)
-        try:
-            remote.submit_sample(args.config, cfg["_sample"])
-        except (Exception, SystemExit) as e:
-            print(f"\n[remote] submission failed: {e}\nThe acquisition is safe in "
-                  f"{cfg['_out_dir']}. Retry with:\n  python spectra/acquisition/remote.py "
-                  f"--config {args.config} --sample {cfg['_sample']}")
-    elif submit and not args.dry_run and n_saved == 0:
-        print("[remote] nothing acquired: not submitting to Mufasa")
+    # Acquisition only: vision / registration (here or on Mufasa, see the
+    # `mufasa:` section) are run by `spectra full`, which calls this main().
+    return n_saved
 
 
 if __name__ == "__main__":

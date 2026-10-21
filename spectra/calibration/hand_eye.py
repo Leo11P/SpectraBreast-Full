@@ -1,37 +1,32 @@
 # -*- coding: utf-8 -*-
-"""
-hand_eye.py
-===========
-Hand-eye calibration (eye-in-hand) from data/input/calibration:
-solvePnP per view + cv.calibrateHandEye, with chessboard-origin disambiguation
-(the 7x4 board is symmetric under 180 deg) and iterative outlier rejection.
+"""Hand-eye calibration (eye-in-hand) from input/calibration: solvePnP per view
++ cv.calibrateHandEye, with chessboard-origin disambiguation (a 7x4 board is
+symmetric under 180 deg) and iterative outlier rejection.
 
-Views whose PnP reprojection error exceeds calibration.max_reproj_err_px are
-EXCLUDED before the hand-eye solve.
+Views whose PnP reprojection error exceeds calibration.hand_eye.max_reproj_err_px
+are EXCLUDED before the hand-eye solve.
 
-Output (data/output/calibration): cam2gripper.txt, matrici_4x4.txt (target2cam),
-gripper2base.txt, kept_images.txt, intrinsics_used.json.
+Output (output/calibration): cam2gripper.txt (4x4, mm), matrici_4x4.txt
+(target2cam), gripper2base.txt, kept_images.txt, intrinsics_used.json.
+The sample acquisition reads cam2gripper.txt when
+acquisition.hand_eye.T_cam2gripper is null.
 """
+
+from __future__ import annotations
 
 import json
+import math
 import os
 
 import cv2 as cv
 import numpy as np
 
-import common
-import pose_diagnostics as pdg
+from . import common
+from .common import to_T as _T
 
 METHODS = {"PARK": cv.CALIB_HAND_EYE_PARK, "TSAI": cv.CALIB_HAND_EYE_TSAI,
            "HORAUD": cv.CALIB_HAND_EYE_HORAUD, "ANDREFF": cv.CALIB_HAND_EYE_ANDREFF,
            "DANIILIDIS": cv.CALIB_HAND_EYE_DANIILIDIS}
-
-
-def _T(R, t):
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = np.ravel(t)
-    return T
 
 
 def reproj_error_px(objp, corners, rvec, tvec, K, D):
@@ -41,14 +36,13 @@ def reproj_error_px(objp, corners, rvec, tvec, K, D):
 
 
 def collect_pairs(cfg, K, D, info):
-    P, C = cfg["_paths"], cfg["calibration"]
+    P, H = cfg["_paths"], cfg["hand_eye"]
     objp, size = common.board_points(cfg), common.board_size(cfg)
-    max_err = float(C["max_reproj_err_px"])
-    order = str(C["euler_order"])
+    max_err = float(H["max_reproj_err_px"])
 
     pairs, names = [], []
     n_nopat = n_reproj = 0
-    for num, ip, pp in common.list_views(P["cal_in"], C.get("only_images") or None):
+    for num, ip, pp in common.list_views(P["cal_in"], H["only_images"] or None):
         img = cv.imread(ip)
         if img is None:
             continue
@@ -59,7 +53,7 @@ def collect_pairs(cfg, K, D, info):
             continue
 
         v = common.read_pose(pp)
-        Rg = common.euler_deg_to_R(v[3], v[4], v[5], order)
+        Rg = common.euler_deg_to_R(v[3], v[4], v[5], H["euler_order"])
         tg = np.array([[v[0]], [v[1]], [v[2]]])      # mm
 
         # both corner orderings: the board origin is ambiguous (180 deg symmetry)
@@ -147,6 +141,32 @@ def resolve_origin_and_calibrate(pairs, method, outlier_sigma):
     return R, t, choice, mask
 
 
+def per_view_residuals(G_list, C_list, X):
+    """target2base_i = G_i @ X @ C_i must be the same for every view (board
+    still): per view, rotational (deg) and translational (mm) deviation from
+    the robust consensus."""
+    T = [G @ X @ C for G, C in zip(G_list, C_list)]
+    t_ref = np.median(np.array([Ti[:3, 3] for Ti in T]), axis=0)
+    R_ref = common.mean_rotation([Ti[:3, :3] for Ti in T])
+    rot_dev = [math.degrees(math.acos(max(-1.0, min(1.0, (np.trace(R_ref.T @ Ti[:3, :3]) - 1) / 2))))
+               for Ti in T]
+    tr_dev = [float(np.linalg.norm(Ti[:3, 3] - t_ref)) for Ti in T]
+    return np.array(rot_dev), np.array(tr_dev)
+
+
+def format_residuals(names, rot_dev, tr_dev, rot_sigma=2.0):
+    thr = float(np.median(rot_dev) + rot_sigma * np.std(rot_dev))
+    L = ["    view      rot_dev(deg)   tr_dev(mm)   flag", "    " + "-" * 46]
+    for i in np.argsort(rot_dev)[::-1]:
+        flag = "  <== ROT OUTLIER" if rot_dev[i] > thr else ""
+        L.append(f"    {str(names[i]):>8s}   {rot_dev[i]:9.3f}     {tr_dev[i]:8.2f}{flag}")
+    L.append("")
+    L.append(f"    rot_dev: median={np.median(rot_dev):.3f}  max={rot_dev.max():.3f}  "
+             f"outlier_threshold={thr:.3f} deg")
+    L.append(f"    tr_dev : median={np.median(tr_dev):.2f}  max={tr_dev.max():.2f} mm")
+    return "\n".join(L)
+
+
 def save_outputs(out_dir, R, t, pairs, choice, mask, names, info):
     np.savetxt(os.path.join(out_dir, "cam2gripper.txt"), _T(R, t), fmt="%.10f")
 
@@ -176,19 +196,19 @@ def save_outputs(out_dir, R, t, pairs, choice, mask, names, info):
 
 
 def run(cfg):
-    P, C = cfg["_paths"], cfg["calibration"]
-    method = METHODS[str(C["handeye_method"]).upper()]
+    P, H = cfg["_paths"], cfg["hand_eye"]
+    method = METHODS[H["method"]]
 
     print("\n[1] Intrinsics")
     K, D, info = common.load_intrinsics(cfg)
 
-    print(f"\n[2] Pairs from {P['cal_in']} (reproj filter: {C['max_reproj_err_px']} px)")
+    print(f"\n[2] Pairs from {P['cal_in']} (reproj filter: {H['max_reproj_err_px']} px)")
     pairs, names = collect_pairs(cfg, K, D, info)
     if len(pairs) < 3:
         raise SystemExit("Fewer than 3 valid pairs: cannot calibrate.")
 
-    print(f"\n[3] Origin disambiguation + hand-eye {C['handeye_method']} ({len(pairs)} pairs)")
-    R, t, choice, mask = resolve_origin_and_calibrate(pairs, method, float(C["outlier_sigma"]))
+    print(f"\n[3] Origin disambiguation + hand-eye {H['method']} ({len(pairs)} pairs)")
+    R, t, choice, mask = resolve_origin_and_calibrate(pairs, method, float(H["outlier_sigma"]))
     print(f"    kept views: {sum(mask)}/{len(pairs)}, "
           f"flipped: {sum(c for c, m in zip(choice, mask) if m)}")
 
@@ -201,9 +221,9 @@ def run(cfg):
     print(f"\n[4] Self-check chessboard->base: std={np.round(std, 2)} mm "
           f"(|std|={np.linalg.norm(std):.2f} mm) -> small = good")
 
-    rot_dev, tr_dev = pdg.per_view_residuals(G_list, C_list, Tcg)
+    rot_dev, tr_dev = per_view_residuals(G_list, C_list, Tcg)
     print("\n[5] Per-view residuals (target->base consistency; high rot = rotational outlier):")
-    print(pdg.format_residuals([nm for _, _, nm in kept], rot_dev, tr_dev))
+    print(format_residuals([nm for _, _, nm in kept], rot_dev, tr_dev))
 
     print("\n[Result] cam2gripper:")
     print("  t (mm):", np.round(t.ravel(), 2))

@@ -176,6 +176,11 @@ def _print_summary(cfg: RegistrationConfig, sample_name: str) -> None:
 
     print(f"  Save PC       : {'YES' if cfg.export.save_pointcloud else 'NO'}")
     print(f"  Save images   : {'YES' if cfg.export.save_images else 'NO'}")
+    rc = cfg.rerun
+    print("  Rerun         : " + (
+        f"YES → {rc.rrd_basename}{' + ' + rc.rbl_basename if rc.save_rbl else ''} "
+        f"(max_points={rc.max_points}, band_step={rc.band_step})"
+        if rc.enabled else "NO"))
     if cfg.mode == "batch":
         print("  Output        : per-sample, resolved by batch discovery")
     else:
@@ -243,6 +248,14 @@ def run_registration(
         )
 
     _print_summary(cfg, sample_name)
+
+    if cfg.rerun.enabled:
+        import importlib.util
+        if importlib.util.find_spec("rerun") is None:
+            raise RuntimeError(
+                "registration.rerun.enabled=true but rerun-sdk is not installed "
+                "(run `uv sync`, or set registration.rerun.enabled=false)."
+            )
 
     if dry_run:
         if cfg.mode == "batch" and data_root is not None and results_root is not None:
@@ -448,6 +461,11 @@ def _run_single_or_roi(
         )
     except Exception as exc:
         print(f"[yellow]Could not append Timings sheet: {exc}[/yellow]")
+
+    from .rerun_spectral import maybe_write_spectral_rerun
+    rrd = maybe_write_spectral_rerun(cfg, output_dir, sample_name)
+    if rrd is not None:
+        result["spectral_rrd"] = str(rrd)
 
     return result
 

@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
-"""
-validation.py
-=============
-Hand-eye validation on NEW images (data/input/validation).
+"""Hand-eye validation on NEW images (input/validation).
 
-For each view: chessboard pose observed with solvePnP, then the chessboard
-corners are PREDICTED through the chain
+For each view the chessboard pose is observed with solvePnP, then its corners
+are PREDICTED through the chain
     T_target2cam_pred = inv(T_cam2grip) @ inv(T_grip2base) @ T_target2base
 and compared with the observed ones.
   [X] T_target2base estimated from the VALIDATION images (self-consistency)
   [Y] T_target2base estimated from the CALIBRATION images (out-of-sample, stricter)
 
-The intrinsics come from common.load_intrinsics (same source as calibration,
-same K, D for validation and calibration views). Nothing is written in the
-input folders.
+Intrinsics: same source as the calibration (same K, D for both sets). Nothing
+is written in the input folders. Output: output/validation/validation_report.csv
+(+ overlay_X/, overlay_Y/).
 """
+
+from __future__ import annotations
 
 import json
 import os
@@ -22,26 +21,18 @@ import os
 import cv2 as cv
 import numpy as np
 
-import common
+from . import common
 
 
 def median_transform(Ts):
-    t = np.median(np.array([T[:3, 3] for T in Ts]), axis=0)
-    U, _, Vt = np.linalg.svd(sum(T[:3, :3] for T in Ts))
-    R = U @ Vt
-    if np.linalg.det(R) < 0:
-        U[:, -1] *= -1
-        R = U @ Vt
-    out = np.eye(4)
-    out[:3, :3] = R
-    out[:3, 3] = t
-    return out
+    return common.to_T(common.mean_rotation([T[:3, :3] for T in Ts]),
+                       np.median(np.array([T[:3, 3] for T in Ts]), axis=0))
 
 
 def collect_views(cfg, folder, K, D, info):
     """[(num, corners, T_grip2base, T_target2cam_observed, img)]."""
     objp, size = common.board_points(cfg), common.board_size(cfg)
-    order = str(cfg["calibration"]["euler_order"])
+    order = cfg["hand_eye"]["euler_order"]
     views = []
     for num, ip, pp in common.list_views(folder):
         img = cv.imread(ip)
@@ -53,10 +44,7 @@ def collect_views(cfg, folder, K, D, info):
             print(f"  [skip] chessboard not detected in img{num}")
             continue
         _, rvec, tvec = cv.solvePnP(objp, corners, K, D)
-        R, _ = cv.Rodrigues(rvec)
-        T_t2c = np.eye(4)
-        T_t2c[:3, :3] = R
-        T_t2c[:3, 3] = tvec.ravel()
+        T_t2c = common.to_T(cv.Rodrigues(rvec)[0], tvec)
         views.append((num, corners, common.pose_to_T(common.read_pose(pp), order), T_t2c, img))
     return views
 
@@ -119,8 +107,9 @@ def _check_same_intrinsics(P, K, D):
         d = json.load(f)
     if not (np.allclose(np.array(d["K"]), K) and np.allclose(np.array(d["D"]), D)):
         print(f"\n  WARNING: these intrinsics differ from the ones used by the calibration "
-              f"({d.get('source')}, {d.get('path')}). Re-run 'calibration calibrate' or "
-              "change intrinsics.source, otherwise X/Y are not comparable.")
+              f"({d.get('source')}, {d.get('path')}). Re-run the hand-eye "
+              "(`spectra calibrate --modality calibration calibrate`) or change "
+              "calibration.intrinsics.source, otherwise X/Y are not comparable.")
 
 
 def run(cfg):
@@ -129,7 +118,8 @@ def run(cfg):
     overlay = bool(cfg["validation"]["save_overlay"])
 
     if not os.path.exists(P["cam2gripper"]):
-        raise SystemExit(f"{P['cam2gripper']} not found: run 'calibration calibrate' first.")
+        raise SystemExit(f"{P['cam2gripper']} not found: run the hand-eye first "
+                         "(`spectra calibrate --modality calibration calibrate`).")
     T_cam2grip = np.loadtxt(P["cam2gripper"])
     print(f"cam2gripper t (mm): {np.round(T_cam2grip[:3, 3], 2)}")
 

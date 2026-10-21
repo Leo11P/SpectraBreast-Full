@@ -1,20 +1,18 @@
 # -*- coding: utf-8 -*-
-"""
-intrinsics.py
-=============
-OpenCV intrinsic calibration of the RealSense from the chessboard images in
-data/input/calibration. Writes ONLY data/output/intrinsics/intrinsics_opencv.json:
-no input file is touched. To use it, set intrinsics.source: opencv in config.yaml.
+"""OpenCV intrinsic calibration of the RealSense from the chessboard images in
+input/calibration. Writes ONLY output/intrinsics/intrinsics_opencv.json (no
+input file is touched). Used when calibration.intrinsics.source is `opencv`.
 """
 
-import glob
+from __future__ import annotations
+
 import json
 import os
 
 import cv2 as cv
 import numpy as np
 
-import common
+from . import common
 
 
 def run(cfg):
@@ -23,8 +21,7 @@ def run(cfg):
     objp = common.board_points(cfg)
     min_views = int(cfg["intrinsics"]["min_views_warn"])
 
-    imgs = sorted(glob.glob(os.path.join(P["cal_in"], "img*.png")) +
-                  glob.glob(os.path.join(P["cal_in"], "img*.jpg")))
+    imgs = common.list_images(P["cal_in"])
     if not imgs:
         raise SystemExit(f"No img*.png in {P['cal_in']}")
     print(f"\nImages found: {len(imgs)}")
@@ -82,5 +79,7 @@ def run(cfg):
     with open(P["intr_opencv"], "w") as f:
         json.dump(out, f, indent=2)
     print(f"\n[Output] {P['intr_opencv']}")
-    print("To use it: intrinsics.source: opencv in config.yaml.")
+    if cfg["intrinsics"]["source"] != "opencv":
+        print("Not used by hand-eye / validation: calibration.intrinsics.source is "
+              f"{cfg['intrinsics']['source']!r} (set it to opencv to use it).")
     return K, D, mean_reproj

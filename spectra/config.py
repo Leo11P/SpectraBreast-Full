@@ -166,6 +166,39 @@ class RegistrationExport(BaseModel):
     save_images: bool = True
 
 
+class RegistrationRerun(BaseModel):
+    """Spectral Rerun recording written after the point-cloud export.
+
+    ``<output_dir>/spectral.rrd`` (+ ``spectral.rbl``): top view = one band,
+    chosen on the ``wavelength_nm`` timeline; bottom view = PCA PC1. Both views
+    spin around the sample. See :mod:`spectra.registration.rerun_spectral`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    max_points: Optional[int] = Field(default=150_000, ge=1000)   # None = all
+    band_step: int = Field(default=2, ge=1)
+    colormap: Literal["viridis", "turbo", "inferno", "magma",
+                      "plasma", "cividis", "jet"] = "viridis"
+    point_radius_px: float = Field(default=2.0, gt=0.0)
+    spin_speed: float = Field(default=0.3, ge=0.0)
+    save_rbl: bool = True
+    rrd_basename: str = "spectral.rrd"
+    rbl_basename: str = "spectral.rbl"
+
+    @field_validator("rrd_basename", "rbl_basename")
+    @classmethod
+    def _plain_basename(cls, value: str, info) -> str:
+        suffix = ".rrd" if info.field_name == "rrd_basename" else ".rbl"
+        if Path(value).name != value or not value.endswith(suffix):
+            raise ValueError(
+                f"registration.rerun.{info.field_name} must be a plain file name "
+                f"ending in {suffix}, got {value!r}"
+            )
+        return value
+
+
 class RegistrationBatch(BaseModel):
     """Batch mode parameters.
 
@@ -217,6 +250,7 @@ class RegistrationConfig(BaseModel):
     render:      RegistrationRender      = Field(default_factory=RegistrationRender)
     pointcloud:  RegistrationPointcloud  = Field(default_factory=RegistrationPointcloud)
     export:      RegistrationExport      = Field(default_factory=RegistrationExport)
+    rerun:       RegistrationRerun       = Field(default_factory=RegistrationRerun)
     batch:       RegistrationBatch       = Field(default_factory=RegistrationBatch)
     sweep:       RegistrationSweep       = Field(default_factory=RegistrationSweep)
 
@@ -226,6 +260,149 @@ class RegistrationConfig(BaseModel):
             v = getattr(self.paths, fld)
             if v is not None:
                 setattr(self.paths, fld, Path(v).expanduser())
+        return self
+
+    @model_validator(mode="after")
+    def _rerun_needs_pointcloud(self) -> "RegistrationConfig":
+        exp = self.export
+        if self.rerun.enabled and not (exp.save_pointcloud and (exp.ply or exp.npy)):
+            raise ValueError(
+                "registration.rerun.enabled=true reads the exported point cloud: set "
+                "registration.export.save_pointcloud=true and ply or npy to true "
+                "(or registration.rerun.enabled=false)."
+            )
+        return self
+
+
+# =============================================================================
+# Calibration — hand-eye + intrinsics of the robot camera (spectra calibrate).
+# Robot / camera stream are NOT repeated: they come from acquisition.robot and
+# acquisition.camera. Data layout is fixed: <data_root>/camera_calibration/.
+# =============================================================================
+
+class CalibrationBoard(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    chessboard_size: List[int]                   # INNER corners (columns, rows)
+    square_size_mm: float = Field(gt=0.0)        # measured square side
+
+    @field_validator("chessboard_size")
+    @classmethod
+    def _two_sizes(cls, value: List[int]) -> List[int]:
+        if len(value) != 2 or min(value) < 2:
+            raise ValueError(f"calibration.board.chessboard_size must be [cols, rows] "
+                             f"of inner corners (>= 2), got {value!r}")
+        return value
+
+
+class CalibrationIntrinsics(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["realsense", "opencv", "file"] = "realsense"
+    file: Optional[str] = None                   # JSON {"K", "D"}, source = file only
+    min_views_warn: int = Field(default=10, ge=1)
+
+    @model_validator(mode="after")
+    def _file_when_needed(self) -> "CalibrationIntrinsics":
+        if self.source == "file" and not self.file:
+            raise ValueError("calibration.intrinsics.source = file needs calibration.intrinsics.file")
+        return self
+
+
+class CalibrationHandEye(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["PARK", "TSAI", "HORAUD", "ANDREFF", "DANIILIDIS"] = "PARK"
+    outlier_sigma: float = Field(default=0.5, ge=0.0)
+    max_reproj_err_px: float = Field(default=0.4, gt=0.0)
+    only_images: List[str] = Field(default_factory=list)
+
+
+class CalibrationAcquisition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    n_calib_target: int = Field(default=30, ge=1)
+    n_val_target: int = Field(default=20, ge=1)
+    preview_margin_px: int = Field(default=60, ge=0)
+
+
+class CalibrationValidation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    save_overlay: bool = True
+
+
+class CalibrationCamera(BaseModel):
+    """Colour-sensor settings for the calibration views only (resolution, fps
+    and frame averaging come from acquisition.camera)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    frame_timeout_ms: int = Field(default=10000, ge=1)
+    auto_exposure: bool = False
+    exposure: Optional[float] = 120
+    gain: Optional[float] = 16
+    auto_white_balance: bool = True
+    white_balance: Optional[float] = None
+
+
+class CalibrationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    board:       CalibrationBoard
+    intrinsics:  CalibrationIntrinsics  = Field(default_factory=CalibrationIntrinsics)
+    hand_eye:    CalibrationHandEye     = Field(default_factory=CalibrationHandEye)
+    acquisition: CalibrationAcquisition = Field(default_factory=CalibrationAcquisition)
+    validation:  CalibrationValidation  = Field(default_factory=CalibrationValidation)
+    camera:      CalibrationCamera      = Field(default_factory=CalibrationCamera)
+
+
+# =============================================================================
+# Mufasa — where vision / registration run.
+# =============================================================================
+
+class MufasaConfig(BaseModel):
+    """``mufasa:`` section: run vision / registration on this PC or on Mufasa.
+
+    ``enabled: true`` → ``spectra vision``, ``spectra registration`` and the
+    vision / registration part of ``spectra full`` are submitted to Mufasa as
+    a SLURM job (``spectra/acquisition/remote.py``): inputs and results live in
+    ``repo_dir`` on Mufasa (DATA/, RESULTS/) and only ``pull_patterns`` come back. ``enabled: false`` → everything runs on this PC. The acquisition
+    always runs on this PC. The run config sent with each job has no
+    ``mufasa:`` section, so the job itself always runs locally on the GPU node.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    host: Optional[str] = None
+    port: int = Field(default=22, ge=1, le=65535)
+    user: Optional[str] = None
+    ssh_key_path: Optional[str] = None          # None = ask for the password
+    repo_dir: Optional[str] = None              # repo clone on Mufasa: DATA/ + RESULTS/ there
+    slurm_bin_dirs: List[str] = Field(default_factory=list)
+    partition: str = "jobs"
+    qos: str = "gpuwide"
+    gres: str = "gpu:4g.20gb:1"
+    cpus: int = Field(default=8, ge=1)
+    mem: str = "64G"
+    time: str = "12:00:00"
+    job_name: str = "spectra"
+    wait: bool = True
+    poll_s: int = Field(default=20, ge=1)
+    pull_results: bool = True
+    #: Downloaded after the job, relative to RESULTS/<date>/<sample>/ on Mufasa
+    #: ("dir/glob"); everything else stays on Mufasa.
+    pull_patterns: List[str] = Field(default_factory=lambda: [
+        "registration/*.xlsx", "registration/*.rrd", "registration/*.rbl"])
+
+    @model_validator(mode="after")
+    def _required_when_enabled(self) -> "MufasaConfig":
+        if self.enabled:
+            missing = [k for k in ("host", "user", "repo_dir")
+                       if not getattr(self, k)]
+            if missing:
+                raise ValueError(f"mufasa.enabled=true needs mufasa.{missing} to be set.")
         return self
 
 
@@ -239,7 +416,8 @@ class UnifiedConfig(BaseModel):
     A standalone Vision config and a standalone Registration config remain
     valid as the ``vision:`` / ``registration:`` sub-trees. The extra
     top-level fields (``sample_name``, ``data_root``, ``results_root``,
-    ``stages``) drive automatic path derivation for ``spectra full``.
+    ``stages``) drive automatic path derivation for ``spectra full``;
+    ``mufasa`` decides where vision / registration run.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -252,7 +430,9 @@ class UnifiedConfig(BaseModel):
     #: today. Pin an older date to re-run registration against that day's
     #: vision outputs.
     results_date: Optional[str] = None
-    stages: List[Literal["vision", "registration"]] = Field(
+    #: Stages run by ``spectra full``. "acquisition" (robot, always on this
+    #: PC) is opt-in so a config without it never moves the robot.
+    stages: List[Literal["acquisition", "vision", "registration"]] = Field(
         default_factory=lambda: ["vision", "registration"],
     )
 
@@ -264,6 +444,10 @@ class UnifiedConfig(BaseModel):
     #: and marker edge length are NOT repeated here — acquisition reads them
     #: from ``vision.aruco`` (single source of truth).
     acquisition:  Optional[dict[str, Any]] = None
+    #: Where vision / registration run (this PC or Mufasa). ``None`` = this PC.
+    mufasa:       Optional[MufasaConfig] = None
+    #: Hand-eye + intrinsics calibration of the robot camera (spectra calibrate).
+    calibration:  Optional[CalibrationConfig] = None
 
     @field_validator("results_date")
     @classmethod
@@ -278,6 +462,19 @@ class UnifiedConfig(BaseModel):
                 f"results_date must be formatted dd-mm-yyyy, got {value!r}"
             ) from exc
         return value
+
+    @model_validator(mode="after")
+    def _check_stages_and_sections(self) -> "UnifiedConfig":
+        if not self.stages:
+            raise ValueError("stages must list at least one of acquisition / vision / registration.")
+        if isinstance(self.acquisition, dict) and "remote" in self.acquisition:
+            raise ValueError(
+                "acquisition.remote has moved to the top-level `mufasa:` section "
+                "(with `enabled: true|false`); `submit_after_acquisition` no longer "
+                "exists: `spectra full` submits after the acquisition when "
+                "mufasa.enabled is true."
+            )
+        return self
 
     @model_validator(mode="after")
     def _resolve_roots(self) -> "UnifiedConfig":
@@ -415,8 +612,11 @@ __all__ = [
     "RegistrationPaths",
     "RegistrationPointcloud",
     "RegistrationRender",
+    "RegistrationRerun",
     "RegistrationRoiAlign",
     "RegistrationSweep",
+    "MufasaConfig",
+    "CalibrationConfig",
     # Unified
     "UnifiedConfig",
     # I/O

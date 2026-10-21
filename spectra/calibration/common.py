@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""
-common.py
-=========
-Helpers shared by acquisition, intrinsics, hand-eye and validation:
-pose conventions, chessboard detection, file pairing and intrinsics loading.
+"""Shared by acquisition, intrinsics, hand-eye and validation: settings from the
+unified config, pose conventions, chessboard detection, file pairing and
+intrinsics loading.
 
-File convention: imgXXXX.png + posaXXXX.txt (x,y,z in mm; rx,ry,rz in deg,
-Fairino Euler ZYX), TCP = bare flange (tool 0).
+View files: imgXXXX.png + posaXXXX.txt (flange pose x,y,z mm; rx,ry,rz deg,
+Fairino Euler convention), TCP = bare flange (tool 0).
 """
+
+from __future__ import annotations
 
 import glob
 import json
@@ -22,6 +22,52 @@ CB_FLAGS = (cv.CALIB_CB_ADAPTIVE_THRESH + cv.CALIB_CB_NORMALIZE_IMAGE +
 SUBPIX = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
 
+# -------------------------------------------------------------- settings ---
+def settings(ucfg) -> dict:
+    """Plain dict used by the calibration modules, from a UnifiedConfig.
+
+    Robot (ip, tool, euler_order) and camera stream (width, height, fps,
+    n_avg_frames) come from `acquisition.robot` / `acquisition.camera`; the
+    rest from `calibration:`. Paths are fixed under
+    <data_root>/camera_calibration/{input,output}/{calibration,validation,intrinsics}.
+    """
+    if ucfg.calibration is None:
+        raise SystemExit("[calibration] `calibration:` section missing in the config")
+    cal = ucfg.calibration.model_dump()
+    acq = ucfg.acquisition or {}
+    robot, cam = acq.get("robot") or {}, acq.get("camera") or {}
+    euler = str(robot.get("euler_order", "ZYX")).upper()
+    if euler not in ("ZYX", "XYZ"):
+        raise SystemExit(f"[calibration] acquisition.robot.euler_order is {euler!r}: the "
+                         "calibration needs the explicit convention, ZYX or XYZ.")
+
+    root = os.path.abspath(os.path.join(str(ucfg.data_root), "camera_calibration"))
+    paths = {
+        "root": root,
+        "cal_in": os.path.join(root, "input", "calibration"),
+        "val_in": os.path.join(root, "input", "validation"),
+        "cal_out": os.path.join(root, "output", "calibration"),
+        "intr_out": os.path.join(root, "output", "intrinsics"),
+        "val_out": os.path.join(root, "output", "validation"),
+    }
+    for d in list(paths.values()):
+        os.makedirs(d, exist_ok=True)
+    paths["intr_realsense"] = os.path.join(paths["cal_in"], "intrinsics_realsense.json")
+    paths["intr_opencv"] = os.path.join(paths["intr_out"], "intrinsics_opencv.json")
+    f = cal["intrinsics"]["file"]
+    paths["intr_file"] = os.path.abspath(os.path.expanduser(f)) if f else None
+    paths["cam2gripper"] = os.path.join(paths["cal_out"], "cam2gripper.txt")
+
+    cal["hand_eye"]["euler_order"] = euler
+    cal["acquisition"].update(robot_ip=robot.get("ip", "192.168.58.2"),
+                              expected_tool=int(robot.get("tool", 0)))
+    cal["camera"].update(width=int(cam.get("width", 1280)), height=int(cam.get("height", 800)),
+                         fps=int(cam.get("fps", 15)),
+                         n_avg_frames=int(cam.get("n_avg_frames", 5)))
+    cal["_paths"] = paths
+    return cal
+
+
 # ----------------------------------------------------------------- poses ---
 def euler_deg_to_R(rx, ry, rz, order="ZYX"):
     rx, ry, rz = map(math.radians, (rx, ry, rz))
@@ -31,18 +77,31 @@ def euler_deg_to_R(rx, ry, rz, order="ZYX"):
     return (Rz @ Ry @ Rx) if order == "ZYX" else (Rx @ Ry @ Rz)
 
 
-def pose_to_T(pose, order="ZYX"):
+def to_T(R, t):
     T = np.eye(4)
-    T[:3, :3] = euler_deg_to_R(pose[3], pose[4], pose[5], order)
-    T[:3, 3] = pose[:3]
+    T[:3, :3] = R
+    T[:3, 3] = np.ravel(t)
     return T
+
+
+def mean_rotation(Rs):
+    """Rotation closest to the sum of Rs (SVD projection)."""
+    U, _, Vt = np.linalg.svd(sum(Rs))
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        U[:, -1] *= -1
+        R = U @ Vt
+    return R
+
+
+def pose_to_T(pose, order="ZYX"):
+    return to_T(euler_deg_to_R(pose[3], pose[4], pose[5], order), pose[:3])
 
 
 def read_pose(path):
     with open(path) as f:
         txt = f.read().strip().replace('[', '').replace(']', '').replace(';', ',')
-    sep = ',' if ',' in txt else None
-    vals = [float(v) for v in (txt.split(sep) if sep else txt.split())]
+    vals = [float(v) for v in (txt.split(',') if ',' in txt else txt.split())]
     if len(vals) < 6:
         raise ValueError(f"Invalid pose file: {path}")
     return vals[:6]
@@ -70,13 +129,16 @@ def detect_board(img, size):
 
 
 # ----------------------------------------------------------------- files ---
+def list_images(folder):
+    return sorted(glob.glob(os.path.join(folder, "img*.png")) +
+                  glob.glob(os.path.join(folder, "img*.jpg")))
+
+
 def list_views(folder, only=None):
     """[(num, img_path, pose_path)] for every imgXXXX with a matching posaXXXX.txt."""
-    imgs = sorted(glob.glob(os.path.join(folder, "img*.png")) +
-                  glob.glob(os.path.join(folder, "img*.jpg")))
+    imgs = list_images(folder)
     if only:
-        wanted = set(only)
-        imgs = [p for p in imgs if os.path.basename(p) in wanted]
+        imgs = [p for p in imgs if os.path.basename(p) in set(only)]
     out = []
     for ip in imgs:
         num = os.path.splitext(os.path.basename(ip))[0][3:]
@@ -90,11 +152,9 @@ def list_views(folder, only=None):
 
 def next_index(folder):
     """Progressive numbering: continue after the files already in the folder."""
-    nums = []
-    for p in glob.glob(os.path.join(folder, "img*.png")):
-        stem = os.path.splitext(os.path.basename(p))[0][3:]
-        if stem.isdigit():
-            nums.append(int(stem))
+    nums = [int(s) for s in (os.path.splitext(os.path.basename(p))[0][3:]
+                             for p in glob.glob(os.path.join(folder, "img*.png")))
+            if s.isdigit()]
     return (max(nums) if nums else 0) + 1
 
 
@@ -109,10 +169,9 @@ def realsense_intrinsics(profile, rs):
 
 def _read_realsense_live(cfg):
     import pyrealsense2 as rs
-    R = cfg["realsense"]
+    C = cfg["camera"]
     pipe, rcfg = rs.pipeline(), rs.config()
-    rcfg.enable_stream(rs.stream.color, int(R["width"]), int(R["height"]),
-                       rs.format.bgr8, int(R["fps"]))
+    rcfg.enable_stream(rs.stream.color, C["width"], C["height"], rs.format.bgr8, C["fps"])
     prof = pipe.start(rcfg)
     try:
         return realsense_intrinsics(prof, rs)
@@ -121,10 +180,10 @@ def _read_realsense_live(cfg):
 
 
 def load_intrinsics(cfg):
-    """K, D and info dict, from the source chosen in config.yaml.
-    The same values are used for calibration AND validation."""
+    """K, D and info dict from calibration.intrinsics.source. The same values
+    are used for calibration AND validation."""
     P = cfg["_paths"]
-    source = str(cfg["intrinsics"]["source"]).lower()
+    source = cfg["intrinsics"]["source"]
     if source == "realsense":
         path = P["intr_realsense"]
         if not os.path.exists(path):
@@ -135,13 +194,11 @@ def load_intrinsics(cfg):
     elif source == "opencv":
         path = P["intr_opencv"]
         if not os.path.exists(path):
-            raise SystemExit(f"{path} not found: run 'python main.py intrinsics' first.")
-    elif source == "file":
+            raise SystemExit(f"{path} not found: run `spectra calibrate --modality intrinsics` first.")
+    else:   # file
         path = P["intr_file"]
         if not path or not os.path.exists(path):
-            raise SystemExit(f"intrinsics.file not found: {path}")
-    else:
-        raise SystemExit(f"Unknown intrinsics.source: {source} (realsense | opencv | file)")
+            raise SystemExit(f"calibration.intrinsics.file not found: {path}")
 
     with open(path) as f:
         d = json.load(f)

@@ -17,7 +17,9 @@ Vision and read by Registration:
 | `surface_mesh.ply` | reconstructed surface, metres, in the ArUco-aligned output frame |
 | `aruco_markers_3d.json` | 3D marker corners in the same frame |
 
-Everything is driven by one YAML config and one CLI (`spectra`).
+Everything is driven by one YAML config and one CLI (`spectra`). On the robot
+PC the same CLI also calibrates the camera (`spectra calibrate`, §8) and
+acquires the RGB views (`spectra acquire`).
 
 ---
 
@@ -30,6 +32,7 @@ Everything is driven by one YAML config and one CLI (`spectra`).
 - [5. Running locally](#5-running-locally)
 - [6. Running on Mufasa (SLURM)](#6-running-on-mufasa-slurm)
 - [7. Outputs](#7-outputs)
+- [8. Camera calibration (robot PC)](#8-camera-calibration-robot-pc)
 
 
 ---
@@ -78,10 +81,14 @@ Both `mast3r/` and `asmk/` are in `.gitignore` and are never committed.
 ### 1.3 Create the environment
 
 ```bash
-uv sync                                            # pyproject deps + torch (cu130 index)
+uv sync --extra processing                         # core + vision/registration deps + torch (cu130 index)
 uv run pip install -r mast3r/requirements.txt
 uv run pip install -r mast3r/dust3r/requirements.txt
 ```
+
+The `processing` extra (torch, open3d, trimesh, ...) is what vision and
+registration need; the core alone is the light robot-PC install (§1.7). A plain
+`uv sync` removes the extra again: always pass `--extra processing` here.
 
 ### 1.4 Build and install ASMK
 
@@ -165,6 +172,20 @@ pip install "numpy>=1.24" "opencv-python>=4.8" "PyYAML>=6.0" "pyrealsense2>=2.54
 checks, `rerun-sdk` the live viewer, `paramiko` the hand-off to Mufasa. The Fairino SDK is not on PyPI: it is the
 `Robot.py` copied below (pure Python, standard library only).
 
+For the `spectra` commands the robot PC uses the repo's `uv` environment, and
+what it installs follows `mufasa.enabled`:
+
+| `mufasa.enabled` | Robot PC install | Runs here |
+| --- | --- | --- |
+| `true` | `uv sync --extra acquisition` (no torch, no GPU) | acquisition; vision + registration go to Mufasa |
+| `false` | `uv sync --extra acquisition --extra processing` + MASt3R / ASMK (§1.3–§1.4), CUDA GPU | everything |
+
+The heavy modules are imported only when vision / registration run on this
+PC, so the light install is enough with `mufasa.enabled: true`. With `false`,
+the CLI checks before anything starts (and before the robot moves) that the
+`processing` packages, MASt3R and a CUDA GPU are there, and prints the command
+to run if they are not.
+
 The Fairino Python SDK and the FR5 URDF + meshes are **not** committed (they
 are in `.gitignore`), so copy them into `spectra/acquisition/` by hand, e.g.
 from the lab copy in `Fairino/VisuoServoing/`:
@@ -240,7 +261,7 @@ bash Setup_env.sh        # run on the LOGIN node, NOT via sbatch
 
 `Setup_env.sh` assumes the repo is exactly at `~/SpectraBreast-Full`. It
 installs `uv` if absent (no `sudo` needed), checks that `mast3r/` and
-`mast3r/asmk/` exist, runs `uv sync`, installs the MASt3R and dust3r
+`mast3r/asmk/` exist, runs `uv sync --extra processing`, installs the MASt3R and dust3r
 requirements, cythonizes and installs ASMK, then smoke-tests `torch`, CUDA
 visibility and `import spectra`. This one script replaces the manual pip
 commands from §1.3–§1.5.
@@ -333,6 +354,26 @@ X Y Z ROLL PITCH YAW
 Both `poses/` and `camera_parameters/` are fully optional — with neither, Vision
 runs pure SfM and takes its metric scale from the ArUco markers alone.
 
+### 3.4 Camera calibration layout
+
+Fixed, under `data_root`; written and read by `spectra calibrate` (§8):
+
+```
+DATA/
+└── camera_calibration/
+    ├── input/
+    │   ├── calibration/     imgXXXX.png + posaXXXX.txt (+ intrinsics_realsense.json)
+    │   └── validation/      imgXXXX.png + posaXXXX.txt
+    └── output/
+        ├── calibration/     cam2gripper.txt, matrici_4x4.txt, gripper2base.txt,
+        │                    kept_images.txt, intrinsics_used.json
+        ├── intrinsics/      intrinsics_opencv.json
+        └── validation/      validation_report.csv, overlay_X/, overlay_Y/
+```
+
+`posaXXXX.txt` holds the flange pose as read from the controller: `x,y,z,rx,ry,rz`
+in mm and degrees (convention `acquisition.robot.euler_order`).
+
 
 
 ## 4. CLI reference
@@ -345,9 +386,25 @@ uv run python -m spectra ...
 uv run python -m spectra.cli ...
 ```
 
+**Where it runs** is set once in the YAML, by `mufasa.enabled`:
+
+| Command | `mufasa.enabled: true` | `mufasa.enabled: false` |
+| --- | --- | --- |
+| `spectra full` | acquisition here → vision + registration on Mufasa | acquisition → vision → registration here |
+| `spectra vision` | on Mufasa | here (CUDA GPU required) |
+| `spectra registration` | on Mufasa | here |
+| `spectra acquire` | acquisition only, here | acquisition only, here |
+| `spectra calibrate` | here (robot PC) | here (robot PC) |
+
+"On Mufasa" means: upload what the stage needs (unless already there), `sbatch`
+a job that runs it on a GPU node, wait, download the selected results here (see
+[`remote.py`](#remotepy-mufasa-hand-off)). Every job is launched from this PC
+with this PC's config.
+Inside a SLURM job `mufasa.enabled` is ignored and everything runs on the node.
+
 ### `spectra vision`
 
-MASt3R-SfM + ArUco reconstruction.
+MASt3R-SfM + ArUco reconstruction, here or on Mufasa (`mufasa.enabled`).
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -358,7 +415,9 @@ MASt3R-SfM + ArUco reconstruction.
 
 ### `spectra registration`
 
-HSI → mesh registration. Requires Vision outputs to exist already.
+HSI → mesh registration, here or on Mufasa (`mufasa.enabled`). Requires Vision
+outputs to exist already: on Mufasa it uses the vision run already there, or
+this PC's if newer. `--mode batch` runs only here.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -371,20 +430,26 @@ HSI → mesh registration. Requires Vision outputs to exist already.
 
 ### `spectra full`
 
-Vision → Registration on one sample.
+The stages listed in `stages:` (default `["acquisition", "vision", "registration"]`)
+on one sample: acquisition on this PC, then vision → registration here or on
+Mufasa (`mufasa.enabled`). Drop `"acquisition"` from `stages` to re-run
+vision/registration on a sample already acquired. Before the robot moves it
+checks that the rest can run: SSH login + repo on Mufasa, or a CUDA GPU here.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `-c`, `--config` PATH | required | Unified YAML with both stage sections |
 | `--sample` TEXT | from YAML | Override `sample_name` |
-| `-s`, `--set` KEY=VAL | — | Dotted override, repeatable |
+| `-s`, `--set` KEY=VAL | — | Dotted override, repeatable (not for `acquisition.*`) |
 | `--cpu` | off | Force CPU raycasting in Registration |
-| `--force-vision` | off | Re-run Vision even if its outputs exist |
-| `--dry-run` | off | Print the plan, run nothing |
+| `--force-vision` | off | Re-run Vision even if its outputs exist (here; on Mufasa it always runs) |
+| `--overwrite` | off | Acquisition: replace an existing acquisition for the same sample |
+| `--no-viz` | off | Acquisition: disable the Rerun viewer |
+| `--dry-run` | off | Print the plan (and the Mufasa run config), run nothing |
 
 **Vision is skipped automatically** when both `RESULTS/<dd-mm-yyyy>/<sample>/vision/surface_mesh.ply`
 and `RESULTS/<dd-mm-yyyy>/<sample>/vision/aruco_markers_3d.json` already exist
-for `results_date` (today by default). Use
+for `results_date` (today by default), unless the acquisition just ran. Use
 `--force-vision` to override. Which stages run at all is also gated by the
 `stages:` list in the YAML — `spectra vision` and `spectra registration` ignore it.
 
@@ -414,8 +479,10 @@ Local 3D viewer (Gradio) for the runs under a results folder.
 
 ### `spectra calibrate-intrinsics`
 
-Checkerboard intrinsic calibration. Writes `intrinsics.npy` and
-`distortions.npy`, the files expected in `camera_parameters/` (§3.1).
+Generic checkerboard intrinsic calibration of any image folder. Writes
+`intrinsics.npy` and `distortions.npy`, the files expected in
+`camera_parameters/` (§3.1). The robot camera is calibrated by
+`spectra calibrate` (§8).
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -425,13 +492,40 @@ Checkerboard intrinsic calibration. Writes `intrinsics.npy` and
 | `--checkerboard-rows` INT | `7` | Inner corners per column |
 | `--square-size-m` FLOAT | `0.024` | Square edge in metres |
 
+### `spectra calibrate`
+
+Hand-eye (camera → flange) and intrinsics of the robot camera, with validation.
+Robot PC only (§8). Without `--modality` it runs the whole procedure:
+calibration acquisition → intrinsics → hand-eye → validation acquisition →
+validation.
+
+```bash
+uv run spectra calibrate                                   # everything
+uv run spectra calibrate --modality calibration acquire    # drag-mode views only
+uv run spectra calibrate --modality calibration calibrate  # hand-eye on the saved views
+uv run spectra calibrate --modality calibration            # = full: acquire + calibrate
+uv run spectra calibrate --modality intrinsics             # OpenCV intrinsics
+uv run spectra calibrate --modality validation validate    # metrics X / Y
+uv run spectra calibrate --modality validation             # = full: acquire + validate
+```
+
+| Flag / argument | Default | Meaning |
+| --- | --- | --- |
+| `-m`, `--modality` | — (everything) | `calibration` \| `validation` \| `intrinsics` |
+| `STEP` | `full` | `calibration`: `acquire` \| `calibrate` \| `full`; `validation`: `acquire` \| `validate` \| `full`; none for `intrinsics` |
+| `-c`, `--config` PATH | `configs/default.yaml` | Unified YAML (needs a `calibration:` section) |
+
+The acquisition steps need `uv sync --extra acquisition` and the Fairino SDK
+(§1.7); intrinsics, hand-eye and validation are offline and run with the core
+install.
+
 ### `spectra acquire`
 
 Fairino FR5 + RealSense acquisition with visual servoing, through the `spectra`
-console script. Same behaviour as `acquire.py` below, but it needs the full
-environment of §1.3 (the `spectra` package imports torch / MASt3R) plus the
-robot-PC extra: `uv sync --extra acquisition` (RealSense, collision checks,
-`paramiko` for the hand-off to Mufasa).
+console script. Acquisition only: it never submits anything, `spectra full`
+chains vision + registration after it. Same behaviour as `acquire.py` below;
+it needs `uv sync --extra acquisition` (RealSense, collision checks), not the
+`processing` extra (§1.7).
 
 ```bash
 uv run spectra acquire --mode verify
@@ -447,7 +541,6 @@ uv run spectra acquire --sample SB021
 | `--ip` TEXT | `acquisition.robot.ip` | Robot controller IP |
 | `--no-viz` | off | Disable the Rerun viewer |
 | `--overwrite` | off | Replace an existing acquisition for the same sample |
-| `--submit` / `--no-submit` | `acquisition.remote.submit_after_acquisition` | Send the sample to Mufasa after the acquisition (see `remote.py` below) |
 
 ### `acquire.py` (robotic acquisition)
 
@@ -471,45 +564,74 @@ python spectra/acquisition/acquire.py --config configs/default.yaml --sample SB0
 | `--no-viz` | off | Disable the Rerun viewer |
 | `--overwrite` | off | Replace an existing acquisition for the same sample |
 | `--reset` | off | Reset robot errors and exit |
-| `--submit` / `--no-submit` | `acquisition.remote.submit_after_acquisition` | Send the sample to Mufasa after the acquisition (see `remote.py` below) |
 
 ArUco dictionary and marker edge length are read from `vision.aruco`. The
 Fairino SDK (`spectra/acquisition/fairino/`) and the FR5 URDF + meshes
 (`spectra/acquisition/fairino_description/`) are not versioned: copy them there
 locally before running.
 
-### `remote.py` (hand-off to Mufasa)
+### `remote.py` (Mufasa hand-off)
 
-Runs on the robot PC. When `acquisition.remote.submit_after_acquisition` is
-true, `acquire.py` calls it at the end of every acquisition: it uploads
-`DATA/input_vision/<sample>/` (and `DATA/input_registration/<sample>/` if the
-HSI cube is there) to `acquisition.remote.runs_dir/<sample>_<timestamp>/` on
-Mufasa, checks the upload against `SHA256SUMS`, submits `spectra full` with
-`sbatch`, waits for the job and downloads `RESULTS/` into the local
-`results_root`. Without the HSI cube only Vision runs. Use it by hand to
-(re)submit a sample already on disk:
+Runs on this PC and is what "on Mufasa" means above: `spectra full`,
+`spectra vision` and `spectra registration` call it when `mufasa.enabled` is
+true. On Mufasa everything lives in the repo clone `mufasa.repo_dir`, with the
+same layout as here:
+
+```
+<repo_dir>/DATA/input_vision/<sample>/          inputs, kept between jobs
+<repo_dir>/DATA/input_registration/<sample>/
+<repo_dir>/RESULTS/<dd-mm-yyyy>/<sample>/
+    vision/  registration/                      results (all of them stay here)
+    _job/    run_config.yaml, job.slurm, slurm-<jobid>.out
+```
+
+Inputs go by sample name and only what is missing or changed is uploaded (same
+size and modification time = already there):
+
+| Stage | Input on Mufasa |
+| --- | --- |
+| vision | `DATA/input_vision/<sample>/` mirrored from this PC (stale files removed), checked against `SHA256SUMS` |
+| registration | `DATA/input_registration/<sample>/` from this PC; if it is not here, the copy already on Mufasa is used |
+| registration without vision | the vision run already on Mufasa, or this PC's when it is the one the pipeline would pick (same date, or newer) |
+
+Then it submits `spectra full` for those stages with `sbatch` (vision always
+re-runs: `RESULTS/` on Mufasa is shared between jobs), waits for the job and
+downloads only `mufasa.pull_patterns` of the stages that ran — by default the
+registration Excel reports and the spectral Rerun recording
+(`registration/*.xlsx`, `*.rrd`, `*.rbl`) — into the local
+`RESULTS/<dd-mm-yyyy>/<sample>/`. In `spectra full`, without the HSI cube
+(here or on Mufasa) only Vision runs. CLI overrides (`--sample`, `--date`,
+`--mode`, `--set`) travel with the job. Paths set by hand in the YAML
+(`vision.input.*`, `registration.paths.*`) are refused: on Mufasa every path is
+derived from `sample_name`. Use it by hand to (re)submit a sample:
 
 ```bash
 python spectra/acquisition/remote.py --sample SB021
+python spectra/acquisition/remote.py --sample SB021 --stages registration
 python spectra/acquisition/remote.py --sample SB021 --no-wait   # submit and return
+python spectra/acquisition/remote.py --sample SB021 --dry-run   # what would be uploaded
 ```
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--config` PATH | `configs/default.yaml` | Unified YAML (needs `acquisition.remote`) |
-| `--sample` TEXT | from YAML | Sample folder under `DATA/input_vision/` |
+| `--config` PATH | `configs/default.yaml` | Unified YAML (needs `mufasa.enabled: true`) |
+| `--sample` TEXT | from YAML | Sample name |
+| `--stages` ... | `stages` in the YAML | `vision` and/or `registration` |
 | `--no-wait` | off | Submit and return, do not wait for the job |
 | `--no-pull` | off | Do not download the results |
+| `--dry-run` | off | Print what would be uploaded and the run config, send nothing |
 
-Requirements: robot PC on the Polimi LAN or VPN, an SSH key authorised on
-Mufasa (`acquisition.remote.ssh_key_path`; `null` asks for the password), the
-repo cloned at `acquisition.remote.repo_dir` with `Setup_env.sh` done. The QOS
-allow one job at a time (`MaxSubmit=1`).
+Requirements: this PC on the Polimi LAN or VPN, an SSH key authorised on
+Mufasa (`mufasa.ssh_key_path`; `null` asks for the password), the repo cloned
+at `mufasa.repo_dir` with `Setup_env.sh` done. The QOS allow one job at a time
+(`MaxSubmit=1`).
 
 The marker edge length is set only in `configs/default.yaml`
 (`vision.aruco.marker_edge_length_mm`; any other config or `--set` that sets it
 is rejected). Each submitted run carries its own copy of the local config,
-`<runs_dir>/<sample>_<timestamp>/run_config.yaml`, and the job points
+`RESULTS/<dd-mm-yyyy>/<sample>/_job/run_config.yaml` on Mufasa (without the
+`acquisition:`, `calibration:` and `mufasa:` sections, so the job never submits
+again, and with `results_date` pinned to the submission day), and the job points
 `SPECTRA_DEFAULT_CONFIG` at it: for that run it is the default config, so the
 `configs/default.yaml` of the repo on Mufasa is neither read nor modified and
 the two never need to be kept in sync by hand.
@@ -518,8 +640,9 @@ the two never need to be kept in sync by hand.
 
 ## 5. Running locally
 
-Requires a CUDA GPU for MASt3R-SfM. Registration falls back to CPU raycasting
-(`--cpu`), Vision does not.
+With `mufasa.enabled: false` and the `processing` extra installed (§1.3).
+Requires a CUDA GPU for MASt3R-SfM (checked before anything runs). Registration falls back to CPU raycasting (`--cpu`),
+Vision does not.
 
 Either prefix everything with `uv run`:
 
@@ -568,10 +691,13 @@ sbatch run_spectra.sh
 of the file — edit it:
 
 ```bash
-uv run spectra vision --config configs/default.yaml
-#uv run spectra registration --config configs/default.yaml
-#uv run spectra full --config configs/default.yaml
+uv run --extra processing spectra vision --config configs/default.yaml
+#uv run --extra processing spectra registration --config configs/default.yaml
+#uv run --extra processing spectra full --config configs/default.yaml
 ```
+
+Inside the job `mufasa.enabled` is ignored and the `acquisition` stage is
+skipped (no robot on the cluster).
 
 ### 6.3 Monitoring
 
@@ -634,6 +760,8 @@ RESULTS/
         │   ├── spectral_pointcloud_SB021_spectra.bin     float32 memmap, (N,bands)
         │   ├── spectral_pointcloud_SB021_wavelengths.npy wavelengths in nm
         │   ├── spectral_pointcloud_SB021_meta.npy        int64 [N,3,N,bands] — memmap shapes
+        │   ├── spectral.rrd                              Rerun: band + PCA views (if rerun.enabled)
+        │   ├── spectral.rbl                              Rerun layout (if rerun.save_rbl)
         │   ├── SB021_registration_errors.xlsx            2D/3D errors + Timings sheet
         │   ├── SB021_registration.png                    HSI + render overlay with ArUco
         │   ├── SB021_coverage.png                        HSI → mesh coverage map
@@ -644,3 +772,69 @@ RESULTS/
         └── .mast3r_sfm_cache/                      intermediate SfM cache, safe to delete
                                                     (removed automatically when vision.output.clean_sfm_cache: true)
 ```
+
+---
+
+## 8. Camera calibration (robot PC)
+
+`spectra calibrate` estimates `cam2gripper` (camera → flange) from chessboard
+views taken in **drag mode** (you move the robot by hand), and optionally the
+camera intrinsics, then validates the result on new views. No starting
+`cam2gripper` is needed. Code in `spectra/calibration/`, settings in the
+`calibration:` section of `configs/default.yaml`; robot (`ip`, `tool`,
+`euler_order`) and camera stream (`width`, `height`, `fps`, `n_avg_frames`)
+come from `acquisition.robot` / `acquisition.camera`. Data in
+`DATA/camera_calibration/` (§3.4).
+
+The result feeds the acquisition directly: with
+`acquisition.hand_eye.T_cam2gripper: null` (default) `spectra acquire` reads
+`DATA/camera_calibration/output/calibration/cam2gripper.txt`; a 4x4 matrix
+there pins a specific calibration instead. To acquire with the OpenCV
+intrinsics, set `acquisition.camera.intrinsics` to
+`DATA/camera_calibration/output/intrinsics/intrinsics_opencv.json`.
+
+### 8.1 Procedure
+
+**Before starting:** the active tool on the controller must be
+`acquisition.robot.tool` (0 = bare flange); the acquisition checks it and
+refuses to start otherwise. The chessboard must **not move** from the first
+calibration view to the last validation view.
+
+1. **Calibration views** (~30, `calibration.acquisition.n_calib_target`):
+   `--modality calibration acquire`. Move the robot by hand, frame the
+   chessboard, keep still, **ENTER** saves, **q/ESC** quits. Views without the
+   chessboard are not saved; re-running continues the numbering. Vary the
+   orientation a lot (tilt in all directions + roll around the optical axis).
+   The factory intrinsics are saved once in `input/calibration/intrinsics_realsense.json`.
+2. **Intrinsics** — `calibration.intrinsics.source`, used by both hand-eye and
+   validation:
+   - `realsense`: factory values, nothing to do;
+   - `opencv`: `--modality intrinsics` (target: mean reprojection < ~0.3 px);
+   - `file`: a JSON `{"K": [[fx,0,cx],[0,fy,cy],[0,0,1]], "D": [[k1,k2,p1,p2,k3]]}`
+     in `calibration.intrinsics.file`. From MATLAB: `K = cameraParams.Intrinsics.K`
+     (not the transposed `IntrinsicMatrix`), subtract 1 from cx and cy (MATLAB
+     is 1-based), `D = [Radial(1) Radial(2) Tangential(1) Tangential(2) Radial(3)]`
+     (k3 = 0 with only 2 radial coefficients).
+3. **Hand-eye:** `--modality calibration calibrate` → `output/calibration/cam2gripper.txt`.
+   Views with PnP reprojection error above `calibration.hand_eye.max_reproj_err_px`
+   are excluded; the per-view residuals flag rotational outliers.
+4. **Validation:** `--modality validation` (acquire ~20 NEW views, then
+   validate). Only images and poses are written in `input/validation`; the
+   intrinsics are the same as the calibration's, with a warning if they differ
+   from `output/calibration/intrinsics_used.json`.
+
+`spectra calibrate` alone runs 1 → 2 (`opencv`) → 3 → 4 in one go.
+
+### 8.2 Metrics
+
+| Step | Metric | Good if |
+| --- | --- | --- |
+| Intrinsics (`opencv`) | mean reprojection error | < 1 px (sub-pixel) |
+| Hand-eye | std chessboard → base (self-check) | a few mm |
+| Validation | 3D error mm, metric **Y** | compatible with the task requirements |
+
+- **X** (self-consistency): board pose in base estimated from the validation images.
+- **Y** (out-of-sample, stricter): board pose in base estimated from the calibration images.
+
+Intrinsics are tied to the resolution (`acquisition.camera.width/height`):
+images at another resolution are rejected.

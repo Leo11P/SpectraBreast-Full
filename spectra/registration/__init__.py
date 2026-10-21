@@ -11,22 +11,37 @@ Public API:
   unchanged in behavior compared to the legacy ``spectrabreast/`` package.
 """
 
-from .pipeline import (
-    extract_suspicious_centroids,
-    load_mesh,
-    run_full_pipeline,
-    save_render,
-    save_turbo_render,
-)
-from .pipeline_roi import run_full_pipeline_roi
-from .roi_align import compute_roi_to_png_homography, load_liveview_png
-from .runner import run_registration
+# Every backend needs trimesh / openpyxl (and torch for GPU rendering):
+# imported on first use, so ``spectra.registration.<module>`` imports stay
+# explicit and the package itself imports with only the core dependencies.
+_LAZY = {
+    "extract_suspicious_centroids": ".pipeline",
+    "load_mesh": ".pipeline",
+    "run_full_pipeline": ".pipeline",
+    "save_render": ".pipeline",
+    "save_turbo_render": ".pipeline",
+    "run_full_pipeline_roi": ".pipeline_roi",
+    "compute_roi_to_png_homography": ".roi_align",
+    "load_liveview_png": ".roi_align",
+    "run_registration": ".runner",
+    "render_orthographic_topview_gpu": ".render_gpu",
+}
 
-# render_gpu is optional (requires torch / cupy)
-try:
-    from .render_gpu import render_orthographic_topview_gpu
-except ImportError:
-    render_orthographic_topview_gpu = None
+
+def __getattr__(name: str):
+    if name in _LAZY:
+        import importlib
+
+        try:
+            value = getattr(importlib.import_module(_LAZY[name], __name__), name)
+        except ImportError:
+            if name != "render_orthographic_topview_gpu":
+                raise
+            value = None          # optional: requires torch / cupy
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "compute_roi_to_png_homography",

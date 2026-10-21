@@ -3520,26 +3520,37 @@ name = "spectra"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "opencv-contrib-python" },
+    { name = "paramiko" },
+    { name = "pip" },
+    { name = "pyaml" },
+    { name = "pydantic" },
+    { name = "pyyaml" },
+    { name = "rerun-sdk" },
+    { name = "rich" },
+    { name = "typer" },
+]
+
+[package.optional-dependencies]
+acquisition = [
+    { name = "pyrealsense2" },
+    { name = "python-fcl" },
+    { name = "trimesh" },
+]
+gpu-raycast = [
+    { name = "cupy-cuda12x" },
+]
+processing = [
     { name = "einops" },
     { name = "gradio" },
     { name = "huggingface-hub" },
     { name = "jaxtyping", version = "0.3.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "jaxtyping", version = "0.3.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "open3d" },
-    { name = "opencv-contrib-python" },
     { name = "openpyxl" },
-    { name = "paramiko" },
     { name = "pillow" },
-    { name = "pip" },
-    { name = "pyaml" },
-    { name = "pydantic" },
-    { name = "pyrealsense2" },
-    { name = "python-fcl" },
-    { name = "pyyaml" },
-    { name = "rerun-sdk" },
-    { name = "rich" },
     { name = "roma" },
     { name = "rtree" },
     { name = "safetensors" },
@@ -3550,55 +3561,42 @@ dependencies = [
     { name = "torchvision" },
     { name = "tqdm" },
     { name = "trimesh" },
-    { name = "typer" },
-]
-
-[package.optional-dependencies]
-acquisition = [
-    { name = "paramiko" },
-    { name = "pyrealsense2" },
-    { name = "python-fcl" },
-]
-gpu-raycast = [
-    { name = "cupy-cuda12x" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "cupy-cuda12x", marker = "extra == 'gpu-raycast'", specifier = ">=12.0" },
-    { name = "einops", specifier = ">=0.8" },
-    { name = "gradio", specifier = ">=6.0" },
-    { name = "huggingface-hub", specifier = ">=0.20" },
-    { name = "jaxtyping", specifier = ">=0.3" },
+    { name = "einops", marker = "extra == 'processing'", specifier = ">=0.8" },
+    { name = "gradio", marker = "extra == 'processing'", specifier = ">=6.0" },
+    { name = "huggingface-hub", marker = "extra == 'processing'", specifier = ">=0.20" },
+    { name = "jaxtyping", marker = "extra == 'processing'", specifier = ">=0.3" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "open3d", specifier = ">=0.19" },
+    { name = "open3d", marker = "extra == 'processing'", specifier = ">=0.19" },
     { name = "opencv-contrib-python", specifier = ">=4.8" },
-    { name = "openpyxl", specifier = ">=3.1" },
+    { name = "openpyxl", marker = "extra == 'processing'", specifier = ">=3.1" },
     { name = "paramiko", specifier = ">=5.0.0" },
-    { name = "paramiko", marker = "extra == 'acquisition'", specifier = ">=3.0" },
-    { name = "pillow", specifier = ">=10.0" },
+    { name = "pillow", marker = "extra == 'processing'", specifier = ">=10.0" },
     { name = "pip", specifier = ">=26.1.2" },
     { name = "pyaml", specifier = ">=25.0" },
     { name = "pydantic", specifier = ">=2.8" },
-    { name = "pyrealsense2", specifier = ">=2.59.1.11053" },
-    { name = "pyrealsense2", marker = "extra == 'acquisition'", specifier = ">=2.54" },
-    { name = "python-fcl", specifier = ">=0.7.0.11" },
-    { name = "python-fcl", marker = "extra == 'acquisition'", specifier = ">=0.7" },
+    { name = "pyrealsense2", marker = "extra == 'acquisition'", specifier = ">=2.59.1.11053" },
+    { name = "python-fcl", marker = "extra == 'acquisition'", specifier = ">=0.7.0.11" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "rerun-sdk", specifier = ">=0.30" },
     { name = "rich", specifier = ">=13.0" },
-    { name = "roma", specifier = ">=1.5" },
-    { name = "rtree", specifier = ">=1.0" },
-    { name = "safetensors", specifier = ">=0.4" },
-    { name = "scipy", specifier = ">=1.11" },
-    { name = "textual", specifier = ">=0.60" },
-    { name = "torch", specifier = ">=2.2", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchvision", specifier = ">=0.17", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "tqdm", specifier = ">=4.66" },
-    { name = "trimesh", specifier = ">=4.0" },
+    { name = "roma", marker = "extra == 'processing'", specifier = ">=1.5" },
+    { name = "rtree", marker = "extra == 'processing'", specifier = ">=1.0" },
+    { name = "safetensors", marker = "extra == 'processing'", specifier = ">=0.4" },
+    { name = "scipy", marker = "extra == 'processing'", specifier = ">=1.11" },
+    { name = "textual", marker = "extra == 'processing'", specifier = ">=0.60" },
+    { name = "torch", marker = "extra == 'processing'", specifier = ">=2.2", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torchvision", marker = "extra == 'processing'", specifier = ">=0.17", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "tqdm", marker = "extra == 'processing'", specifier = ">=4.66" },
+    { name = "trimesh", marker = "extra == 'acquisition'", specifier = ">=4.0" },
+    { name = "trimesh", marker = "extra == 'processing'", specifier = ">=4.0" },
     { name = "typer", specifier = ">=0.12" },
 ]
-provides-extras = ["gpu-raycast", "acquisition"]
+provides-extras = ["acquisition", "processing", "gpu-raycast"]
 
 [[package]]
 name = "starlette"

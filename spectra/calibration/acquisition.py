@@ -1,8 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-acquisition.py
-==============
-Manual acquisition in DRAG TEACH mode, used for both calibration and validation:
+"""Manual acquisition in DRAG TEACH mode, for both calibration and validation:
 - the robot stays in drag mode (you move it by hand)
 - live RealSense preview with chessboard detection
 - ENTER -> save imgXXXX.png + posaXXXX.txt (only if the chessboard is detected)
@@ -12,33 +9,85 @@ Intrinsics:
 - calibration: the RealSense factory intrinsics are written ONCE to
   input/calibration/intrinsics_realsense.json (never overwritten).
 - validation: NOTHING but images and poses is written.
+
+Needs the robot-PC install (`uv sync --extra acquisition`) and the Fairino SDK
+in spectra/acquisition/fairino/ (shared with the sample acquisition).
 """
+
+from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 
 import cv2 as cv
 import numpy as np
 
-import common
-import rs_setup
+from . import common
 
 KEY_SAVE = (13,)            # ENTER
 KEY_QUIT = (ord('q'), 27)   # q / ESC
+FAIRINO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "acquisition")
+
+
+# ------------------------------------------------------------- RealSense ---
+def _apply_color_settings(rs, profile, C):
+    """Colour sensor: manual exposure/gain keep the corners stable between
+    frames. Unsupported options are reported and skipped."""
+    try:
+        sensor = profile.get_device().first_color_sensor()
+    except Exception as e:
+        print(f"  [rs] colour sensor not accessible: {e}")
+        return
+
+    def _set(opt, val, name):
+        try:
+            if sensor.supports(opt):
+                sensor.set_option(opt, float(val))
+                print(f"  [rs] {name} = {val}")
+            else:
+                print(f"  [rs] {name}: not supported by the sensor")
+        except Exception as e:
+            print(f"  [rs] cannot set {name}: {e}")
+
+    _set(rs.option.enable_auto_exposure, 1 if C["auto_exposure"] else 0, "auto_exposure")
+    if not C["auto_exposure"]:
+        if C["exposure"] is not None:
+            _set(rs.option.exposure, C["exposure"], "exposure")
+        if C["gain"] is not None:
+            _set(rs.option.gain, C["gain"], "gain")
+    # Turning auto white balance off WITHOUT a manual value leaves a residual
+    # value and a colour cast on the whole image: set white_balance too.
+    _set(rs.option.enable_auto_white_balance, 1 if C["auto_white_balance"] else 0,
+         "auto_white_balance")
+    if not C["auto_white_balance"] and C["white_balance"] is not None:
+        _set(rs.option.white_balance, C["white_balance"], "white_balance")
+
+
+def _grab_averaged(pipeline, timeout_ms, n_avg=1):
+    """Mean of n_avg consecutive colour frames (robot still) -> uint8 image,
+    ~sqrt(n) less corner noise. None if no frame arrives."""
+    acc, got = None, 0
+    for _ in range(max(1, int(n_avg))):
+        cf = pipeline.wait_for_frames(timeout_ms).get_color_frame()
+        if not cf:
+            continue
+        img = np.asanyarray(cf.get_data()).astype(np.float32)
+        acc = img if acc is None else acc + img
+        got += 1
+    return None if acc is None else (acc / got).round().astype(np.uint8)
 
 
 def _open_camera(cfg, rs):
-    R = cfg["realsense"]
+    C = cfg["camera"]
     pipeline, rcfg = rs.pipeline(), rs.config()
-    rcfg.enable_stream(rs.stream.color, int(R["width"]), int(R["height"]),
-                       rs.format.bgr8, int(R["fps"]))
+    rcfg.enable_stream(rs.stream.color, C["width"], C["height"], rs.format.bgr8, C["fps"])
     profile = pipeline.start(rcfg)
-    rs_setup.apply_color_settings(rs, profile, bool(R["auto_exposure"]), R["exposure"],
-                                  R["gain"], bool(R["auto_white_balance"]),
-                                  R["white_balance"])
+    _apply_color_settings(rs, profile, C)
     for _ in range(30):     # discard the first frames (exposure settling)
-        pipeline.wait_for_frames(int(R["frame_timeout_ms"]))
+        pipeline.wait_for_frames(int(C["frame_timeout_ms"]))
     return pipeline, profile
 
 
@@ -57,16 +106,19 @@ def _store_factory_intrinsics(cfg, profile, rs):
               "(different unit or resolution?). File NOT overwritten.")
 
 
+# ----------------------------------------------------------- acquisition ---
 def run(cfg, which):
-    """which = 'calibration' | 'validation'."""
-    from fairino import Robot
+    """which = 'calibration' | 'validation'. Returns the number of saved views."""
     import pyrealsense2 as rs
+    if FAIRINO_DIR not in sys.path:
+        sys.path.insert(0, FAIRINO_DIR)
+    from fairino import Robot
 
-    P, A, R = cfg["_paths"], cfg["acquisition"], cfg["realsense"]
+    P, A, C = cfg["_paths"], cfg["acquisition"], cfg["camera"]
     save_dir = P["cal_in"] if which == "calibration" else P["val_in"]
     target = int(A["n_calib_target"] if which == "calibration" else A["n_val_target"])
     size = common.board_size(cfg)
-    timeout = int(R["frame_timeout_ms"])
+    timeout = int(C["frame_timeout_ms"])
 
     pipeline, profile = _open_camera(cfg, rs)
     if which == "calibration":
@@ -79,8 +131,9 @@ def run(cfg, which):
     if err == 0 and int(tool) != int(A["expected_tool"]):
         robot.CloseRPC()
         pipeline.stop()
-        raise SystemExit(f"Active tool is {tool}, expected {A['expected_tool']}: the saved "
-                         "poses would not be flange poses. Set the tool on the controller.")
+        raise SystemExit(f"Active tool is {tool}, expected {A['expected_tool']} "
+                         "(acquisition.robot.tool): the saved poses would not be flange "
+                         "poses. Set the tool on the controller.")
     robot.RobotEnable(1)
     robot.DragTeachSwitch(1)
 
@@ -91,9 +144,7 @@ def run(cfg, which):
 
     win = f"RealSense - {which} (ENTER = save, q/ESC = quit)"
     cv.namedWindow(win, cv.WINDOW_NORMAL)
-    saved = 0
-    frame_i = 0
-    corners = None
+    saved, frame_i, corners = 0, 0, None
     flash_msg, flash_until = "", 0.0
     try:
         while saved < target:
@@ -114,9 +165,9 @@ def run(cfg, which):
             H, W = vis.shape[:2]
             m = int(A["preview_margin_px"])
             cv.rectangle(vis, (m, m), (W - m, H - m), (200, 200, 200), 1)
-            if corners is not None:
-                cv.drawChessboardCorners(vis, size, corners, True)
             ok = corners is not None
+            if ok:
+                cv.drawChessboardCorners(vis, size, corners, True)
             cv.rectangle(vis, (0, 0), (W, 34), (0, 0, 0), -1)
             cv.putText(vis, f"{'board OK' if ok else 'board NOT detected'}  |  "
                             f"saved {saved}/{target}  |  next {n_next:04d}",
@@ -139,7 +190,7 @@ def run(cfg, which):
                 flash_msg, flash_until = "Pose read ERROR", time.time() + 1.5
                 continue
             tcp = res[1]
-            snap = rs_setup.grab_averaged(rs, pipeline, timeout, int(R["n_avg_frames"]))
+            snap = _grab_averaged(pipeline, timeout, C["n_avg_frames"])
             if snap is None:
                 print("  [ERROR] no camera frame -> NOT saved")
                 flash_msg, flash_until = "Camera ERROR", time.time() + 1.5
@@ -162,14 +213,12 @@ def run(cfg, which):
         print("\n(interrupted)")
     finally:
         print("\n[Closing] drag teach off, stopping camera and robot...")
-        try:
-            robot.DragTeachSwitch(0)
-        except Exception as e:
-            print("  (DragTeachSwitch(0):", e, ")")
-        try:
-            robot.CloseRPC()
-        except Exception as e:
-            print("  (CloseRPC:", e, ")")
+        for name, fn in (("DragTeachSwitch(0)", lambda: robot.DragTeachSwitch(0)),
+                         ("CloseRPC", robot.CloseRPC)):
+            try:
+                fn()
+            except Exception as e:
+                print(f"  ({name}: {e})")
         pipeline.stop()
         cv.destroyAllWindows()
     print(f"[{which}] {saved} new views saved in {save_dir}")

@@ -556,6 +556,8 @@ def run_sweep(
                     save_pointcloud_override=save_pointcloud_cfg,
                     save_images_override=save_images_cfg,
                 )
+                from .rerun_spectral import maybe_write_spectral_rerun
+                maybe_write_spectral_rerun(cfg, base_out, sample_name)
             except Exception as e:
                 print(f"[sweep] ERROR re-running best pair: {e}")
                 traceback.print_exc()

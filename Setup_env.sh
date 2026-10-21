@@ -60,8 +60,10 @@ fi
 echo "[2/5] mast3r e asmk trovati."
 
 # --- 3. uv sync --------------------------------------------------------------
-echo "[3/5] uv sync..."
-uv sync
+echo "[3/5] uv sync --extra processing..."
+# processing = vision + registration (torch, open3d, ...): the core alone is the
+# light robot-PC install. NB: a plain `uv sync` would REMOVE them again.
+uv sync --extra processing
 
 # Installa dipendenze mast3r e dust3r (usa 'uv run pip', non 'pip' direttamente)
 uv run pip install --no-cache-dir -r "${MAST3R_DIR}/requirements.txt"

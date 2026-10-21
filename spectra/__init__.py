@@ -50,6 +50,7 @@ from .orchestrator import (
 )
 
 # -------- Vision (legacy public API, unchanged) ------------------------------
+# Light (cv2 / pydantic only): imported eagerly.
 from .vision import (
     ARUCO_DICTIONARIES,
     ArucoDetector,
@@ -62,17 +63,30 @@ from .vision import (
     detect_image,
     read_detections_json,
 )
-from .vision.pipeline import ReconstructionResult, run_reconstruction
 
-# -------- Registration -------------------------------------------------------
-from .registration import (
-    extract_suspicious_centroids,
-    load_mesh,
-    render_orthographic_topview_gpu,
-    run_full_pipeline,
-    run_full_pipeline_roi,
-    run_registration,
-)
+# -------- Heavy parts (torch / trimesh / openpyxl): imported on first use -----
+# so the CLI works with only the core dependencies when vision / registration
+# run on Mufasa (mufasa.enabled: true) — see pyproject.toml extras.
+_LAZY = {
+    "ReconstructionResult": ".vision.pipeline",
+    "run_reconstruction": ".vision.pipeline",
+    "extract_suspicious_centroids": ".registration",
+    "load_mesh": ".registration",
+    "render_orthographic_topview_gpu": ".registration",
+    "run_full_pipeline": ".registration",
+    "run_full_pipeline_roi": ".registration",
+    "run_registration": ".registration",
+}
+
+
+def __getattr__(name: str):
+    if name in _LAZY:
+        import importlib
+
+        value = getattr(importlib.import_module(_LAZY[name], __name__), name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def run_viewer(*args, **kwargs):

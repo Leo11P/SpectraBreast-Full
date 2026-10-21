@@ -29,7 +29,18 @@ from .config import (
     load_config,
     save_config,
 )
-from .pipeline import ReconstructionResult, run_reconstruction
+
+
+def __getattr__(name: str):
+    """``ReconstructionResult`` / ``run_reconstruction`` need torch: imported on
+    first use, so ``spectra.vision.aruco`` & co. work without it."""
+    if name in ("ReconstructionResult", "run_reconstruction"):
+        from . import pipeline
+
+        value = getattr(pipeline, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def run_viewer(*args, **kwargs):

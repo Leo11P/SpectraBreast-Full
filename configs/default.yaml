@@ -24,6 +24,12 @@
 #     RESULTS/<dd-mm-yyyy>/<sample>/registration/
 #     RESULTS/<dd-mm-yyyy>/_batch/batch_summary.xlsx
 #
+#   Camera calibration (`spectra calibrate`, robot PC) — fixed layout.
+#
+#     DATA/camera_calibration/
+#       input/{calibration,validation}/      imgXXXX.png + posaXXXX.txt
+#       output/{calibration,intrinsics,validation}/
+#
 #   Re-running any command on the same day OVERWRITES that day's stage folder.
 #
 # ABSOLUTE PATHS
@@ -44,7 +50,7 @@
 
 # Sample being processed. Drives every auto-derived path — spell it exactly as
 # the folder names under DATA/.
-sample_name: "Tetta"
+sample_name: "Sintetico"
 
 # Roots that drive default path resolution. Relative (from cwd) or absolute.
 data_root:    "DATA"
@@ -55,9 +61,57 @@ results_root: "RESULTS"
 # vision outputs.
 results_date: null
 
-# Which stage(s) `spectra full` runs. The standalone sub-commands
-# `spectra vision` and `spectra registration` ignore this.
-stages: ["vision", "registration"]
+# Which stage(s) `spectra full` runs, in this order:
+#   acquisition  : robot + RealSense, always on THIS PC (`acquisition:` section)
+#   vision       : MASt3R-SfM + ArUco ─┐ on this PC, or on Mufasa when
+#   registration : HSI → mesh          ─┘ mufasa.enabled is true (see below)
+# Drop "acquisition" to re-run vision/registration on a sample already acquired
+# (or: --set 'stages=["vision","registration"]'). The standalone sub-commands
+# `spectra vision` and `spectra registration` ignore this list.
+stages: ["acquisition", "vision", "registration"]
+
+
+
+
+# =============================================================================
+# MUFASA (BioHPC cluster, SLURM) — where vision and registration run
+# =============================================================================
+# enabled: true  → `spectra vision`, `spectra registration` and the vision /
+#                  registration stages of `spectra full` do NOT run on this PC:
+#                  a SLURM job runs them on a GPU node of Mufasa.
+# enabled: false → everything runs on this PC (vision needs a CUDA GPU).
+# The acquisition always runs on this PC (robot and camera are local), and
+# every job is launched from here with this config.
+# On Mufasa everything lives in repo_dir, same layout as here:
+#   <repo_dir>/DATA/input_{vision,registration}/<sample>/   inputs, by sample name:
+#       only what is missing or changed is uploaded; an HSI cube already on
+#       Mufasa is used even if it is not on this PC
+#   <repo_dir>/RESULTS/<dd-mm-yyyy>/<sample>/{vision,registration,_job}/
+# Only pull_patterns come back here (RESULTS/<dd-mm-yyyy>/<sample>/).
+# Needs: this PC on the Polimi LAN/VPN, an SSH key on Mufasa, `paramiko`.
+mufasa:
+  enabled: true
+  host: "10.79.23.96"                # Mufasa login server
+  port: 22
+  user: "lpassoni"
+  ssh_key_path: 'C:\Users\leolu\.ssh\id_spectra_mufasa'   # null = ask for the password
+  repo_dir: "/home/lpassoni/SpectraBreast-Full"    # cloned + Setup_env.sh done
+  # dir with sbatch/squeue/sacct (non-interactive SSH does not load it): `which sbatch`
+  slurm_bin_dirs: ["/opt/shared/sw/amd/gcc-13.3.0/slurm-25.05.4/bin"]
+  partition: jobs
+  qos: gpuwide                       # QOS have MaxSubmit=1: one job at a time
+  gres: "gpu:4g.20gb:1"              # must match the QOS GPU type
+  cpus: 8
+  mem: 64G
+  time: "12:00:00"
+  job_name: spectra
+  wait: true                         # wait for the job to finish ...
+  poll_s: 20
+  pull_results: true                 # ... and download pull_patterns:
+  pull_patterns:                     # relative to RESULTS/<dd-mm-yyyy>/<sample>/
+    - "registration/*.xlsx"          # error / timing reports
+    - "registration/*.rrd"           # spectral point cloud for Rerun (registration.rerun)
+    - "registration/*.rbl"           # its layout
 
 
 
@@ -66,8 +120,9 @@ stages: ["vision", "registration"]
 # =============================================================================
 # ACQUISITION (Fairino FR5 + RealSense, visual servoing)
 # =============================================================================
-# Used only by `python spectra/acquisition/acquire.py` and `remote.py` (robot
-# PC). Vision and registration ignore this section.
+# Used only by the acquisition (`spectra acquire`, the "acquisition" stage of
+# `spectra full`, `python spectra/acquisition/acquire.py`), always on the robot
+# PC. Vision and registration ignore this section.
 #
 # Output: written straight into the folder Vision reads from, i.e.
 #   DATA/input_vision/<sample_name>/
@@ -112,12 +167,11 @@ acquisition:
     depth: true
 
   hand_eye:
-    # T_cam2gripper 4x4 (rotazione + traslazione in mm).
-    T_cam2gripper:
-    - [-0.6979648877, -0.0125032970, -0.7160228231, -57.3722216589,]
-    - [0.7161254414, -0.0079127539, -0.6979267443, -41.2358499795]
-    - [0.0030606730, -0.9998905220, 0.0144767535, 14.3508732906]
-    - [0.0000000000, 0.0000000000, 0.0000000000, 1.0000000000]
+    # T_cam2gripper 4x4 (rotation + translation in mm).
+    #   null      : the output of `spectra calibrate`,
+    #               DATA/camera_calibration/output/calibration/cam2gripper.txt
+    #   4x4 list  : used as written (e.g. to pin an older calibration)
+    T_cam2gripper: null
 
 
   camera_box:
@@ -185,32 +239,6 @@ acquisition:
     camera_pinhole_distance_m: 0.06
     # repo_dir: null            # default: spectra/acquisition
 
-  # After a successful acquisition: upload DATA/input_vision/<sample>/ to
-  # Mufasa and submit `spectra full` as a SLURM job (spectra/acquisition/remote.py).
-  # Needs: robot PC on the Polimi LAN/VPN, an SSH key on Mufasa, `pip install paramiko`.
-  # Registration runs too only if DATA/input_registration/<sample>/<sample>_raw.hdr
-  # exists locally; otherwise vision only.
-  remote:
-    submit_after_acquisition: true     # override per run: --submit / --no-submit
-    host: "10.79.23.96"                # Mufasa login server
-    port: 22
-    user: "lpassoni"
-    ssh_key_path: 'C:\Users\leolu\.ssh\id_spectra_mufasa'   # null = ask for the password
-    repo_dir: "/home/lpassoni/SpectraBreast-Vision"    # cloned + `uv sync` done
-    runs_dir: "/home/lpassoni/spectra_runs"          # one folder per submission
-    # dir with sbatch/squeue/sacct (non-interactive SSH does not load it): `which sbatch`
-    slurm_bin_dirs: ["/opt/shared/sw/amd/gcc-13.3.0/slurm-25.05.4/bin"]
-    partition: jobs
-    qos: gpuwide                       # QOS have MaxSubmit=1: one job at a time
-    gres: "gpu:4g.20gb:1"              # must match the QOS GPU type
-    cpus: 8
-    mem: 64G
-    time: "12:00:00"
-    job_name: spectra
-    wait: true                         # wait for the job to finish ...
-    poll_s: 20
-    pull_results: true                 # ... and download RESULTS/ into results_root
-
   # tilt_deg: 0 = top-down, 90 = laterale. depth: salva o meno la depth per il layer.
   layers:
     - name: top_down
@@ -241,6 +269,52 @@ acquisition:
       depth: false
 
 
+
+# =============================================================================
+# CALIBRATION (hand-eye camera -> flange + intrinsics, drag-mode views)
+# =============================================================================
+# `spectra calibrate` on the robot PC. Robot (ip, tool, euler_order) and camera
+# stream (width, height, fps, n_avg_frames) come from `acquisition.robot` /
+# `acquisition.camera`, so they are not repeated here. Data in
+# DATA/camera_calibration/ (layout at the top of this file). The active tool on
+# the controller must be acquisition.robot.tool (0 = bare flange).
+calibration:
+  board:
+    chessboard_size: [7, 4]      # INNER corners (columns, rows)
+    square_size_mm:  33.8        # physical square side (MEASURE IT!)
+
+  # K, D used by BOTH hand-eye and validation:
+  #   realsense -> input/calibration/intrinsics_realsense.json (factory values,
+  #                written by the calibration acquisition, else read from the camera)
+  #   opencv    -> output/intrinsics/intrinsics_opencv.json (`--modality intrinsics`)
+  #   file      -> any JSON {"K": 3x3, "D": [[k1,k2,p1,p2,k3]]} given in `file`
+  intrinsics:
+    source: opencv               # realsense | opencv | file
+    file: null                   # only with source = file (relative to the cwd)
+    min_views_warn: 10           # warning below this number of valid views (opencv)
+
+  hand_eye:
+    method:            PARK      # PARK | TSAI | HORAUD | ANDREFF | DANIILIDIS
+    outlier_sigma:     0.5       # outlier threshold: median + sigma*std (lower = stricter)
+    max_reproj_err_px: 0.4       # views with mean PnP reprojection error above it are EXCLUDED
+    only_images: []              # optional subset, e.g. ["img0001.png"]; empty = all
+
+  acquisition:
+    n_calib_target: 30           # stop after this many saved views (re-run: numbering continues)
+    n_val_target:   20
+    preview_margin_px: 60        # guide rectangle in the live preview
+
+  validation:
+    save_overlay: true           # observed (green) vs predicted (red) corners
+
+  # Colour sensor during the calibration views only.
+  camera:
+    frame_timeout_ms: 10000
+    auto_exposure: false         # false = manual exposure/gain (stable corners between frames)
+    exposure: 120
+    gain: 16
+    auto_white_balance: true     # set false ONLY together with a tuned white_balance
+    white_balance: null          # kelvin, used only if auto_white_balance = false
 
 
 
@@ -439,6 +513,26 @@ registration:
     csv:             false
     csv_max_points:  500000
     save_images:     true
+
+  # Spectral Rerun recording, written right after the point-cloud export (needs
+  # export.save_pointcloud + ply or npy). It lands next to the point cloud:
+  #   RESULTS/<dd-mm-yyyy>/<sample>/registration/spectral.rrd (+ spectral.rbl)
+  # Open it with `rerun spectral.rrd spectral.rbl`.
+  #   top view    : one band — pick it on the `wavelength_nm` timeline (time panel)
+  #   bottom view : PCA, first principal component only
+  # Both views spin around the sample. Weight ≈ max_points x bands/band_step x
+  # 4 bytes (150000 points, 290 bands, step 2 → ~90 MB raw, ~45 MB on disk).
+  # Works in every mode (single / roi / batch / sweep's best pair).
+  rerun:
+    enabled:         true
+    max_points:      150000     # random subset of the cloud; null = all (heavy)
+    band_step:       2          # 1 = every band, 2 = every other band, ...
+    colormap:        "viridis"  # viridis | turbo | inferno | magma | plasma | cividis | jet
+    point_radius_px: 2.0        # point size on screen
+    spin_speed:      0.3        # auto-spin speed of both views; 0 = still
+    save_rbl:        true       # also write the layout alone (.rbl)
+    rrd_basename:    "spectral.rrd"
+    rbl_basename:    "spectral.rbl"
 
   # ------------------------------------------------------------------
   # mode == "batch"

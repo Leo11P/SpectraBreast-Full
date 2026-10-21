@@ -1,6 +1,0 @@
-__pycache__/
-*.pyc
-data/input/**/*.png
-data/input/**/*.jpg
-data/output/**
-!data/output/**/.gitkeep

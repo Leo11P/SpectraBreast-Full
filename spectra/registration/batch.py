@@ -566,6 +566,9 @@ def run_batch(
                 use_torch_render=use_torch_render,
                 render_fn=render_fn,
             )
+            from .rerun_spectral import maybe_write_spectral_rerun
+            maybe_write_spectral_rerun(cfg, pair["output_dir"], pair["sample_name"],
+                                       mesh_path=pair["mesh_path"])
         except Exception as e:
             print(f"\n[batch] ERROR on {pair['sample_name']}: {e}")
             traceback.print_exc()
