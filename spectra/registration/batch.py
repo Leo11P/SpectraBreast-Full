@@ -35,7 +35,7 @@ import re
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 from .runner import read_vision_timings
 
 import numpy as np
@@ -289,19 +289,17 @@ def _run_single_sample(
         n2 = 0
 
     if err3d_dict is not None:
-        m_rb_bil, md_rb_bil, n_rb_bil = _stats(err3d_dict.get("bilinear"))
-        m_rb_bic, md_rb_bic, n_rb_bic = _stats(err3d_dict.get("bicubic"))
+        m_rb_bil, md_rb_bil, _ = _stats(err3d_dict.get("bilinear"))
+        m_rb_bic, md_rb_bic, _ = _stats(err3d_dict.get("bicubic"))
     else:
         m_rb_bil = md_rb_bil = m_rb_bic = md_rb_bic = float("nan")
-        n_rb_bil = n_rb_bic = 0
 
     if err3d_dict_pc is not None:
-        m_pc_bil, md_pc_bil, n_pc_bil = _stats(err3d_dict_pc.get("bilinear"))
-        m_pc_bic, md_pc_bic, n_pc_bic = _stats(err3d_dict_pc.get("bicubic"))
+        m_pc_bil, md_pc_bil, _ = _stats(err3d_dict_pc.get("bilinear"))
+        m_pc_bic, md_pc_bic, _ = _stats(err3d_dict_pc.get("bicubic"))
     else:
         m_pc_bil, md_pc_bil = m_rb_bil, md_rb_bil
         m_pc_bic, md_pc_bic = m_rb_bic, md_rb_bic
-        n_pc_bil, n_pc_bic = n_rb_bil, n_rb_bic
 
         # Tempo vision (se la vision ha scritto timings.json)
     vision_dir = Path(output_dir).parent / "vision"

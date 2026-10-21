@@ -390,7 +390,6 @@ def render_orthographic_topview_gpu(
     res         : resolution_mm_per_px
     """
     # ── Determinazione device ────────────────────────────────────────────────
-    dev_str    = str(device) if device is not None else ''
     want_gpu   = device != 'cpu'   # False solo se esplicitamente 'cpu'
 
     # Auto-detect: se device=None, preferisci GPU

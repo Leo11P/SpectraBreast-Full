@@ -30,7 +30,7 @@ import numpy as np
 from ..config import RegistrationConfig
 from .pipeline import load_mesh
 from .pipeline_roi import run_full_pipeline_roi
-from .runner import read_vision_timings, _vision_dir_for
+from .runner import read_vision_timings
 
 _3D_ERROR_KEYS = [
     "3D_REG_bilinear_mean_mm",
@@ -546,7 +546,7 @@ def run_sweep(
               f"→ 3D error min = {best_val:.4f} mm")
 
         if do_best_rerun:
-            print(f"\n[sweep] Re-running best pair with save flags enabled...")
+            print("\n[sweep] Re-running best pair with save flags enabled...")
             try:
                 _run_single_pair(
                     cfg=cfg, sample_name=sample_name, aruco_dict_cv=aruco_dict_cv,

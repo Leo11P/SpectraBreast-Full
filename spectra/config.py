@@ -142,9 +142,6 @@ class RegistrationRender(BaseModel):
     resolution_mm_per_px: float = Field(default=5.0, gt=0.0)
     resolution_reg_mm_per_px: float = Field(default=0.5, gt=0.0)
     margin_mm: float = Field(default=10.0, ge=0.0)
-    ray_chunk_size: int = Field(default=16384, ge=1)
-    face_chunk_size: int = Field(default=2048, ge=1)
-    sort_rays_for_culling: bool = True
 
 
 class RegistrationPointcloud(BaseModel):

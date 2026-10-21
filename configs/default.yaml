@@ -66,7 +66,7 @@ results_date: null
 #   vision       : MASt3R-SfM + ArUco ─┐ on this PC, or on Mufasa when
 #   registration : HSI → mesh          ─┘ mufasa.enabled is true (see below)
 # Drop "acquisition" to re-run vision/registration on a sample already acquired
-# (or: --set 'stages=["vision","registration"]'). The standalone sub-commands
+# (or: --set stages=[vision,registration]). The standalone sub-commands
 # `spectra vision` and `spectra registration` ignore this list.
 stages: ["acquisition", "vision", "registration"]
 
@@ -157,10 +157,11 @@ acquisition:
     # Intrinsics used for solvePnP and saved into camera_parameters/.
     #   null (default): RealSense factory intrinsics of the running color stream
     #                   (always matching width/height).
-    #   override      : folder written by `spectra calibrate-intrinsics`
-    #                   (intrinsics.npy [+ distortions.npy]), an intrinsics.npy
-    #                   file, or a legacy JSON. Relative to the cwd. Aborts if it
-    #                   is >5% off the factory values (other resolution).
+    #   override      : a JSON with K and D, e.g. the output of
+    #                   `spectra calibrate --modality intrinsics`:
+    #                   DATA/camera_calibration/output/intrinsics/intrinsics_opencv.json
+    #                   Relative to the cwd. Aborts if it is >5% off the factory
+    #                   values (other resolution).
     intrinsics: null
     # MASTER depth: abilita lo STREAM depth della RealSense (allineato al color).
     # Ogni layer decide col proprio 'depth:' se salvare la mappa depth.
@@ -375,7 +376,6 @@ vision:
     smooth_iters: 2
     min_neighbors: 3
     max_resolution: 3072
-    conf_threshold_percentile: 50.0
 
   mast3r:
     # Hugging Face repo id (downloaded on first run) or a local .pth path.
@@ -408,7 +408,6 @@ vision:
     pose_prior_sigma_deg: 1.0
     pose_prior_sigma_m: 0.01
     pose_prior_weight: 0.06
-    pose_refine_log_every: 25
     pose_refine_max_drot_deg: 8.0
     pose_refine_max_dt_m: 0.06
     dense_refine_iters: 1
@@ -496,9 +495,6 @@ registration:
     resolution_mm_per_px:     0.5   # final mesh / point-cloud resolution
     resolution_reg_mm_per_px: 1.0   # resolution used for registration only
     margin_mm:                10.0
-    ray_chunk_size:           16384
-    face_chunk_size:          2048
-    sort_rays_for_culling:    true
 
   pointcloud:
     border_px:        2

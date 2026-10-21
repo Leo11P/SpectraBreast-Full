@@ -351,8 +351,12 @@ X Y Z ROLL PITCH YAW
 - Angles in **radians** (`angles_in_degrees = False`).
 - Convention `ROLLPITCHYAW`: `R = Rz(yaw) · Ry(pitch) · Rx(roll)`.
 
-Both `poses/` and `camera_parameters/` are fully optional — with neither, Vision
-runs pure SfM and takes its metric scale from the ArUco markers alone.
+Both `poses/` and `camera_parameters/` are fully optional. The poses are used
+only by `vision.mast3r.pipeline_variant: dense`, where they make the reconstruction
+metric. With `sfm` (the default) MASt3R-SfM estimates its own cameras at an
+arbitrary scale, so the poses are ignored and the metric scale always comes from
+the ArUco edge length (`vision.aruco.marker_edge_length_mm`). The vision log
+prints the median marker edge in the output frame next to the configured value.
 
 ### 3.4 Camera calibration layout
 
@@ -477,21 +481,6 @@ Local 3D viewer (Gradio) for the runs under a results folder.
 | `--share` / `--no-share` | off | Public Gradio link |
 | `--no-browser` | off | Do not open the browser |
 
-### `spectra calibrate-intrinsics`
-
-Generic checkerboard intrinsic calibration of any image folder. Writes
-`intrinsics.npy` and `distortions.npy`, the files expected in
-`camera_parameters/` (§3.1). The robot camera is calibrated by
-`spectra calibrate` (§8).
-
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `--image-dir` PATH | `checkerboard` | Checkerboard images |
-| `--output-dir` PATH | `intrinsics` | Output folder |
-| `--checkerboard-cols` INT | `10` | Inner corners per row |
-| `--checkerboard-rows` INT | `7` | Inner corners per column |
-| `--square-size-m` FLOAT | `0.024` | Square edge in metres |
-
 ### `spectra calibrate`
 
 Hand-eye (camera → flange) and intrinsics of the robot camera, with validation.
@@ -586,7 +575,8 @@ same layout as here:
 ```
 
 Inputs go by sample name and only what is missing or changed is uploaded (same
-size and modification time = already there):
+size and modification time = already there; same size but another time, e.g.
+data copied there by hand, is compared by SHA-256):
 
 | Stage | Input on Mufasa |
 | --- | --- |

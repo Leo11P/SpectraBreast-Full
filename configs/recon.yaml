@@ -42,7 +42,6 @@ surface:
   smooth_iters: 1
   min_neighbors: 3
   max_resolution: 2048
-  conf_threshold_percentile: 50.0
 
 mast3r:
   model_name: naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric
@@ -73,7 +72,6 @@ mast3r:
   pose_prior_sigma_deg: 1.0
   pose_prior_sigma_m: 0.01
   pose_prior_weight: 0.06
-  pose_refine_log_every: 25
   pose_refine_max_drot_deg: 8.0
   pose_refine_max_dt_m: 0.06
   dense_refine_iters: 1

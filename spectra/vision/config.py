@@ -187,8 +187,11 @@ class ArucoConfig(BaseModel):
         default=0.05,
         ge=0.0,
         description=(
-            "When GT poses + intrinsics are provided, we refuse to apply the "
-            "Sim3 scale if it deviates from 1.0 by more than this fraction. "
+            "Only when the backend reconstructed with the robot poses + GT "
+            "intrinsics (pipeline_variant 'dense' with pose files): the frame is "
+            "already metric, the Sim3 keeps scale 1 and a warning is printed if "
+            "the ArUco scale deviates from 1.0 by more than this fraction. With "
+            "'sfm' (poses not used) the ArUco scale is always applied. "
             "0.05 means '5% tolerance'."
         ),
     )
@@ -307,15 +310,6 @@ class SurfaceConfig(BaseModel):
     smooth_iters: int = Field(default=1, ge=0)
     min_neighbors: int = Field(default=3, ge=1, le=9)
     max_resolution: int = Field(default=2048, ge=64)
-    conf_threshold_percentile: float = Field(
-        default=50.0,
-        ge=0.0,
-        le=100.0,
-        description=(
-            "Confidence percentile used to filter points before surface "
-            "reconstruction. 50 drops the bottom 50%."
-        ),
-    )
 
 
 class Mast3rConfig(BaseModel):
@@ -370,7 +364,6 @@ class Mast3rConfig(BaseModel):
     pose_prior_sigma_deg: float = Field(default=1.0, gt=0.0)
     pose_prior_sigma_m: float = Field(default=0.01, gt=0.0)
     pose_prior_weight: float = Field(default=0.06, ge=0.0)
-    pose_refine_log_every: int = Field(default=25, ge=1)
     pose_refine_max_drot_deg: float = Field(default=8.0, ge=0.0)
     pose_refine_max_dt_m: float = Field(default=0.06, ge=0.0)
     dense_refine_iters: int = Field(default=1, ge=0)

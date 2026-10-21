@@ -469,7 +469,20 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
     aruco_geometric_qc: Dict[str, Any] | None = None
     view_rejection_meta: Dict[str, Any] | None = None
 
-    poses_known = backend_inputs.T_world_cam_gt is not None and backend_inputs.K_orig_gt is not None
+    # The backend frame is metric only if the backend actually reconstructed
+    # with the robot poses (dense variant). The sfm variant estimates its own
+    # cameras at an arbitrary scale even when pose files are loaded, so there
+    # the ArUco edge length must set the scale.
+    poses_known = (
+        bool((raw.alignment_info or {}).get("gt_poses_used", False))
+        and backend_inputs.K_orig_gt is not None
+    )
+    if backend_inputs.T_world_cam_gt is not None and not poses_known:
+        print(
+            f"[dim]Robot poses loaded but not used by the backend "
+            f"(pipeline_variant={cfg.mast3r.pipeline_variant}): the metric scale "
+            f"comes from the ArUco edge length ({cfg.aruco.marker_edge_length_mm:g} mm).[/dim]"
+        )
 
     use_ba = bool(cfg.aruco.bundle_adjustment) and (num_detections > 0)
     _timer.begin("Step 4/6 - ArUco alignment / bundle adjustment")
@@ -508,7 +521,9 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
             print(
                 f"[yellow]ArUco scale {aruco_alignment.scale:.4f} deviates from 1.0 "
                 f"by more than {cfg.aruco.max_sim3_scale_deviation_when_poses_known:.2f}; "
-                "poses are known so we refuse to rescale.[/yellow]"
+                "the backend reconstructed with the robot poses (metric frame), so the "
+                "scale is NOT applied. Check vision.aruco.marker_edge_length_mm, the "
+                "hand-eye calibration and the pose units.[/yellow]"
             )
 
         if aruco_alignment.plane_frame is not None:
@@ -586,6 +601,12 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
             }
 
             plane_rms_m = markers_best_fit_plane_rms_m(aligned_markers_in_output_frame)
+            edge_mm = 1000.0 * float(np.median(np.concatenate([
+                np.linalg.norm(np.roll(c, -1, axis=0) - c, axis=1)
+                for c in (np.asarray(v, dtype=np.float64).reshape(4, 3)
+                          for v in aligned_markers_in_output_frame.values())
+            ])))
+            edge_cfg_mm = float(cfg.aruco.marker_edge_length_mm)
             reproj_qc = marker_corner_reprojection_stats(
                 detections_per_view=detections_per_view,
                 marker_corners_world=aligned_markers_in_output_frame,
@@ -595,12 +616,22 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
             aruco_geometric_qc = {
                 "markers_plane_rms_m": float(plane_rms_m),
                 "markers_plane_rms_mm": float(plane_rms_m * 1000.0),
+                "marker_edge_median_mm": edge_mm,
+                "marker_edge_configured_mm": edge_cfg_mm,
                 **reproj_qc,
             }
             print(
                 f"[dim]ArUco geometric QC:[/dim] best-fit plane RMS [cyan]{plane_rms_m * 1000:.2f} mm[/cyan]; "
                 f"corners reprojected with output cameras → RMSE [cyan]{reproj_qc['rmse_px']:.3f} px[/cyan] "
                 f"(max {reproj_qc['max_px']:.3f}, p95 {reproj_qc['p95_px']:.3f}, n={reproj_qc['num_observations']})"
+            )
+            # >2% off means the output frame is not at the configured metric scale.
+            edge_ok = abs(edge_mm / edge_cfg_mm - 1.0) <= 0.02
+            print(
+                f"[{'dim' if edge_ok else 'yellow'}]Marker edge in the output frame: median "
+                f"{edge_mm:.3f} mm (configured {edge_cfg_mm:g} mm)"
+                f"{'' if edge_ok else ' -> MISMATCH, the output is not at the configured scale'}"
+                f"[/{'dim' if edge_ok else 'yellow'}]"
             )
             if plane_rms_m > 0.015:
                 print(
@@ -620,6 +651,8 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
         _log_step("Step 4/6 - ArUco alignment disabled or no markers detected")
         if cfg.aruco.align_to_aruco:
             print("[yellow]No ArUco markers detected; skipping alignment.[/yellow]")
+        if not poses_known:
+            print("[yellow]The output keeps the backend's arbitrary scale (NOT metric).[/yellow]")
 
     V_all = int(raw.T_world_cam.shape[0])
     if (

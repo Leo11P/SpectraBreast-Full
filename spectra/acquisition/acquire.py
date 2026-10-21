@@ -22,9 +22,7 @@ import sys
 import math
 import json
 import time
-import glob
 import argparse
-import datetime as _dt
 
 import numpy as np
 import cv2 as cv
@@ -98,12 +96,6 @@ def _R_to_euler(R, order):
     else:
         raise ValueError(order)
     return math.degrees(rx), math.degrees(ry), math.degrees(rz)
-
-
-def _geodesic_deg(Ra, Rb):
-    """Geodesic angle (deg) between two rotations."""
-    c = (np.trace(Ra.T @ Rb) - 1.0) / 2.0
-    return math.degrees(math.acos(max(-1.0, min(1.0, c))))
 
 
 # controller Euler convention, determined at runtime
@@ -334,28 +326,15 @@ def load_intrinsics(path):
 
 
 def load_intrinsics_override(path):
-    """Optional override (config `acquisition.camera.intrinsics`). Accepts:
-      - a folder written by `spectra calibrate-intrinsics`
-        (intrinsics.npy + optional distortions.npy),
-      - an intrinsics.npy file (distortions.npy is looked up next to it),
-      - a legacy JSON file (see load_intrinsics).
-    Relative paths are resolved from the cwd, like every other path."""
+    """Optional override (config `acquisition.camera.intrinsics`): a JSON with
+    K and D, e.g. DATA/camera_calibration/output/intrinsics/intrinsics_opencv.json
+    written by `spectra calibrate --modality intrinsics` (accepted schemas: see
+    load_intrinsics). Relative paths are resolved from the cwd, like every other path."""
     p = os.path.abspath(str(path))
-    if p.lower().endswith(".json"):
-        return load_intrinsics(p)
-    k_path = os.path.join(p, "intrinsics.npy") if os.path.isdir(p) else p
-    if not os.path.isfile(k_path):
-        raise SystemExit(f"[intrinsics] override not found: {k_path}")
-    K = np.asarray(np.load(k_path), float)
-    if K.shape != (3, 3):
-        raise SystemExit(f"[intrinsics] {k_path}: expected a 3x3 matrix, got {K.shape}")
-    d_path = os.path.join(os.path.dirname(k_path), "distortions.npy")
-    if os.path.isfile(d_path):
-        D = np.asarray(np.load(d_path), float).ravel()
-    else:
-        D = np.zeros(5)
-        print(f"[intrinsics] {d_path} not found: assuming D=0")
-    return K, D
+    if not (p.lower().endswith(".json") and os.path.isfile(p)):
+        raise SystemExit(f"[intrinsics] acquisition.camera.intrinsics must be an existing "
+                         f"JSON file with K and D, got {p}")
+    return load_intrinsics(p)
 
 
 def resolve_intrinsics(cfg, rs_cam):
@@ -661,7 +640,7 @@ def run_verify(cfg, robot, T_c2g, K, D, rs):
     R_look = look_at_R(cam_pos_now, centroid_base, 0.0)
     T_look = np.eye(4); T_look[:3, :3] = R_look; T_look[:3, 3] = cam_pos_now
     flange_cmd = gripper_pose_from_camera_T(T_look, T_c2g)
-    print(f"[verify] flange to command to point at the centroid (same camera pos):")
+    print("[verify] flange to command to point at the centroid (same camera pos):")
     print(f"         {np.round(flange_cmd,2).tolist()}")
     print(f"[verify] CURRENT flange (FK)      = {np.round(fk,2).tolist()}")
     dpos_cmd = np.linalg.norm(np.array(flange_cmd[:3]) - np.array(fk[:3]))
@@ -861,7 +840,6 @@ def generate_poses(target, cfg, robot, T_c2g, K, D):
     centroid = target["centroid"]; up = target["up"]
     u, v = _orthonormal_basis(up)
     W = int(cfg["camera"]["width"]); H = int(cfg["camera"]["height"])
-    cx, cy = K[0, 2], K[1, 2]
     vis = cfg.get("visibility", {})
     base_margin = float(vis.get("margin_px", 40))
     gimbal_margin = float(vis.get("gimbal_lock_margin_deg", 12))
@@ -1040,7 +1018,7 @@ def recenter(robot, rs, cfg, T_c2g, K, D, centroid_hint, guard=None):
         err = robot.move_l(flange, tool, user, vel)
         if err != 0:
             print(f"  [servo] MoveL failed (code {err})"); return True
-    print(f"  [servo] max_iters reached"); return True
+    print("  [servo] max_iters reached"); return True
 
 
 # -----------------------------------------------------------------------------
@@ -1304,7 +1282,7 @@ def run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir, use_viz=True):
         # wasted waiting before knowing whether another move is needed.
         seen = recenter(robot, rs, cfg, T_c2g, K, D, target["centroid"], guard=guard)
         if not seen:
-            print(f"  sample not in view -> shot SKIPPED"); continue
+            print("  sample not in view -> shot SKIPPED"); continue
 
         t0 = time.time()
         while time.time() - t0 < dwell:

@@ -25,7 +25,6 @@ Behavior is otherwise identical to the legacy ``main.py``.
 from __future__ import annotations
 
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -51,17 +50,6 @@ def read_vision_timings(vision_dir: Path) -> Optional[Dict[str, Any]]:
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
-
-
-def _vision_dir_for(results_root, sample_name, results_date=None) -> Path:
-    """Vision output folder under the dated RESULTS layout.
-
-    Prefer :func:`_vision_dir_from_mesh` when a resolved mesh path is at hand:
-    it needs no date and always matches the run actually being consumed.
-    """
-    from ..orchestrator import vision_output_dir
-
-    return vision_output_dir(Path(results_root), str(sample_name), results_date)
 
 
 def _vision_dir_from_mesh(mesh_path) -> Optional[Path]:
@@ -438,9 +426,8 @@ def _run_single_or_roi(
     print("REGISTRATION COMPLETED")
     print("=" * 68)
     print(f"  Total time     : {elapsed:.1f}s  ({elapsed/60:.1f} min)")
-    n_pts = result.get("n_valid", 0)
-    n_bands = result.get("bands", 0)
-    ...
+    if result.get("n_valid"):
+        print(f"  Point cloud    : {result['n_valid']:,} points x {result.get('bands', 0)} bands")
     print(f"  Output         : {output_dir}")
     print("=" * 68)
 

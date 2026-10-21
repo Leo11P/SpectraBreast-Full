@@ -33,12 +33,12 @@ which run on tiny 4×3 systems.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Sequence
+from typing import Dict, List, Sequence
 
 import numpy as np
 import torch
 
-from .align import MarkerTriangulation, triangulate_markers
+from .align import triangulate_markers
 from .aruco import MarkerDetection
 
 
@@ -145,11 +145,6 @@ def _matrix_to_axis_angle(R: np.ndarray) -> np.ndarray:
 def _so3_mat_mul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Matmul that works for ``[..., 3, 3] @ [..., 3, 3]``."""
     return torch.matmul(A, B)
-
-
-def _apply_se3_to_points(R: torch.Tensor, t: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
-    """``R @ P + t`` for ``R [..., 3, 3]``, ``t [..., 3]``, ``P [..., 3]``."""
-    return torch.einsum("...ij,...j->...i", R, P) + t
 
 
 def _invert_rigid_4x4(T: np.ndarray) -> np.ndarray:

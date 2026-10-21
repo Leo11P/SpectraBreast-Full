@@ -8,7 +8,6 @@ Top-level commands::
                           # (the stages listed in `stages:`)
     spectra detect        # standalone 2D ArUco detection (unchanged)
     spectra viewer        # local 3D viewer (unchanged)
-    spectra calibrate-intrinsics  # checkerboard calibration (unchanged)
     spectra acquire       # robotic acquisition only (Fairino FR5 + RealSense)
     spectra calibrate     # hand-eye + intrinsics of the robot camera (+ validation)
 
@@ -42,11 +41,9 @@ from rich.markup import escape
 
 from .config import (
     UnifiedConfig,
-    VisionConfig,
     load_unified_config,
 )
 from .vision.aruco import ARUCO_DICTIONARIES, detect_folder
-from .vision.calibration import calibrate_intrinsics
 from .vision.config import DEFAULT_CONFIG_PATH, load_config as load_vision_only_config
 
 app = typer.Typer(
@@ -61,7 +58,10 @@ app = typer.Typer(
 # =============================================================================
 
 def _parse_override(value: str) -> tuple[str, object]:
-    """Parse 'a.b.c=value' overrides. Value is JSON-parsed when possible."""
+    """Parse 'a.b.c=value' overrides. Value is JSON-parsed when possible; a
+    list / mapping without quotes (`stages=[vision,registration]`, which is
+    also what Windows PowerShell passes for '["vision","registration"]') is
+    read as YAML."""
     if "=" not in value:
         raise typer.BadParameter(f"Override {value!r} must be 'key.path=VALUE'")
     dotted_key, raw_value = value.split("=", 1)
@@ -71,6 +71,11 @@ def _parse_override(value: str) -> tuple[str, object]:
         parsed: object = json.loads(raw_value)
     except json.JSONDecodeError:
         parsed = raw_value
+        if raw_value[:1] in "[{":
+            try:
+                parsed = yaml.safe_load(raw_value)
+            except yaml.YAMLError:
+                raise typer.BadParameter(f"--set {dotted_key}: cannot parse {raw_value!r}") from None
     return dotted_key, parsed
 
 
@@ -178,7 +183,7 @@ def _run_on_mufasa(
         )
     except SystemExit as exc:          # remote.py reports errors as SystemExit(msg)
         print(f"[red]{escape(str(exc))}[/red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
     if state not in ("COMPLETED", "SUBMITTED", "DRY-RUN"):
         print(f"[red]Mufasa job {jobid} ended in state {state}: see the job log above.[/red]")
         raise typer.Exit(code=1)
@@ -391,7 +396,7 @@ def full_cmd(
             remote.preflight(str(config), ovr)
         except SystemExit as exc:
             print(f"[red]{escape(str(exc))}[/red]")
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=1) from None
     elif compute:
         _require_local_processing(compute)
 
@@ -521,7 +526,7 @@ def viewer_cmd(
     except ImportError as exc:
         print(f"[red]Viewer import failed:[/red] {exc}")
         print("[yellow]Install gradio and trimesh.[/yellow]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
     run_viewer(
         results_dir=results_dir, host=host, port=port,
         share=share, inbrowser=not no_browser,
@@ -552,7 +557,7 @@ def calibrate_cmd(
     try:
         steps = calibration.plan(modality, step)
     except ValueError as exc:
-        raise typer.BadParameter(str(exc))
+        raise typer.BadParameter(str(exc)) from None
     cfg = load_unified_config(config)
     if cfg.calibration is None:
         raise typer.BadParameter(f"{config} has no `calibration:` section.")
@@ -570,32 +575,7 @@ def calibrate_cmd(
     except SystemExit as exc:          # calibration modules report errors as SystemExit(msg)
         if exc.code not in (None, 0):
             print(f"[red]{escape(str(exc))}[/red]")
-            raise typer.Exit(code=1)
-
-
-@app.command("calibrate-intrinsics")
-def calibrate_intrinsics_cmd(
-    image_dir: Path = typer.Option(Path("checkerboard"), "--image-dir"),
-    output_dir: Path = typer.Option(Path("intrinsics"), "--output-dir"),
-    checkerboard_cols: int = typer.Option(10, "--checkerboard-cols"),
-    checkerboard_rows: int = typer.Option(7, "--checkerboard-rows"),
-    square_size_m: float = typer.Option(0.024, "--square-size-m"),
-) -> None:
-    """Camera-intrinsic calibration from checkerboard images."""
-    try:
-        mtx, dist = calibrate_intrinsics(
-            image_dir=image_dir,
-            output_dir=output_dir,
-            checkerboard_size=(int(checkerboard_cols), int(checkerboard_rows)),
-            square_size_m=float(square_size_m),
-        )
-    except ValueError as exc:
-        print(f"[red]Calibration failed:[/red] {exc}")
-        raise typer.Exit(code=1)
-    print(f"[green]Saved:[/green] {output_dir / 'intrinsics.npy'}")
-    print(f"[green]Saved:[/green] {output_dir / 'distortions.npy'}")
-    print("Camera Matrix:"); print(mtx)
-    print("Distortion Coefficients:"); print(dist)
+            raise typer.Exit(code=1) from None
 
 
 # =============================================================================

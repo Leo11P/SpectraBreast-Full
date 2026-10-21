@@ -749,6 +749,9 @@ def _run_mast3r_sfm(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReco
         alignment_info={
             "pipeline_variant": "sfm",
             "scene_graph": scene_graph,
+            # sparse_global_alignment estimates its own cameras at an arbitrary
+            # scale: robot poses, if loaded, are NOT used here.
+            "gt_poses_used": False,
         },
         extra={
             "pipeline_variant": "sfm",
@@ -989,7 +992,7 @@ def run_mast3r(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReconstru
         confidence_maps_network=conf_maps_np,
         frame_description=("gt-aligned" if have_gt_poses else "mst"),
         backend_name="mast3r",
-        alignment_info={"pose_refinement": pose_stats},
+        alignment_info={"pose_refinement": pose_stats, "gt_poses_used": bool(have_gt_poses)},
         extra={
             "have_gt_poses": bool(have_gt_poses),
             "have_gt_intrinsics": bool(have_gt_intrinsics),

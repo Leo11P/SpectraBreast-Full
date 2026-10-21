@@ -177,8 +177,9 @@ depth/  manifest.json  SHA256SUMS  _discarded/     (not read by Vision)
   Vision composes `T_world_cam = T_world_flange @ camera2ee`, so the hand-eye is applied once.
 - **Intrinsics**: by default the RealSense factory intrinsics of the running color
   stream (always matching `camera.width/height`). Set `acquisition.camera.intrinsics`
-  to override them with a calibration: the folder written by
-  `spectra calibrate-intrinsics`, an `intrinsics.npy`, or a legacy JSON. The override
+  to override them with a calibration JSON (K, D), e.g.
+  `DATA/camera_calibration/output/intrinsics/intrinsics_opencv.json` from
+  `spectra calibrate --modality intrinsics`. The override
   is rejected if it is more than 5% off the factory values (calibrated at another
   resolution). The source is recorded in `camera_parameters/intrinsics_source.json`.
 - **Image/pose pairing**: each shot is saved as a pair (image + pose) or not at all. At the end

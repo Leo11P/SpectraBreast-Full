@@ -1117,7 +1117,7 @@ def save_excel_errors(err2d_px, err3d_dict, data_hsi, common_ids,
             ri += 1
 
         # ── Sezione Δ (PC - REG) ─────────────────────────────────────────
-        _hdr(ws2, ri, 1, f'Δ PC − REG  (negativo = PC migliore)',
+        _hdr(ws2, ri, 1, 'Δ PC − REG  (negativo = PC migliore)',
              fill=PatternFill('solid', start_color='833C00'))
         ws2.cell(row=ri, column=2, value='')
         ws2.cell(row=ri, column=3, value='')
@@ -1406,149 +1406,8 @@ def parse_wavelengths(meta):
         return None
 
 
-def build_spectral_pointcloud(cube, xyz_map, H_inv,
-                               border_px=2, reflectance_norm=True):
-    """
-    For every render pixel with a valid (X,Y,Z), back-project via H_inv to
-    the HSI image and read the full spectrum.
-
-    Parameters
-    ----------
-    cube             : (rows_hsi, cols_hsi, bands) float32
-    xyz_map          : (H_r, W_r, 3) float32  3D coords per render pixel (mm)
-    H_inv            : (3,3) inverse homography: render pixel -> HSI pixel
-    border_px        : discard pixels within this many pixels of the HSI edge
-    reflectance_norm : if True, normalise each spectrum to [0, 1]
-
-    Returns
-    -------
-    points_xyz : (N, 3)       float32  X, Y, Z in mm
-    spectra    : (N, bands)   float32
-    valid_mask : (H_r, W_r)  bool     coverage mask on render
-    n_valid    : int
-    """
-    H_r, W_r, _           = xyz_map.shape
-    rows_hsi, cols_hsi, bands = cube.shape
-
-    print(f"\n[BuildPC] Render grid : {W_r}x{H_r} px  ({W_r*H_r:,} pixels)")
-    print(f"[BuildPC] HSI image   : {cols_hsi}x{rows_hsi} px  x {bands} bands")
-
-    col_grid, row_grid = np.meshgrid(np.arange(W_r), np.arange(H_r))
-    render_coords = np.column_stack([
-        col_grid.ravel().astype(np.float32),
-        row_grid.ravel().astype(np.float32),
-    ])
-
-    xyz_flat   = xyz_map.reshape(-1, 3)
-    mesh_valid = ~np.isnan(xyz_flat[:, 0])
-    print(f"[BuildPC] Pixels with mesh hit: {mesh_valid.sum():,} / {mesh_valid.size:,}")
-
-    pts_hsi_back = cv2.perspectiveTransform(
-        render_coords[mesh_valid].reshape(-1, 1, 2).astype(np.float32),
-        H_inv.astype(np.float32)
-    ).reshape(-1, 2)
-
-    col_hsi = pts_hsi_back[:, 0]
-    row_hsi = pts_hsi_back[:, 1]
-
-    in_bounds = (
-        (col_hsi >= border_px) & (col_hsi <= cols_hsi - 1 - border_px) &
-        (row_hsi >= border_px) & (row_hsi <= rows_hsi - 1 - border_px)
-    )
-    print(f"[BuildPC] Pixels inside HSI FOV: {in_bounds.sum():,}")
-
-    col_idx = np.round(col_hsi[in_bounds]).astype(int)
-    row_idx = np.round(row_hsi[in_bounds]).astype(int)
-
-    xyz_in_bounds = xyz_flat[mesh_valid][in_bounds]
-
-    print("[BuildPC] Reading spectra from cube...")
-    spectra = cube[row_idx, col_idx, :].astype(np.float32)
-
-    if reflectance_norm:
-        s_min = spectra.min(axis=1, keepdims=True)
-        s_max = spectra.max(axis=1, keepdims=True)
-        spectra = (spectra - s_min) / np.where(s_max > s_min, s_max - s_min, 1.0)
-        print("[BuildPC] Spectra normalised to [0, 1] per point.")
-
-    mesh_valid_idx   = np.where(mesh_valid)[0]
-    in_bounds_global = mesh_valid_idx[in_bounds]
-    valid_flat       = np.zeros(H_r * W_r, dtype=bool)
-    valid_flat[in_bounds_global] = True
-    valid_mask = valid_flat.reshape(H_r, W_r)
-
-    n_valid = xyz_in_bounds.shape[0]
-    print(f"[BuildPC] Final cloud: {n_valid:,} points  x {bands} bands")
-    return xyz_in_bounds.astype(np.float32), spectra, valid_mask, n_valid
-
-
 # =============================================================================
-# 10 — Export point cloud
-# =============================================================================
-
-def export_ply(points_xyz, spectra, output_path, wavelengths=None):
-    """
-    Export spectral point cloud as a binary PLY file.
-    Open in CloudCompare and colour by any scalar field (band).
-    """
-    N, bands = spectra.shape
-    band_names = ([f"b{i}_{int(round(w))}nm" for i, w in enumerate(wavelengths)]
-                  if wavelengths and len(wavelengths) == bands
-                  else [f"b{i:03d}" for i in range(bands)])
-    header = ("ply\nformat binary_little_endian 1.0\n"
-              f"element vertex {N}\n"
-              "property float x\nproperty float y\nproperty float z\n"
-              + "\n".join(f"property float {n}" for n in band_names)
-              + "\nend_header\n")
-    data = np.concatenate([points_xyz, spectra], axis=1)
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    with open(output_path, 'wb') as f:
-        f.write(header.encode('ascii'))
-        f.write(data.astype(np.float32).tobytes())
-    print(f"[Export PLY] {output_path}  ({N:,} pts, {os.path.getsize(output_path)/1e6:.1f} MB)")
-
-
-def export_npy(points_xyz, spectra, output_path, wavelengths=None):
-    """
-    Export as compressed numpy .npz.
-
-    Load with:
-        data = np.load('spectral_pointcloud.npz')
-        xyz     = data['xyz']         # (N, 3)  mm
-        spectra = data['spectra']     # (N, bands)
-        wl      = data['wavelengths'] # (bands,) nm
-    """
-    save_dict = {'xyz': points_xyz, 'spectra': spectra}
-    if wavelengths is not None:
-        save_dict['wavelengths'] = np.array(wavelengths, dtype=np.float32)
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    np.savez_compressed(output_path, **save_dict)
-    print(f"[Export NPZ] {output_path}.npz  ({os.path.getsize(output_path+'.npz')/1e6:.1f} MB)")
-
-
-def export_csv(points_xyz, spectra, output_path, wavelengths=None,
-               max_points=500_000):
-    """
-    Export as CSV, capped at max_points (sub-sampled randomly if exceeded).
-    Columns: X_mm, Y_mm, Z_mm, b0, b1, ..., bN
-    """
-    N, bands = spectra.shape
-    if N > max_points:
-        idx = np.random.choice(N, max_points, replace=False)
-        points_xyz, spectra = points_xyz[idx], spectra[idx]
-    band_hdr = ([f"b{i}_{int(round(w))}nm" for i, w in enumerate(wavelengths)]
-                if wavelengths and len(wavelengths) == bands
-                else [f"b{i:03d}" for i in range(bands)])
-    header = "X_mm,Y_mm,Z_mm," + ",".join(band_hdr)
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    np.savetxt(output_path, np.concatenate([points_xyz, spectra], axis=1),
-               delimiter=',', header=header, comments='', fmt='%.4f')
-    print(f"[Export CSV] {output_path}  ({points_xyz.shape[0]:,} pts, "
-          f"{os.path.getsize(output_path)/1e6:.1f} MB)")
-
-
-# =============================================================================
-# 11 — Visualisations
+# 10 — Visualisations
 # =============================================================================
 
 def visualize_registration(render_rgb, hsi_2d, pts_render_h, data_hsi, data_render,
@@ -1661,7 +1520,7 @@ def save_turbo_render(xyz_map, output_path):
 
 
 # =============================================================================
-# 12 — Clustering helper
+# 11 — Clustering helper
 # =============================================================================
 
 def extract_suspicious_centroids(suspicious_mask, min_area=5):
@@ -2124,70 +1983,3 @@ def run_full_pipeline(
         'valid_mask': valid_mask, 'n_valid': n_valid,
         'bands': cube.shape[2],
     }
-
-
-# =============================================================================
-# USAGE EXAMPLE
-# =============================================================================
-
-if __name__ == "__main__":
-
-    HSI_HDR    = r"C:\Users\leolu\Desktop\Polimi\Stage\SpectraBreast\Acquisizioni 23-04\SB019\SB019_001\SB019_raw.hdr"
-    MESH_PATH  = r"C:\Users\leolu\Desktop\Polimi\Stage\SpectraBreast\SAMPLE1\surface_mesh.ply"
-    ARUCO_JSON = r"C:\Users\leolu\Desktop\Polimi\Stage\SpectraBreast\SAMPLE1\aruco_markers_3d.json"
-    OUTPUT_DIR = r"C:\Users\leolu\Desktop\Polimi\Stage\SpectraBreast\SAMPLE1\output_full"
-
-    # ── Optional: suspicious pixels from HSI segmentation ─────────────────────
-    hsi_rows, hsi_cols = 1024, 1280
-    suspicious_mask = np.zeros((hsi_rows, hsi_cols), dtype=np.uint8)
-    suspicious_mask[500:550, 500:550] = 1   # replace with real segmentation mask
-
-    print('\n[Pre-step] Clustering suspicious pixels...')
-    punti_sospetti, n_clusters = extract_suspicious_centroids(
-        suspicious_mask, min_area=5
-    )
-    print(f'  {n_clusters} region(s) -> {n_clusters} centroid(s)\n')
-
-    # ── Run ───────────────────────────────────────────────────────────────────
-    result = run_full_pipeline(
-        hsi_hdr_path             = HSI_HDR,
-        mesh_path                = MESH_PATH,
-        aruco_json_path          = ARUCO_JSON,
-        output_dir               = OUTPUT_DIR,
-        hsi_extraction_method    = 'mean',
-        aruco_dict_type          = cv2.aruco.DICT_4X4_50,
-        suspicious_pixels_hsi    = punti_sospetti,
-        render_resolution_mm     = 0.3,   # fine — per il point cloud
-        render_resolution_reg_mm = 0.5,   # grossolano — per l'omografia (12/12 inlier)
-        render_margin_mm         = 10.0,
-        chunk_size               = 500_000,
-        marker_side_mm           = 6.8,
-        use_subpix               = True,
-        subpix_winsize           = 5,
-        border_px                = 2,
-        reflectance_norm         = True,
-        export_ply_file          = True,
-        export_npy_file          = True,
-        export_csv_file          = False,
-        sample_name              = 'SB019',
-    )
-
-    # ── Quick access ──────────────────────────────────────────────────────────
-    print(f"\nPoint cloud : {result['xyz'].shape[0]:,} pts x "
-          f"{result['spectra'].shape[1]} bands")
-    if result['wavelengths']:
-        print(f"Wavelengths : {result['wavelengths'][0]:.1f} ... "
-              f"{result['wavelengths'][-1]:.1f} nm")
-    if result['coords_3d_h'] is not None:
-        print(f"\nSuspicious points -> 3D (best method = {result['best_method']}):")
-        for i, xyz in enumerate(result['coords_3d_h']):
-            print(f"  T{i}: X={xyz[0]:.3f}  Y={xyz[1]:.3f}  Z={xyz[2]:.3f} mm")
-        # Confronto con l'altro metodo
-        other = (result['coords_3d_h_bicubic']
-                 if result['best_method'] == 'bilinear'
-                 else result['coords_3d_h_bilinear'])
-        if other is not None:
-            other_name = ('bicubic' if result['best_method'] == 'bilinear' else 'bilinear')
-            print(f"\nFor reference, same points via {other_name}:")
-            for i, xyz in enumerate(other):
-                print(f"  T{i}: X={xyz[0]:.3f}  Y={xyz[1]:.3f}  Z={xyz[2]:.3f} mm")

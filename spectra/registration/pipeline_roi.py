@@ -356,10 +356,6 @@ def run_full_pipeline_roi(
     # PNG->render_reg (gli ArUco SONO sulla PNG), quindi calcoliamo l'errore
     # 2D usando pts_png e pts_render_reg con H_png_to_render.
     T_png_to_roi = np.linalg.inv(T_roi_to_png)
-    pts_roi_virtual = cv2.perspectiveTransform(
-        pts_png.reshape(-1, 1, 2).astype(np.float32),
-        T_png_to_roi.astype(np.float32),
-    ).reshape(-1, 2)
 
     # Costruisco data_roi dict per coerenza con la visualizzazione
     data_roi = {}

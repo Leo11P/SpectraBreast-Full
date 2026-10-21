@@ -18,7 +18,6 @@ from .aruco import (
     detect_image,
     read_detections_json,
 )
-from .calibration import calibrate_intrinsics
 from .config import (
     ArucoConfig,
     InputConfig,
@@ -61,7 +60,6 @@ __all__ = [
     "ReconstructionResult",
     "SurfaceConfig",
     "annotate_image",
-    "calibrate_intrinsics",
     "color_for_id",
     "color_for_id_rgb",
     "detect_folder",

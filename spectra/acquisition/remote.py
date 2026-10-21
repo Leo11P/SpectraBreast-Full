@@ -46,6 +46,7 @@ import copy
 import datetime as _dt
 import fnmatch
 import getpass
+import hashlib
 import os
 import posixpath
 import shlex
@@ -189,7 +190,7 @@ def connect(r):
     try:
         import paramiko
     except ImportError:
-        raise SystemExit("[remote] missing dependency: pip install paramiko")
+        raise SystemExit("[remote] missing dependency: pip install paramiko") from None
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     kw = dict(hostname=r["host"], port=int(r["port"]), username=r["user"],
@@ -206,7 +207,7 @@ def connect(r):
         client.connect(**kw)
     except Exception as e:
         raise SystemExit(f"[remote] cannot connect to {r['host']}: {e} "
-                         "(Polimi LAN/VPN on? key authorised on Mufasa?)")
+                         "(Polimi LAN/VPN on? key authorised on Mufasa?)") from None
     return client
 
 
@@ -230,7 +231,7 @@ def check_remote_repo(sftp, r):
     try:
         sftp.stat(path)
     except FileNotFoundError:
-        raise SystemExit(f"[remote] {path} not found on Mufasa: check mufasa.repo_dir")
+        raise SystemExit(f"[remote] {path} not found on Mufasa: check mufasa.repo_dir") from None
 
 
 def r_isfile(sftp, path):
@@ -291,15 +292,52 @@ def remote_files(sftp, remote_dir, rel=""):
     return out
 
 
-def sync_dir(sftp, local_dir, remote_dir, only=None, mirror=False, dry_run=False):
-    """Upload what is missing or changed (size or mtime) in remote_dir; with
-    `mirror`, also delete remote files that are not on this PC. The remote
-    mtime is set to the local one, so an unchanged file is never re-sent.
-    Returns (uploaded, unchanged, removed) lists of relative paths."""
+def local_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def remote_sha256(client, r, remote_dir, names):
+    """{name: sha256} of files in remote_dir, computed on Mufasa."""
+    if not names:
+        return {}
+    _, out, _ = run_cmd(client, r, f"cd {shlex.quote(remote_dir)} && sha256sum -- "
+                        + " ".join(shlex.quote(n) for n in names))
+    res = {}
+    for line in out.splitlines():          # the login shell may print other lines
+        h, _, name = line.strip().partition("  ")
+        if len(h) == 64 and name.lstrip("*") in names:
+            res[name.lstrip("*")] = h
+    return res
+
+
+def sync_dir(sftp, local_dir, remote_dir, only=None, mirror=False, dry_run=False, hasher=None):
+    """Make remote_dir hold this PC's files, uploading only what is needed.
+
+    Same size and mtime = already there (like rsync). Same size but another
+    mtime (e.g. copied on Mufasa with plain `cp` / `scp`) = compared by SHA-256
+    through `hasher(remote_dir, names)`; identical files are not re-sent and get
+    the local mtime, so the next check is instant. With `mirror`, remote files
+    that are not on this PC are deleted. Returns a dict of relative paths:
+    missing / changed (uploaded), same, by_checksum (subset of same), removed."""
     loc = local_files(local_dir, only)
-    rem = remote_files(sftp, remote_dir) if only is None else {
-        n: v for n, v in remote_files(sftp, remote_dir).items() if n in loc}
-    todo = [n for n, (_, size, mtime) in loc.items() if rem.get(n) != (size, mtime)]
+    rem = remote_files(sftp, remote_dir)
+    if only is not None:
+        rem = {n: v for n, v in rem.items() if n in loc}
+    missing = [n for n in loc if n not in rem]
+    changed = [n for n in loc if n in rem and rem[n][0] != loc[n][1]]
+    check = [n for n in loc if n in rem and rem[n][0] == loc[n][1] and rem[n][1] != loc[n][2]]
+    by_checksum = []
+    if check and hasher is not None:
+        rh = hasher(remote_dir, check)
+        for n in check:
+            (by_checksum if rh.get(n) == local_sha256(loc[n][0]) else changed).append(n)
+    else:
+        changed += check
+    todo = missing + changed
     extra = sorted(set(rem) - set(loc)) if mirror else []
     if not dry_run:
         made = set()
@@ -312,9 +350,13 @@ def sync_dir(sftp, local_dir, remote_dir, only=None, mirror=False, dry_run=False
                 made.add(rdir)
             sftp.put(full, rpath)               # paramiko checks the size after the put
             sftp.utime(rpath, (mtime, mtime))
+        for n in by_checksum:
+            mtime = loc[n][2]
+            sftp.utime(posixpath.join(remote_dir, n), (mtime, mtime))
         for n in extra:
             sftp.remove(posixpath.join(remote_dir, n))
-    return todo, [n for n in loc if n not in todo], extra
+    return {"missing": missing, "changed": changed, "by_checksum": by_checksum,
+            "same": [n for n in loc if n not in todo], "removed": extra}
 
 
 def pull_selected(sftp, remote_base, local_base, patterns):
@@ -491,9 +533,14 @@ def submit(config_path=DEFAULT_CONFIG, *, stages=None, overrides=None,
         stages, syncs = plan_run(sftp, full, sample, paths, list(stages), date)
         print(f"[remote] sample {sample}: {' + '.join(stages)} on Mufasa -> {r_sample}")
         for label, ldir, rdir, only, mirror in syncs:
-            up, same, gone = sync_dir(sftp, ldir, rdir, only, mirror, dry_run)
-            verb = "would upload" if dry_run else "uploaded"
-            print(f"[remote] {label}: {verb} {len(up)}, already on Mufasa {len(same)}"
+            s = sync_dir(sftp, ldir, rdir, only, mirror, dry_run,
+                         hasher=lambda d, names: remote_sha256(client, r, d, names))
+            up, gone = s["missing"] + s["changed"], s["removed"]
+            print(f"[remote] {label}: {'would upload' if dry_run else 'uploaded'} {len(up)}"
+                  + (f" ({len(s['missing'])} missing, {len(s['changed'])} different"
+                     f"{', e.g. ' + str(up[:3]) if up else ''})" if up else "")
+                  + f", already on Mufasa {len(s['same'])}"
+                  + (f" ({len(s['by_checksum'])} matched by checksum)" if s["by_checksum"] else "")
                   + (f", {'would remove' if dry_run else 'removed'} {len(gone)} stale "
                      f"{gone[:5]}{' ...' if len(gone) > 5 else ''}" if gone else "")
                   + f"  ({rdir})")

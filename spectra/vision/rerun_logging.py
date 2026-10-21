@@ -7,7 +7,7 @@ backend-agnostic.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -21,12 +21,7 @@ except Exception:  # pragma: no cover - optional
     HAS_RERUN = False
 
 from .align import ArucoAlignment, PlaneFrame
-from .aruco import MarkerDetection, color_for_id_rgb
-
-
-def _require_rerun() -> None:
-    if not HAS_RERUN:
-        raise RuntimeError("rerun is not installed; cannot log visuals.")
+from .aruco import color_for_id_rgb
 
 
 def init_rerun(

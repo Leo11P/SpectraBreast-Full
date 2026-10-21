@@ -528,7 +528,7 @@ class PipelineViz:
         if self.robot_viz is not None:
             try:
                 self.robot_viz.CloseRPC()
-            except Exception as e:
+            except Exception:
                 pass
             self.robot_viz = None
         print(f"[viz] phase 3: robot hidden; {self._n_photo} acquired poses "

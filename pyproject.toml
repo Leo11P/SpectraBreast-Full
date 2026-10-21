@@ -46,7 +46,6 @@ processing = [
     "open3d>=0.19",
     "roma>=1.5",
     "safetensors>=0.4",
-    "textual>=0.60",
     "torch>=2.2",
     "torchvision>=0.17",
     "openpyxl>=3.1",

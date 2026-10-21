@@ -69,9 +69,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import (
-    RegistrationConfig,
     UnifiedConfig,
-    VisionConfig,
 )
 from .vision.aruco import IMAGE_EXTENSIONS
 
