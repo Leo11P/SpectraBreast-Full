@@ -16,7 +16,7 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 folder = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
-name = sys.argv[2] if len(sys.argv) > 2 else "spectral_pointcloud_SAMPLE2"
+name = sys.argv[2] if len(sys.argv) > 2 else "spectral_pointcloud_sintetico"
 
 # meta = [n_punti, 3, n_punti, n_bande]
 n, _, _, n_bands = np.load(folder / f"{name}_meta.npy").tolist()

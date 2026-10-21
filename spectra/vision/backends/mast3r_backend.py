@@ -519,7 +519,8 @@ def _preset_exact_intrinsics(scene, intrinsics_network):
 
 
 def _ensure_mast3r_on_path() -> None:
-    repo_root = Path(__file__).resolve().parent.parent.parent
+    # spectra/vision/backends/mast3r_backend.py -> repo root is 4 levels up
+    repo_root = Path(__file__).resolve().parents[3]
     mast3r_root = repo_root / "mast3r"
     if str(mast3r_root) not in sys.path:
         sys.path.append(str(mast3r_root))
