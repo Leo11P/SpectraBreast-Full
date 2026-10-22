@@ -167,8 +167,8 @@ class RegistrationRerun(BaseModel):
     """Spectral Rerun recording written after the point-cloud export.
 
     ``<output_dir>/spectral.rrd`` (+ ``spectral.rbl``): top view = one band,
-    chosen on the ``wavelength_nm`` timeline; bottom view = PCA PC1. Both views
-    spin around the sample. See :mod:`spectra.registration.rerun_spectral`.
+    chosen on the ``wavelength_nm`` timeline, in ``colormap``; bottom view = PCA
+    PC1/PC2/PC3 as RGB. Both views spin around the sample. See :mod:`spectra.registration.rerun_spectral`.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -176,8 +176,8 @@ class RegistrationRerun(BaseModel):
     enabled: bool = False
     max_points: Optional[int] = Field(default=150_000, ge=1000)   # None = all
     band_step: int = Field(default=2, ge=1)
-    colormap: Literal["viridis", "turbo", "inferno", "magma",
-                      "plasma", "cividis", "jet"] = "viridis"
+    colormap: Literal["gray", "viridis", "turbo", "inferno", "magma",
+                      "plasma", "cividis", "jet"] = "gray"     # band view only
     point_radius_px: float = Field(default=2.0, gt=0.0)
     spin_speed: float = Field(default=0.3, ge=0.0)
     save_rbl: bool = True

@@ -514,8 +514,9 @@ registration:
   # export.save_pointcloud + ply or npy). It lands next to the point cloud:
   #   RESULTS/<dd-mm-yyyy>/<sample>/registration/spectral.rrd (+ spectral.rbl)
   # Open it with `rerun spectral.rrd spectral.rbl`.
-  #   top view    : one band — pick it on the `wavelength_nm` timeline (time panel)
-  #   bottom view : PCA, first principal component only
+  #   top view    : one band, in `colormap` — pick it on the `wavelength_nm`
+  #                 timeline (time panel)
+  #   bottom view : PCA, first three components as RGB (PC1 R, PC2 G, PC3 B)
   # Both views spin around the sample. Weight ≈ max_points x bands/band_step x
   # 4 bytes (150000 points, 290 bands, step 2 → ~90 MB raw, ~45 MB on disk).
   # Works in every mode (single / roi / batch / sweep's best pair).
@@ -523,7 +524,7 @@ registration:
     enabled:         true
     max_points:      150000     # random subset of the cloud; null = all (heavy)
     band_step:       2          # 1 = every band, 2 = every other band, ...
-    colormap:        "viridis"  # viridis | turbo | inferno | magma | plasma | cividis | jet
+    colormap:        "gray"     # band view: gray | viridis | turbo | inferno | magma | plasma | cividis | jet
     point_radius_px: 2.0        # point size on screen
     spin_speed:      0.3        # auto-spin speed of both views; 0 = still
     save_rbl:        true       # also write the layout alone (.rbl)

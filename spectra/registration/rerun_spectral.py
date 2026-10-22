@@ -12,9 +12,11 @@ Layout (both views spin around the sample's vertical axis; the vertical axis
 follows the vision run's ``z_axis_points_down``, read from its
 ``reconstruction_metadata.json``, so the sample is never shown upside down):
 
-    top    : one band at a time — pick it on the ``wavelength_nm`` timeline
-             (or ``band`` = band index) in the time panel at the bottom
-    bottom : first principal component (PCA PC1) of the spectra
+    top    : one band at a time, in ``colormap`` (default gray) — pick it on
+             the ``wavelength_nm`` timeline (or ``band`` = band index) in the
+             time panel at the bottom
+    bottom : first three principal components of the spectra as RGB
+             (PC1 -> R, PC2 -> G, PC3 -> B)
 
 Size control (``registration.rerun`` in the YAML): every logged band costs
 ``n_points x 4`` bytes, so the recording is ``max_points`` random points x
@@ -40,6 +42,7 @@ TIMELINE_NM = "wavelength_nm"
 TIMELINE_BAND = "band"
 
 _CV2_COLORMAPS = {
+    "gray": None,                       # identity LUT, no OpenCV colormap
     "viridis": "COLORMAP_VIRIDIS",
     "turbo": "COLORMAP_TURBO",
     "inferno": "COLORMAP_INFERNO",
@@ -139,6 +142,8 @@ def find_and_read_cloud(output_dir: Path, sample_name: str):
 
 def _lut(name: str) -> np.ndarray:
     """256 x 3 uint8 RGB lookup table from OpenCV's colormaps."""
+    if name == "gray":
+        return np.repeat(np.arange(256, dtype=np.uint8)[:, None], 3, axis=1)
     import cv2
 
     code = getattr(cv2, _CV2_COLORMAPS[name])
@@ -146,24 +151,36 @@ def _lut(name: str) -> np.ndarray:
     return np.ascontiguousarray(bgr[:, 0, ::-1])
 
 
-def _colorize(values: np.ndarray, lut: np.ndarray) -> np.ndarray:
-    """1st–99th percentile stretch, then colormap."""
+def _stretch_u8(values: np.ndarray) -> np.ndarray:
+    """1st–99th percentile stretch to 0..255."""
     lo, hi = np.percentile(values, [1.0, 99.0])
     t = (values - lo) / (hi - lo) if hi > lo else np.zeros_like(values)
-    idx = np.clip(np.round(t * 255.0), 0, 255).astype(np.uint8)
-    return lut[idx]
+    return np.clip(np.round(t * 255.0), 0, 255).astype(np.uint8)
 
 
-def _pca_pc1(spectra: np.ndarray):
-    """Scores on the first principal component + its explained-variance ratio."""
+def _colorize(values: np.ndarray, lut: np.ndarray) -> np.ndarray:
+    """1st–99th percentile stretch, then colormap."""
+    return lut[_stretch_u8(values)]
+
+
+def _pca_rgb(spectra: np.ndarray):
+    """First three principal components, each stretched, as R, G, B.
+
+    Returns ``(rgb uint8 [n, 3], [explained-variance ratio of each PC])``.
+    """
     x = spectra - spectra.mean(axis=0, dtype=np.float64).astype(np.float32)
     cov = (x.T @ x).astype(np.float64) / max(len(x) - 1, 1)
     evals, evecs = np.linalg.eigh(cov)                  # ascending
-    v1 = evecs[:, -1]
-    if v1[np.argmax(np.abs(v1))] < 0:                   # deterministic sign
-        v1 = -v1
-    ratio = float(evals[-1] / evals.sum()) if evals.sum() > 0 else float("nan")
-    return x @ v1.astype(np.float32), ratio
+    total = float(evals.sum())
+    rgb = np.zeros((len(x), 3), dtype=np.uint8)
+    ratios = []
+    for c in range(min(3, evecs.shape[1])):
+        v = evecs[:, -1 - c]
+        if v[np.argmax(np.abs(v))] < 0:                 # deterministic sign
+            v = -v
+        rgb[:, c] = _stretch_u8(x @ v.astype(np.float32))
+        ratios.append(float(evals[-1 - c]) / total if total > 0 else float("nan"))
+    return rgb, ratios
 
 
 # =============================================================================
@@ -176,7 +193,7 @@ def write_spectral_rerun(
     *,
     max_points: Optional[int] = 150_000,
     band_step: int = 2,
-    colormap: str = "viridis",
+    colormap: str = "gray",
     point_radius_px: float = 2.0,
     spin_speed: float = 0.3,
     save_rbl: bool = True,
@@ -215,7 +232,8 @@ def write_spectral_rerun(
           f"(every {band_step}) → ~{est_mb:.0f} MB uncompressed")
 
     lut = _lut(colormap)
-    pc1, ratio = _pca_pc1(spec)
+    pca_rgb, ratios = _pca_rgb(spec)
+    var = "/".join(f"{r:.0%}" for r in ratios)
 
     # -- camera: orbit (and spin) around the sample's centre ------------------
     # Vision's output frame has +Z pointing DOWN by default
@@ -243,7 +261,7 @@ def write_spectral_rerun(
                 origin="/", contents="/band/**", eye_controls=_eye(),
             ),
             rrb.Spatial3DView(
-                name=f"PCA — PC1 ({ratio:.0%} of variance)",
+                name=f"PCA — PC1/PC2/PC3 as R/G/B ({var} of variance)",
                 origin="/", contents="/pca/**", eye_controls=_eye(),
             ),
         ),
@@ -259,8 +277,7 @@ def write_spectral_rerun(
 
     rec.log("/", rr.ViewCoordinates.RIGHT_HAND_Z_DOWN if z_down
             else rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
-    rec.log("pca/cloud", rr.Points3D(xyz, colors=_colorize(pc1, lut), radii=radius),
-            static=True)
+    rec.log("pca/cloud", rr.Points3D(xyz, colors=pca_rgb, radii=radius), static=True)
     rec.log("band/cloud", rr.Points3D(xyz, radii=radius), static=True)
     for bi in band_idx:
         if wl is not None:
@@ -275,7 +292,7 @@ def write_spectral_rerun(
 
     size_mb = rrd_path.stat().st_size / 1e6
     print(f"[Rerun spectral] Saved {rrd_path} ({size_mb:.0f} MB, "
-          f"PC1 = {ratio:.0%} of variance) in {time.time() - t0:.1f}s")
+          f"PC1/PC2/PC3 = {var} of variance) in {time.time() - t0:.1f}s")
     if save_rbl:
         print(f"[Rerun spectral] Layout {output_dir / rbl_basename}")
     print(f"[Rerun spectral] Open with: rerun {rrd_basename}"
