@@ -10,7 +10,8 @@ Reads the point cloud the registration has just exported to ``output_dir``
 
 Layout (both views spin around the sample's vertical axis; the vertical axis
 follows the vision run's ``z_axis_points_down``, read from its
-``reconstruction_metadata.json``, so the sample is never shown upside down):
+``reconstruction_metadata.json``, so the sample is never shown upside down;
+the camera starts on the +Y side, which shows the sample head-up):
 
     top    : one band at a time, in ``colormap`` (default gray) — pick it on
              the ``wavelength_nm`` timeline (or ``band`` = band index) in the
@@ -242,7 +243,9 @@ def write_spectral_rerun(
     lo, hi = xyz.min(axis=0), xyz.max(axis=0)
     centre = (lo + hi) / 2.0
     diag = float(np.linalg.norm(hi - lo)) or 1.0
-    eye_pos = centre + diag * (np.array([0.0, -0.9, 0.0], dtype=np.float32) + 0.7 * up)
+    # Camera on the +Y side: in the vision frame this shows the sample head-up
+    # (from -Y it came out rotated by 180 deg about the vertical axis).
+    eye_pos = centre + diag * (np.array([0.0, 0.9, 0.0], dtype=np.float32) + 0.7 * up)
 
     def _eye():
         return rrb.EyeControls3D(
