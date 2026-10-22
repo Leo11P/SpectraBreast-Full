@@ -50,7 +50,7 @@
 
 # Sample being processed. Drives every auto-derived path — spell it exactly as
 # the folder names under DATA/.
-sample_name: "Sintetico"
+sample_name: "SAMPLE2"
 
 # Roots that drive default path resolution. Relative (from cwd) or absolute.
 data_root:    "DATA"
@@ -353,7 +353,7 @@ vision:
     # PHYSICAL marker edge length in MILLIMETRES. Single source of truth for
     # the whole pipeline (acquisition bootstrap/servo included) — this sets the metric scale of the reconstruction,
     # and registration inherits it. Measure it properly.
-    marker_edge_length_mm:  6.8
+    marker_edge_length_mm:  25
     origin_marker_id:       null
     min_views_per_marker:   2
     align_to_aruco:         true
@@ -417,7 +417,7 @@ vision:
   rerun:
     # true -> record the run to RESULTS/<dd-mm-yyyy>/<sample>/vision/rerun/spectra.rrd
     # (open it later with `rerun spectra.rrd`). Safe on SLURM: no viewer needed.
-    enabled: true
+    enabled: false
     # true ONLY with a Rerun viewer running on this machine (live streaming on
     # grpc_port). Keep false on Mufasa.
     live_viewer: false
@@ -553,3 +553,4 @@ registration:
       - [2.0, 0.5]
       - [1.0, 0.5]
       - [0.5, 0.5]
+      - [0.2, 0.5]
