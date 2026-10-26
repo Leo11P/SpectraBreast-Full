@@ -228,6 +228,12 @@ def rerun_flush() -> None:
         rprint(f"[yellow]Rerun: flush failed ({exc!r}).[/yellow]")
 
 
+def log_world_up_z() -> None:
+    """Declare the output frame (ArUco frame): +Z up, towards the cameras."""
+    if HAS_RERUN:
+        rr.log("/", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+
+
 def log_camera(
     index: int,
     T_world_cam: np.ndarray,

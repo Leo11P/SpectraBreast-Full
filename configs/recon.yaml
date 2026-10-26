@@ -15,12 +15,12 @@ output:
   root: RESULTS
   run_name: SCRAP
   update_most_recent_symlink: true
-  z_axis_points_down: true
 
 aruco:
   dictionary: 4x4_50
   # marker_edge_length_mm: NOT set here — read from configs/default.yaml
-  origin_marker_id: null
+  frame_marker_ids: null
+  x_axis_marker_ids: null
   min_views_per_marker: 2
   align_to_aruco: true
   max_sim3_scale_deviation_when_poses_known: 0.05

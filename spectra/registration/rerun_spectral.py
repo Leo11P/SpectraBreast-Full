@@ -8,10 +8,11 @@ Reads the point cloud the registration has just exported to ``output_dir``
     <output_dir>/spectral.rrd   data + layout, open with ``rerun spectral.rrd``
     <output_dir>/spectral.rbl   layout only, ``rerun spectral.rrd spectral.rbl``
 
-Layout (both views spin around the sample's vertical axis; the vertical axis
-follows the vision run's ``z_axis_points_down``, read from its
-``reconstruction_metadata.json``, so the sample is never shown upside down;
-the camera starts on the +Y side, which shows the sample head-up):
+Layout (both views spin around the sample's vertical axis). "Up" is the side
+of the marker plane (z = 0) where the vision cameras are, read from the vision
+run's ``camera_poses_output_frame.npy``, so the sample is always seen from
+above. This also covers runs made before the output frame was fixed (those
+were reflected with ``z_axis_points_down``).
 
     top    : one band at a time, in ``colormap`` (default gray) — pick it on
              the ``wavelength_nm`` timeline (or ``band`` = band index) in the
@@ -200,9 +201,13 @@ def write_spectral_rerun(
     save_rbl: bool = True,
     rrd_basename: str = "spectral.rrd",
     rbl_basename: str = "spectral.rbl",
-    z_down: bool = True,
+    vision_dir: Optional[Path] = None,
 ) -> Path:
-    """Write ``spectral.rrd`` (+ ``spectral.rbl``) next to the point cloud."""
+    """Write ``spectral.rrd`` (+ ``spectral.rbl``) next to the point cloud.
+
+    ``vision_dir`` (the vision run of this sample, for the camera poses)
+    defaults to ``<output_dir>/../vision``.
+    """
     import rerun as rr
     import rerun.blueprint as rrb
 
@@ -236,16 +241,13 @@ def write_spectral_rerun(
     pca_rgb, ratios = _pca_rgb(spec)
     var = "/".join(f"{r:.0%}" for r in ratios)
 
-    # -- camera: orbit (and spin) around the sample's centre ------------------
-    # Vision's output frame has +Z pointing DOWN by default
-    # (vision.output.z_axis_points_down): "up" is then -Z.
-    up = np.array([0.0, 0.0, -1.0 if z_down else 1.0], dtype=np.float32)
+    # -- camera: orbit (and spin) around the sample's centre, from above -----
+    up_z = _up_from_cameras(Path(vision_dir) if vision_dir else output_dir.parent / "vision")
+    up = np.array([0.0, 0.0, up_z], dtype=np.float32)
     lo, hi = xyz.min(axis=0), xyz.max(axis=0)
     centre = (lo + hi) / 2.0
     diag = float(np.linalg.norm(hi - lo)) or 1.0
-    # Camera on the +Y side: in the vision frame this shows the sample head-up
-    # (from -Y it came out rotated by 180 deg about the vertical axis).
-    eye_pos = centre + diag * (np.array([0.0, 0.9, 0.0], dtype=np.float32) + 0.7 * up)
+    eye_pos = centre + diag * (np.array([0.0, -0.9, 0.0], dtype=np.float32) + 0.7 * up)
 
     def _eye():
         return rrb.EyeControls3D(
@@ -278,8 +280,8 @@ def write_spectral_rerun(
     rec.save(rrd_path, default_blueprint=blueprint)
     radius = rr.Radius.ui_points(float(point_radius_px))
 
-    rec.log("/", rr.ViewCoordinates.RIGHT_HAND_Z_DOWN if z_down
-            else rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+    rec.log("/", rr.ViewCoordinates.RIGHT_HAND_Z_UP if up_z > 0
+            else rr.ViewCoordinates.RIGHT_HAND_Z_DOWN, static=True)
     rec.log("pca/cloud", rr.Points3D(xyz, colors=pca_rgb, radii=radius), static=True)
     rec.log("band/cloud", rr.Points3D(xyz, radii=radius), static=True)
     for bi in band_idx:
@@ -303,17 +305,22 @@ def write_spectral_rerun(
     return rrd_path
 
 
-def _z_axis_points_down(mesh_path) -> bool:
-    """``z_axis_points_down`` of the vision run that produced ``mesh_path``."""
-    import json
+def _up_from_cameras(vision_dir: Path) -> float:
+    """+1.0 if the vision cameras are at +Z (the markers are at z = 0), else -1.0.
 
-    meta = Path(mesh_path).parent / "reconstruction_metadata.json" if mesh_path else None
+    The cameras look down at the sample, so their side of the marker plane is
+    "up".
+    """
+    path = Path(vision_dir) / "camera_poses_output_frame.npy"
     try:
-        return bool(json.loads(meta.read_text(encoding="utf-8"))["z_axis_points_down"])
+        z = float(np.median(np.load(path)[:, 2, 3]))      # camera-to-world, centre z
+        if np.isfinite(z) and z != 0.0:
+            return 1.0 if z > 0 else -1.0
     except Exception:
-        print(f"[Rerun spectral] z_axis_points_down not found in {meta}: "
-              "assuming true (vision default).")
-        return True
+        pass
+    print(f"[Rerun spectral] WARNING: camera poses not readable in {path}: "
+          "assuming +Z up.")
+    return 1.0
 
 
 def maybe_write_spectral_rerun(cfg, output_dir, sample_name: str,
@@ -341,7 +348,7 @@ def maybe_write_spectral_rerun(cfg, output_dir, sample_name: str,
             save_rbl=rc.save_rbl,
             rrd_basename=rc.rrd_basename,
             rbl_basename=rc.rbl_basename,
-            z_down=_z_axis_points_down(mesh_path or cfg.paths.mesh),
+            vision_dir=Path(mesh_path or cfg.paths.mesh).parent,
         )
     except Exception as exc:  # the point cloud is already on disk
         print(f"[Rerun spectral] WARNING: recording NOT written: {exc}")

@@ -358,6 +358,101 @@ class CalibrationConfig(BaseModel):
 # Mufasa — where vision / registration run.
 # =============================================================================
 
+# =============================================================================
+# Validation (spectra validate) — ground-truth phantoms, protocol phase 1 (vision).
+# Data layout is fixed: <data_root>/validation/ (marker table + STL assemblies).
+# =============================================================================
+
+class ValidationPhantom(BaseModel):
+    """One phantom: the STL of the cassette with this phantom in the recess
+    (CAD frame, mm, Z up), in <data_root>/validation/."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stl: str
+    #: XY box [xmin, xmax, ymin, ymax] of the evaluated region, CAD frame (mm).
+    #: null = the STL above the marker plane + validation.vision.roi_margin_mm.
+    roi_mm: Optional[List[float]] = None
+
+    @field_validator("roi_mm")
+    @classmethod
+    def _box(cls, v):
+        if v is not None and (len(v) != 4 or v[0] >= v[1] or v[2] >= v[3]):
+            raise ValueError(f"roi_mm must be [xmin, xmax, ymin, ymax], got {v}")
+        return v
+
+
+class ValidationICP(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    max_corr_mm: float = Field(default=2.0, gt=0.0)    # pairs farther than this are ignored
+    iters: int = Field(default=50, ge=1)
+
+
+class ValidationFiducials(BaseModel):
+    """Per-bersaglio error (validation/fiducials.py): the bersagli, holes of the
+    phantom STL, looked for in the photos of the vision run near their expected
+    position, then hit on the reconstructed mesh."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    #: bright = bersaglio lighter than the phantom (white on black) | dark.
+    polarity: Literal["bright", "dark"] = "bright"
+    search_radius_mm: float = Field(default=2.0, gt=0.0)        # around the expected position
+    max_view_angle_deg: float = Field(default=60.0, gt=0.0, lt=90.0)   # view vs hole axis
+    min_contrast: float = Field(default=20.0, ge=0.0)          # spot peak - background, grey 0-255
+    outlier_mm: float = Field(default=1.0, gt=0.0)             # views this far from the median: dropped
+    min_views: int = Field(default=2, ge=1)
+    save_sheet: bool = True                                    # fiducials.png
+
+
+class ValidationVision(BaseModel):
+    """Phase 1: the reconstruction against the phantom STL."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["mesh", "cloud"] = "mesh"     # surface_mesh.ply (what registration uses) | cloud.ply
+    primary: Literal["frame", "kabsch", "icp"] = "icp"
+    sample_spacing_mm: float = Field(default=0.25, gt=0.0)
+    roi_margin_mm: float = Field(default=5.0, ge=0.0)
+    occluder_margin_mm: float = Field(default=20.0, ge=0.0)
+    icp: ValidationICP = Field(default_factory=ValidationICP)
+    thresholds_mm: List[float] = Field(default_factory=lambda: [1.0, 2.0])
+    height_bin_mm: float = Field(default=2.0, gt=0.0)
+    visibility_tol_mm: float = Field(default=1.0, ge=0.0)
+    error_map_max_mm: float = Field(default=2.0, gt=0.0)
+    save_error_map: bool = True
+    save_rrd: bool = True
+    fiducials: ValidationFiducials = Field(default_factory=ValidationFiducials)
+
+
+class ValidationConfig(BaseModel):
+    """``validation:`` section (spectra validate, stage ``validation``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    fixture_table: str = "Tabella_marker_cassetta.xlsx"
+    phantoms: dict[str, ValidationPhantom] = Field(default_factory=dict)
+    #: sample_name -> phantom, for samples not named as sample_pattern.
+    cases: dict[str, str] = Field(default_factory=dict)
+    #: Groups phantom (required), pose, rep: pose/rep pair the same case across models.
+    sample_pattern: str = r"^(?P<phantom>[^_]+)_(?P<pose>[^_]+)_(?P<rep>[^_]+)$"
+    #: Name of the reconstruction model in the summary; null = backend + pipeline variant.
+    model_label: Optional[str] = None
+    vision: ValidationVision = Field(default_factory=ValidationVision)
+
+    @field_validator("sample_pattern")
+    @classmethod
+    def _pattern(cls, v: str) -> str:
+        import re
+
+        if "phantom" not in re.compile(v).groupindex:
+            raise ValueError("validation.sample_pattern needs a (?P<phantom>...) group")
+        return v
+
+
 class MufasaConfig(BaseModel):
     """``mufasa:`` section: run vision / registration on this PC or on Mufasa.
 
@@ -391,7 +486,8 @@ class MufasaConfig(BaseModel):
     #: Downloaded after the job, relative to RESULTS/<date>/<sample>/ on Mufasa
     #: ("dir/glob"); everything else stays on Mufasa.
     pull_patterns: List[str] = Field(default_factory=lambda: [
-        "registration/*.xlsx", "registration/*.rrd", "registration/*.rbl"])
+        "registration/*.xlsx", "registration/*.rrd", "registration/*.rbl",
+        "validation/vision/*"])
 
     @model_validator(mode="after")
     def _required_when_enabled(self) -> "MufasaConfig":
@@ -429,7 +525,7 @@ class UnifiedConfig(BaseModel):
     results_date: Optional[str] = None
     #: Stages run by ``spectra full``. "acquisition" (robot, always on this
     #: PC) is opt-in so a config without it never moves the robot.
-    stages: List[Literal["acquisition", "vision", "registration"]] = Field(
+    stages: List[Literal["acquisition", "vision", "registration", "validation"]] = Field(
         default_factory=lambda: ["vision", "registration"],
     )
 
@@ -445,6 +541,8 @@ class UnifiedConfig(BaseModel):
     mufasa:       Optional[MufasaConfig] = None
     #: Hand-eye + intrinsics calibration of the robot camera (spectra calibrate).
     calibration:  Optional[CalibrationConfig] = None
+    #: Validation against ground-truth phantoms (spectra validate, stage "validation").
+    validation:   Optional[ValidationConfig] = None
 
     @field_validator("results_date")
     @classmethod
@@ -463,7 +561,10 @@ class UnifiedConfig(BaseModel):
     @model_validator(mode="after")
     def _check_stages_and_sections(self) -> "UnifiedConfig":
         if not self.stages:
-            raise ValueError("stages must list at least one of acquisition / vision / registration.")
+            raise ValueError("stages must list at least one of acquisition / vision / "
+                             "registration / validation.")
+        if "validation" in self.stages and self.validation is None:
+            raise ValueError("stages contains 'validation' but the config has no `validation:` section.")
         if isinstance(self.acquisition, dict) and "remote" in self.acquisition:
             raise ValueError(
                 "acquisition.remote has moved to the top-level `mufasa:` section "

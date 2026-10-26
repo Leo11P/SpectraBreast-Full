@@ -59,11 +59,14 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(ROOT))
 DEFAULT_CONFIG = os.path.join(REPO_ROOT, "configs", "default.yaml")
 
-COMPUTE_STAGES = ("vision", "registration")      # the only stages run on Mufasa
+COMPUTE_STAGES = ("vision", "registration", "validation")   # the stages run on Mufasa
 DATE_FORMAT = "%d-%m-%Y"                         # RESULTS/<dd-mm-yyyy>/
 # Vision run files registration reads (first two required, as in the pipeline).
 VISION_REQUIRED = ("surface_mesh.ply", "aruco_markers_3d.json")
 VISION_HANDOFF = VISION_REQUIRED + ("timings.json", "reconstruction_metadata.json")
+# ... and what the validation reads too.
+VISION_VALIDATION = VISION_HANDOFF + ("camera_poses_output_frame.npy",
+                                      "intrinsics_original_frame.npy")
 
 # SLURM states meaning the job has left the queue.
 TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL",
@@ -77,7 +80,8 @@ DEFAULTS = {
     "partition": "jobs", "qos": "gpuwide", "gres": "gpu:4g.20gb:1",
     "cpus": 8, "mem": "64G", "time": "12:00:00", "job_name": "spectra",
     "wait": True, "poll_s": 20, "pull_results": True,
-    "pull_patterns": ["registration/*.xlsx", "registration/*.rrd", "registration/*.rbl"],
+    "pull_patterns": ["registration/*.xlsx", "registration/*.rrd", "registration/*.rbl",
+                      "validation/vision/*"],
 }
 
 
@@ -120,6 +124,7 @@ def load_settings(config_path, overrides=None):
     paths = {
         "vision": os.path.join(data_root, "input_vision", sample),
         "registration": os.path.join(data_root, "input_registration", sample),
+        "validation": os.path.join(data_root, "validation"),
         "results_root": os.path.abspath(str(full.get("results_root", "RESULTS"))),
         # on Mufasa: same layout, inside the repo clone
         "r_data": posixpath.join(r["repo_dir"], "DATA"),
@@ -393,7 +398,7 @@ def plan_run(sftp, full, sample, paths, stages, date):
     stages = [s for s in COMPUTE_STAGES if s in stages]   # acquisition never runs there
     if not stages:
         raise SystemExit("[remote] nothing to run on Mufasa: stages must include "
-                         "vision and/or registration")
+                         "vision, registration and/or validation")
     syncs = []
     r_vis = posixpath.join(paths["r_data"], "input_vision", sample)
     r_reg = posixpath.join(paths["r_data"], "input_registration", sample)
@@ -421,7 +426,9 @@ def plan_run(sftp, full, sample, paths, stages, date):
         else:
             raise SystemExit(f"[remote] registration needs input_registration/{sample}/{need}, "
                              "neither on this PC nor on Mufasa")
-    if "registration" in stages and "vision" not in stages:
+    if "validation" in stages:
+        syncs += validation_sync(sftp, paths)
+    if ("registration" in stages or "validation" in stages) and "vision" not in stages:
         # The job takes `date`'s vision run, else the most recent one (pipeline
         # rule): send this PC's run only when it is the one that must be used.
         loc = vision_runs(paths["results_root"], sample, os.path.isfile,
@@ -433,13 +440,42 @@ def plan_run(sftp, full, sample, paths, stages, date):
         if l_day and (l_day == date or not r_day or (r_day != date and _day(l_day) > _day(r_day))):
             syncs.append(("vision run", loc[l_day],
                           posixpath.join(paths["r_results"], l_day, sample, "vision"),
-                          VISION_HANDOFF, False))
+                          VISION_VALIDATION if "validation" in stages else VISION_HANDOFF, False))
         elif r_day:
-            print(f"[remote] registration uses the vision run on Mufasa: {rem[r_day]}")
+            print(f"[remote] {' + '.join(s for s in stages if s != 'vision')} uses the "
+                  f"vision run on Mufasa: {rem[r_day]}")
         else:
             raise SystemExit(f"[remote] no vision run for {sample} on this PC or on Mufasa "
                              f"(needs {list(VISION_REQUIRED)}): run `spectra vision` first")
     return stages, syncs
+
+
+def validation_sync(sftp, paths):
+    """DATA/validation (marker table + STL) for a validation job."""
+    r_val = posixpath.join(paths["r_data"], "validation")
+    if os.path.isdir(paths["validation"]):
+        return [("validation data", paths["validation"], r_val, None, False)]
+    if r_listdir(sftp, r_val):
+        print(f"[remote] {paths['validation']} not on this PC: using the copy on Mufasa ({r_val})")
+        return []
+    raise SystemExit(f"[remote] {paths['validation']} (marker table + STL) is neither "
+                     "on this PC nor on Mufasa")
+
+
+def pull_validation_all(sftp, r_results, local_results, date):
+    """After `spectra validate --all`: every case's metrics.json of `date` and
+    the summary (RESULTS/_validation/). Error maps / .rrd stay on Mufasa."""
+    n = 0
+    r_day = posixpath.join(r_results, date)
+    for sample in sorted(r_listdir(sftp, r_day)):
+        src = posixpath.join(r_day, sample, "validation", "vision", "metrics.json")
+        if r_isfile(sftp, src):
+            dst = os.path.join(local_results, date, sample, "validation", "vision")
+            os.makedirs(dst, exist_ok=True)
+            sftp.get(src, os.path.join(dst, "metrics.json"))
+            n += 1
+    n += pull_selected(sftp, r_results, local_results, ["_validation/*"])
+    return n
 
 
 def render_run_config(full, sample, paths, stages, marker_mm, date):
@@ -459,7 +495,7 @@ def render_run_config(full, sample, paths, stages, marker_mm, date):
     return yaml.safe_dump(cfg, sort_keys=False)
 
 
-def build_job_script(r, job_dir, run_config, extra_args=()):
+def build_job_script(r, job_dir, run_config, extra_args=(), command="full"):
     extra = "".join(f" {shlex.quote(a)}" for a in extra_args)
     return f"""#!/bin/bash
 #SBATCH --job-name={r['job_name']}
@@ -491,7 +527,7 @@ export PATH="${{HOME}}/.local/bin:${{PATH}}"
 # configs/default.yaml on Mufasa is not used.
 export SPECTRA_DEFAULT_CONFIG={shlex.quote(run_config)}
 
-uv run --extra processing spectra full --config {shlex.quote(run_config)}{extra}
+uv run --extra processing spectra {command} --config {shlex.quote(run_config)}{extra}
 echo "Finished: $(date)"
 """
 
@@ -512,9 +548,11 @@ def preflight(config_path=DEFAULT_CONFIG, overrides=None):
 
 
 def submit(config_path=DEFAULT_CONFIG, *, stages=None, overrides=None,
-           wait=None, pull=None, dry_run=False, extra_args=()):
+           wait=None, pull=None, dry_run=False, extra_args=(), validate_all=False):
     """Syncs what `stages` need, submits the SLURM job and (optionally) waits
-    for it and downloads the selected results. Returns (jobid, final_state)."""
+    for it and downloads the selected results. Returns (jobid, final_state).
+    ``validate_all``: one job running `spectra validate --all` on every case
+    whose vision run is on Mufasa (only DATA/validation is synced)."""
     full, r, sample, paths = load_settings(config_path, overrides)
     if stages is None:
         stages = full.get("stages") or list(COMPUTE_STAGES)
@@ -523,15 +561,20 @@ def submit(config_path=DEFAULT_CONFIG, *, stages=None, overrides=None,
     wait = r["wait"] if wait is None else wait
     pull = r["pull_results"] if pull is None else pull
     date = full.get("results_date") or time.strftime(DATE_FORMAT)
-    r_sample = posixpath.join(paths["r_results"], date, sample)
+    r_sample = posixpath.join(paths["r_results"], date, "_validation" if validate_all else sample)
     job_dir = posixpath.join(r_sample, "_job")
 
     client = connect(r)
     try:
         sftp = client.open_sftp()
         check_remote_repo(sftp, r)                        # before uploading anything
-        stages, syncs = plan_run(sftp, full, sample, paths, list(stages), date)
-        print(f"[remote] sample {sample}: {' + '.join(stages)} on Mufasa -> {r_sample}")
+        if validate_all:
+            stages, syncs = ["validation"], validation_sync(sftp, paths)
+            print(f"[remote] validate --all on Mufasa (every case with a vision run there) -> "
+                  f"{paths['r_results']}/{date}/<sample>/validation/")
+        else:
+            stages, syncs = plan_run(sftp, full, sample, paths, list(stages), date)
+            print(f"[remote] sample {sample}: {' + '.join(stages)} on Mufasa -> {r_sample}")
         for label, ldir, rdir, only, mirror in syncs:
             s = sync_dir(sftp, ldir, rdir, only, mirror, dry_run,
                          hasher=lambda d, names: remote_sha256(client, r, d, names))
@@ -570,7 +613,9 @@ def submit(config_path=DEFAULT_CONFIG, *, stages=None, overrides=None,
         # because an earlier job already wrote this date's vision run
         args = list(extra_args) + (["--force-vision"] if "vision" in stages else [])
         with sftp.open(job, "w") as fh:
-            fh.write(build_job_script(r, job_dir, run_config, args))
+            fh.write(build_job_script(r, job_dir, run_config,
+                                      ["--all"] if validate_all else args,
+                                      command="validate" if validate_all else "full"))
 
         code, out, err = run_cmd(client, r, f"cd {shlex.quote(job_dir)} && sbatch job.slurm")
         jobid = out.split()[-1] if code == 0 and out else ""
@@ -601,7 +646,11 @@ def submit(config_path=DEFAULT_CONFIG, *, stages=None, overrides=None,
         if tail:
             print("--- last lines of the job log ---\n" + tail + "\n---")
         print(f"[remote] results on Mufasa: {r_sample}")
-        if pull:
+        if pull and validate_all:
+            n = pull_validation_all(sftp, paths["r_results"], paths["results_root"], date)
+            print(f"[remote] downloaded {n} files (every case's metrics.json of {date} + "
+                  f"RESULTS/_validation/) into {paths['results_root']}")
+        elif pull:
             # only the stages this job ran: older files of other stages stay there
             patterns = [p for p in r["pull_patterns"]
                         if p.split("/")[0] in stages or "/" not in p]

@@ -9,9 +9,11 @@ pipeline is:
 2. `estimate_metric_scale(...)` — robust median scale recovery from the
    known physical edge length.
 3. `fit_marker_plane(...)` — SVD plane fit across all triangulated corners,
-   giving the Z axis of the output frame.
+   giving the Z axis of the output frame (towards the cameras); origin and X
+   axis from fixed marker IDs when configured (see ``fit_marker_plane``).
 4. `build_sim3_to_aruco_frame(...)` — compose scale + rotation + translation
-   so the ArUco plane sits at Z=0 with Z pointing up.
+   so the ArUco plane sits at Z=0 with Z pointing up. The output frame is
+   right-handed (proper rotation, never a reflection).
 5. `apply_similarity_*` helpers — apply the Sim3 to clouds, per-view point
    maps, and camera poses.
 
@@ -79,6 +81,8 @@ class ArucoAlignment:
     translation: np.ndarray               # shape: (3,), float32
     used_marker_ids: List[int] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    # How origin and axes were defined (written to reconstruction_metadata.json).
+    frame_info: Dict[str, Any] = field(default_factory=dict)
     # Populated when `align_with_aruco(..., use_bundle_adjustment=True)`. When
     # present, the pipeline should apply ``bundle_adjustment.delta_T_per_view``
     # + ``bundle_adjustment.scale_m_per_backend`` to the back-end's per-view
@@ -313,18 +317,23 @@ def estimate_metric_scale(
 
 def fit_marker_plane(
     markers: Mapping[int, MarkerTriangulation],
-    origin_marker_id: int | None = None,
+    *,
     reference_up: np.ndarray | None = None,
-) -> PlaneFrame:
-    """SVD plane fit across all ArUco corners, returned as a PlaneFrame.
+    frame_marker_ids: Sequence[int] | None = None,
+    x_axis_marker_ids: Sequence[int] | None = None,
+) -> tuple[PlaneFrame, Dict[str, Any]]:
+    """SVD plane fit across all ArUco corners, returned as a PlaneFrame + info.
 
-    - The plane normal becomes the Z axis of the output frame.
-    - The sign is chosen so the normal agrees with ``reference_up`` (default
-      +Z of the input frame); this prevents flipping between runs.
-    - If `origin_marker_id` is given, the frame origin is the centroid of
-      that marker's 4 corners. Otherwise it's the centroid of every corner.
-    - The in-plane orientation is recovered from either the chosen origin
-      marker's top edge, or the dominant PCA tangent of the pooled corners.
+    - Z: normal of the plane through every corner. Its sign agrees with
+      ``reference_up`` (the direction from the markers to the cameras), so Z
+      always points towards the cameras, i.e. up. Without ``reference_up``
+      the +Z of the input frame is used (sign then depends on the backend).
+    - Origin: centroid of the corners of ``frame_marker_ids`` (the ones that
+      were reconstructed; missing ones are reported), else of every corner.
+    - X: from the centre of ``x_axis_marker_ids[0]`` to the centre of
+      ``x_axis_marker_ids[1]``, projected on the plane; else the dominant
+      in-plane PCA direction of the corners (sign arbitrary).
+    - Y = Z x X: the basis is always right-handed.
     """
     if not markers:
         raise ValueError("Cannot fit a plane from an empty set of markers")
@@ -332,37 +341,47 @@ def fit_marker_plane(
     all_corners = np.concatenate([m.corners_3d for m in markers.values()], axis=0).astype(np.float64)  # [4*M,3]
     if all_corners.shape[0] < 3:
         raise ValueError("Need at least 3 corner points to fit a plane")
-
     centroid = all_corners.mean(axis=0)  # [3]
+    info: Dict[str, Any] = {"z_sign_from": "cameras" if reference_up is not None else "input_frame"}
 
-    if origin_marker_id is not None and origin_marker_id in markers:
-        origin = markers[origin_marker_id].center_3d.astype(np.float64)
-        orientation_marker = markers[origin_marker_id]
-    else:
-        origin = centroid
-        orientation_marker = None
-
+    # Z: plane normal, towards the cameras.
     centered = all_corners - centroid
     _, _, Vh = np.linalg.svd(centered, full_matrices=False)
     normal = Vh[-1]                          # smallest-variance axis
     normal = normal / max(np.linalg.norm(normal), 1e-12)
-
     ref_up = np.array([0.0, 0.0, 1.0]) if reference_up is None else np.asarray(reference_up, dtype=np.float64)
     ref_up = ref_up / max(np.linalg.norm(ref_up), 1e-12)
     if float(normal @ ref_up) < 0.0:
         normal = -normal
 
-    # In-plane tangent: prefer the origin marker's top edge (corner 0 -> corner 1).
-    tangent_u = None
-    if orientation_marker is not None:
-        edge_vec = (
-            orientation_marker.corners_3d[1].astype(np.float64)
-            - orientation_marker.corners_3d[0].astype(np.float64)
-        )
-        edge_in_plane = edge_vec - normal * float(edge_vec @ normal)
-        if np.linalg.norm(edge_in_plane) > 1e-6:
-            tangent_u = edge_in_plane / np.linalg.norm(edge_in_plane)
+    # Origin: centroid of the corners of the listed markers.
+    if frame_marker_ids:
+        wanted = [int(i) for i in frame_marker_ids]
+        present = [i for i in wanted if i in markers]
+        missing = [i for i in wanted if i not in markers]
+        info.update(origin="frame_marker_ids", origin_marker_ids=present,
+                    missing_frame_marker_ids=missing)
+        origin = (np.concatenate([markers[i].corners_3d for i in present], axis=0)
+                  .astype(np.float64).mean(axis=0) if present else centroid)
+        if not present:
+            info["origin"] = "all_corners (no frame_marker_ids reconstructed)"
+    else:
+        origin = centroid
+        info.update(origin="all_corners", origin_marker_ids=sorted(int(i) for i in markers))
 
+    # X: from marker A to marker B, in the plane.
+    tangent_u = None
+    if x_axis_marker_ids:
+        a, b = (int(i) for i in x_axis_marker_ids)
+        if a in markers and b in markers:
+            edge_vec = markers[b].center_3d.astype(np.float64) - markers[a].center_3d.astype(np.float64)
+            edge_in_plane = edge_vec - normal * float(edge_vec @ normal)
+            if np.linalg.norm(edge_in_plane) > 1e-9:
+                tangent_u = edge_in_plane / np.linalg.norm(edge_in_plane)
+                info["x_axis"] = f"marker {a} -> marker {b}"
+                info["x_axis_marker_ids"] = [a, b]
+        if tangent_u is None:
+            info["x_axis_missing"] = [i for i in (a, b) if i not in markers]
     if tangent_u is None:
         # PCA in the plane: project centered corners, take the top singular
         # direction, and keep the component orthogonal to `normal`.
@@ -371,6 +390,7 @@ def fit_marker_plane(
         tangent_u = Vh_plane[0]
         tangent_u = tangent_u - normal * float(tangent_u @ normal)
         tangent_u = tangent_u / max(np.linalg.norm(tangent_u), 1e-12)
+        info["x_axis"] = "pca (not fixed between runs)"
 
     tangent_v = np.cross(normal, tangent_u)
     tangent_v = tangent_v / max(np.linalg.norm(tangent_v), 1e-12)
@@ -378,7 +398,7 @@ def fit_marker_plane(
     tangent_u = tangent_u / max(np.linalg.norm(tangent_u), 1e-12)
 
     basis = np.stack([tangent_u, tangent_v, normal], axis=1).astype(np.float32)
-    return PlaneFrame(origin=origin.astype(np.float32), basis=basis)
+    return PlaneFrame(origin=origin.astype(np.float32), basis=basis), info
 
 
 def build_sim3_to_aruco_frame(
@@ -501,11 +521,12 @@ def align_with_aruco(
     K_per_view: np.ndarray,
     T_world_cam_per_view: np.ndarray,
     edge_length_m: float,
-    origin_marker_id: int | None = None,
     min_views_per_marker: int = 2,
     enforce_metric_scale: bool = True,
     use_bundle_adjustment: bool = False,
     ba_options: Mapping[str, Any] | None = None,
+    frame_marker_ids: Sequence[int] | None = None,
+    x_axis_marker_ids: Sequence[int] | None = None,
 ) -> ArucoAlignment:
     """One-call convenience: triangulate (or jointly BA) + fit plane + build Sim3.
 
@@ -524,6 +545,10 @@ def align_with_aruco(
     If ``enforce_metric_scale`` is False, the returned Sim3 uses scale=1 and
     only rotates/translates — useful when the input frame is already metric
     (e.g. right after BA, which always produces metric output).
+
+    The output frame: Z towards the cameras (``T_world_cam_per_view`` gives
+    their centres), origin/X from ``frame_marker_ids``/``x_axis_marker_ids``
+    (see :func:`fit_marker_plane`), right-handed.
     """
     warnings: List[str] = []
     ba_result: "BundleAdjustmentResult | None" = None
@@ -607,7 +632,26 @@ def align_with_aruco(
 
         effective_scale = float(scale) if enforce_metric_scale else 1.0
 
-    plane_frame = fit_marker_plane(markers, origin_marker_id=origin_marker_id)
+    # Camera centres in the same frame as `markers` (BA refines the cameras).
+    T_cams = ba_result.T_world_cam_refined if ba_result is not None else T_world_cam_per_view
+    cam_centres = np.asarray(T_cams, dtype=np.float64)[:, :3, 3]
+    marker_centroid = np.concatenate([m.corners_3d for m in markers.values()], axis=0).mean(axis=0)
+    plane_frame, frame_info = fit_marker_plane(
+        markers,
+        reference_up=cam_centres.mean(axis=0) - marker_centroid,
+        frame_marker_ids=frame_marker_ids,
+        x_axis_marker_ids=x_axis_marker_ids,
+    )
+    if frame_info.get("missing_frame_marker_ids"):
+        warnings.append(
+            f"frame_marker_ids {frame_info['missing_frame_marker_ids']} not reconstructed: "
+            "the origin is computed from the others and is NOT the configured one."
+        )
+    if frame_info.get("x_axis_missing"):
+        warnings.append(
+            f"x_axis_marker_ids {frame_info['x_axis_missing']} not reconstructed: "
+            "X falls back to the PCA direction."
+        )
 
     s, R, t = build_sim3_to_aruco_frame(plane_frame, scale=effective_scale)
     sim3 = build_similarity_matrix(s, R, t)
@@ -624,6 +668,7 @@ def align_with_aruco(
         used_marker_ids=sorted(markers.keys()),
         warnings=warnings,
         bundle_adjustment=ba_result,
+        frame_info=frame_info,
     )
 
 

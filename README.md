@@ -19,7 +19,8 @@ Vision and read by Registration:
 
 Everything is driven by one YAML config and one CLI (`spectra`). On the robot
 PC the same CLI also calibrates the camera (`spectra calibrate`, §8) and
-acquires the RGB views (`spectra acquire`).
+acquires the RGB views (`spectra acquire`); `spectra validate` (§9) checks the
+reconstruction against 3D-printed phantoms.
 
 ---
 
@@ -33,6 +34,7 @@ acquires the RGB views (`spectra acquire`).
 - [6. Running on Mufasa (SLURM)](#6-running-on-mufasa-slurm)
 - [7. Outputs](#7-outputs)
 - [8. Camera calibration (robot PC)](#8-camera-calibration-robot-pc)
+- [9. Validation](#9-validation)
 
 
 ---
@@ -399,6 +401,7 @@ uv run python -m spectra.cli ...
 | `spectra registration` | on Mufasa | here |
 | `spectra acquire` | acquisition only, here | acquisition only, here |
 | `spectra calibrate` | here (robot PC) | here (robot PC) |
+| `spectra validate` | on Mufasa (`summary`: here) | here (§9) |
 
 "On Mufasa" means: upload what the stage needs (unless already there), `sbatch`
 a job that runs it on a GPU node, wait, download the selected results here (see
@@ -763,6 +766,29 @@ RESULTS/
                                                     (removed automatically when vision.output.clean_sfm_cache: true)
 ```
 
+### 7.1 Output frame
+
+Every Vision output (mesh, clouds, camera poses, marker corners) is in the
+ArUco frame, in metres:
+
+| | Definition |
+| --- | --- |
+| z = 0 | best-fit plane through every reconstructed marker corner |
+| +Z | normal to that plane, towards the cameras (up) |
+| origin | centroid of the corners of `vision.aruco.frame_marker_ids` (null = every corner) |
+| +X | from the centre of `x_axis_marker_ids[0]` to that of `x_axis_marker_ids[1]`, in the plane (null = dominant in-plane direction, not fixed between runs) |
+| +Y | Z × X — the frame is right-handed |
+
+A marker counts as reconstructed if it is seen in at least
+`min_views_per_marker` images. If one of `frame_marker_ids` is missing, the
+origin is computed from the others; the run says so in the log and in
+`reconstruction_metadata.json` → `frame`, which also records the IDs used and
+a check (camera rotations with det = +1, cameras above the plane).
+
+Runs made before this frame was introduced were mirrored (Z negated by the old
+`z_axis_points_down` option): their coordinates are not comparable with new
+runs.
+
 ---
 
 ## 8. Camera calibration (robot PC)
@@ -828,3 +854,116 @@ calibration view to the last validation view.
 
 Intrinsics are tied to the resolution (`acquisition.camera.width/height`):
 images at another resolution are rejected.
+
+---
+
+## 9. Validation
+
+`spectra validate` checks the pipeline against 3D-printed phantoms of known
+geometry (protocol: `Protocollo_sperimentale_HSI.docx`). Only phase 1
+(`--modality vision`, the reconstruction) exists so far.
+
+### 9.1 Setup
+
+- The phantom sits in the recess of the cassette; the ArUco markers sit in
+  pockets of the cassette at known positions.
+- `DATA/validation/` holds the ground truth, in the CAD frame (mm, Z up):
+
+```
+DATA/validation/
+├── Tabella_marker_cassetta.xlsx   marker id, centre, surface z, rotation, edge (sheet Marker / Info)
+├── Target1+Cassetta.stl           cassette + phantom 1 in the recess (Fusion assembly, mm)
+└── Target2+Cassetta.stl ...
+```
+
+- The bersagli (fiducials) are blind round holes in the phantom: they are
+  taken from the STL itself, no extra file (§9.3).
+
+- Samples are named `T<phantom>_P<pose>_R<repetition>` (e.g. `T1_P2_R3`), or
+  mapped in `validation.cases` / with `--phantom`.
+- Vision runs made before the output frame was fixed (§7.1) are refused: re-run vision.
+
+### 9.2 Commands
+
+```bash
+spectra validate --sample T1_P1_R1            # one sample (on Mufasa if mufasa.enabled)
+spectra validate --all                        # every case with a vision run, then the summary
+spectra validate --all --dry-run              # which cases / vision runs it would take
+spectra validate summary                      # every validated sample -> RESULTS/_validation/
+spectra full --sample T1_P1_R1 --set 'stages=[vision,validation]'   # reconstruct + validate
+```
+
+With `mufasa.enabled: true` the run goes to Mufasa like vision / registration:
+`DATA/validation/` is synced, the vision run is taken there (or sent), and
+`validation/vision/*` comes back. `--all` is one job on every case whose
+vision run is on Mufasa; it brings back each case's `metrics.json` and
+`RESULTS/_validation/` (error maps and `.rrd` stay there: run that sample alone
+to get them). A failing case (e.g. a vision run made before §7.1) is reported
+and skipped. The summary always runs here.
+
+`--all` takes, for each case, the vision run of `--date` if there is one, else
+the most recent one.
+
+### 9.3 What it computes
+
+The STL is aligned to the reconstruction in three ways:
+
+| Alignment | How | Measures |
+| --- | --- | --- |
+| `frame` | same rule as vision on the CAD markers (needs `frame_marker_ids` / `x_axis_marker_ids`) | everything, coordinates compared directly |
+| `kabsch` | rigid fit of the CAD marker corners on the reconstructed ones | everything (shape + position + scale) |
+| `icp` | kabsch refined by point-to-plane ICP on the phantom region, no scale | shape only |
+
+For each alignment, in the phantom region (XY box of the STL above the marker
+plane + `roi_margin_mm`):
+
+- **accuracy** — reconstruction → STL, signed (+ outside the STL): RMSE, mean, median, p95, % within `thresholds_mm`;
+- **completeness** — STL → reconstruction, only on the STL seen by the cameras;
+- **Hausdorff p95** — the larger of the two 95th percentiles;
+- **height** — signed error per `height_bin_mm` above the marker plane + linear fit.
+
+Marker checks: Kabsch corner residual and leave-one-marker-out error; ICP correction (rotation, shift).
+
+Scale is **kept**: the reconstruction keeps the scale vision set from the ArUco
+edge, every alignment is rigid, so a scale error shows up in the metrics.
+
+Fiducials (`fiducials` in `metrics.json`, `<alignment>.fiducials.*` in the
+summary): the bersagli, found in the STL as blind round holes on flat faces (up
+to 3 mm diameter), numbered by CAD Y then X; the point is the centre of the
+hole mouth. Each one is looked for in the photos of the vision run
+(`inputs_exif_canonical/`):
+
+1. expected position from the marker alignment (kabsch), so the id comes from the STL;
+2. in each photo where it faces the camera (within `max_view_angle_deg`) and is
+   not hidden, the spot (`polarity`: bright = white on black) nearest to the
+   projected position, within `search_radius_mm`; its intensity-weighted centre;
+3. a ray from the camera through that pixel onto the reconstructed mesh (what
+   registration does with an HSI pixel);
+4. median over the views, dropping those farther than `outlier_mm`.
+
+Error = measured - expected, per alignment: norm, along the outward normal
+(signed, + outside the STL) and in the surface plane; RMSE / median / max over
+the bersagli found. `fiducials.png` shows the photo crops (cyan + expected,
+green circle used, red circle dropped): check it on the first acquisitions.
+The photos are where vision ran (Mufasa): a validation run elsewhere skips this.
+
+Acquisition geometry (`views` in `metrics.json`, `views.*` in the summary): per
+view, distance from the phantom, elevation above the marker plane, azimuth and
+whether the phantom is in the image; summary: views seeing the phantom,
+distance and elevation (mean / min / max), azimuth coverage.
+
+### 9.4 Outputs
+
+```
+RESULTS/<dd-mm-yyyy>/<sample>/validation/vision/
+├── metrics.json      every number above + the vision run used
+├── error_map.ply     phantom region of the mesh coloured by |error| (mm, + error_map.npy)
+├── fiducials.png     photo crops around each bersaglio (expected / found)
+└── validation.rrd    STL + reconstruction coloured by error, markers, fiducials (Rerun)
+
+RESULTS/_validation/vision_summary.xlsx (+ .json)
+    Cases, Descriptive (per model), Per phantom, Tests (Wilcoxon / Friedman + Holm between models)
+```
+
+The vision mesh is a height field: vertical walls become slanted strips one
+grid step wide, so expect errors of about half the grid step at the walls.

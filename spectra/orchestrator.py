@@ -521,6 +521,7 @@ def run_full(
 
     do_vision = "vision" in cfg.stages
     do_registration = "registration" in cfg.stages
+    do_validation = "validation" in cfg.stages
 
     out: dict[str, Any] = {"sample": sample, "date": date, "skipped_vision": False}
 
@@ -573,6 +574,20 @@ def run_full(
     else:
         print("[orchestrator] Registration stage disabled (not in cfg.stages).")
 
+    if do_validation:
+        from .validation import run_validation_stage
+
+        # The vision run of this invocation; without vision, this date's run
+        # else the most recent one (as for registration).
+        vision_dir = (Path(out["vision"].get(
+            "run_dir", vision_output_dir(cfg.results_root, sample, cfg.results_date)))
+            if do_vision else None)
+        if dry_run:
+            print("[orchestrator][dry-run] Would run validation stage.")
+            out["validation"] = {"dry_run": True}
+        else:
+            out["validation"] = run_validation_stage(cfg, vision_dir=vision_dir)
+
     print("\n" + "=" * 68)
     print("SPECTRA FULL COMPLETED")
     print("=" * 68)
@@ -583,6 +598,9 @@ def run_full(
         print(f"  Vision output : {out['vision']['run_dir']}")
     if "registration" in out:
         print(f"  Reg. output   : {cfg.registration.paths.output_dir}")
+    if "validation" in out and not dry_run:
+        from .validation import output_dir as _validation_dir
+        print(f"  Validation    : {_validation_dir(cfg)}")
     print("=" * 68)
 
     return out

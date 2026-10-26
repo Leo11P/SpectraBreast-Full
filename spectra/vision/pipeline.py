@@ -38,7 +38,6 @@ from .align import (
 from .backends.types import RawReconstruction
 from .aruco import ArucoDetector, MarkerDetection, annotate_image
 from .config import ReconstructionConfig, RerunConfig, save_config, save_config_json
-from .coordinates import apply_output_z_reflection, reflect_z_sim3_matrix
 from .inputs import build_backend_inputs, canonicalize_images_with_exif
 from .io_utils import (
     clean_sfm_cache,
@@ -55,6 +54,7 @@ from .rerun_logging import (
     log_camera,
     log_cloud,
     log_surface_mesh,
+    log_world_up_z,
     resample_cloud_for_logging,
     rerun_flush,
     send_blueprint,
@@ -498,8 +498,9 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
             K_per_view=raw.K_per_view_orig,
             T_world_cam_per_view=raw.T_world_cam,
             edge_length_m=cfg.aruco.marker_edge_length_m,
-            origin_marker_id=cfg.aruco.origin_marker_id,
             min_views_per_marker=cfg.aruco.min_views_per_marker,
+            frame_marker_ids=cfg.aruco.frame_marker_ids,
+            x_axis_marker_ids=cfg.aruco.x_axis_marker_ids,
             enforce_metric_scale=not poses_known,
             use_bundle_adjustment=use_ba,
             ba_options={
@@ -645,6 +646,13 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
                 f"scale={aruco_alignment.scale:.6f} (applied={s:.6f}), "
                 f"MAD={aruco_alignment.scale_mad:.6f}"
             )
+            fi = aruco_alignment.frame_info
+            print(
+                f"[dim]Output frame:[/dim] origin = {fi.get('origin')} "
+                f"{fi.get('origin_marker_ids')}, X = {fi.get('x_axis')}, Z towards the cameras"
+            )
+            for w in aruco_alignment.warnings:
+                print(f"[yellow]ArUco warning: {w}[/yellow]")
         else:
             print("[yellow]ArUco plane fit failed; keeping backend output frame.[/yellow]")
     else:
@@ -767,14 +775,7 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
         f"grid {surface.grid_shape[0]}x{surface.grid_shape[1]} @ step {surface.grid_step:.6f}"
     )
 
-    if cfg.output.z_axis_points_down:
-        apply_output_z_reflection(
-            aligned_cloud=aligned_cloud,
-            aligned_poses=aligned_poses,
-            aligned_markers_in_output_frame=aligned_markers_in_output_frame,
-            surface=surface,
-        )
-        print("[dim]Output frame: world +Z points down (Z negated).[/dim]")
+    frame_meta = _output_frame_meta(aruco_alignment, aligned_poses)
 
     _log_step("Step 6/6 - Writing outputs and logging to Rerun")
     _timer.begin("Step 6/6 - Write outputs + Rerun")
@@ -792,6 +793,7 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
         aligned_markers_output_frame=aligned_markers_in_output_frame,
         aruco_geometric_qc=aruco_geometric_qc,
         view_rejection_meta=view_rejection_meta,
+        frame_meta=frame_meta,
     )
 
     if cfg.rerun.enabled and HAS_RERUN:
@@ -907,6 +909,37 @@ class _StepTimer:
             ],
         }
 
+def _output_frame_meta(
+    aruco_alignment: ArucoAlignment | None,
+    aligned_poses: np.ndarray,
+) -> Dict[str, Any]:
+    """Describe the output frame and check it: right-handed (camera rotations
+    with det +1) and Z towards the cameras (every camera at z > 0)."""
+    aligned = aruco_alignment is not None and aruco_alignment.plane_frame is not None
+    meta: Dict[str, Any] = {
+        "convention": (
+            "ArUco frame: markers at z = 0, +Z towards the cameras, right-handed, metres"
+            if aligned else "backend frame (no ArUco alignment), metres"
+        ),
+        **(dict(aruco_alignment.frame_info) if aligned else {}),
+    }
+    if aligned_poses is not None and len(aligned_poses):
+        det = np.linalg.det(np.asarray(aligned_poses, dtype=np.float64)[:, :3, :3])
+        cam_z = np.asarray(aligned_poses, dtype=np.float64)[:, 2, 3]
+        meta["check"] = {
+            "camera_rotation_det_min": float(det.min()),
+            "camera_rotation_det_max": float(det.max()),
+            "cameras_above_plane": f"{int((cam_z > 0).sum())}/{len(cam_z)}",
+        }
+        if det.min() < 0.0:
+            print("[yellow]Output frame check: some camera rotations have det < 0 "
+                  "(reflected frame).[/yellow]")
+        if aligned and (cam_z <= 0).any():
+            print(f"[yellow]Output frame check: {int((cam_z <= 0).sum())} camera(s) at "
+                  "z <= 0, below the marker plane.[/yellow]")
+    return meta
+
+
 def _write_outputs(
     run_dir: Path,
     cfg: ReconstructionConfig,
@@ -921,6 +954,7 @@ def _write_outputs(
     aligned_markers_output_frame: Dict[int, np.ndarray] | None = None,
     aruco_geometric_qc: Dict[str, Any] | None = None,
     view_rejection_meta: Dict[str, Any] | None = None,
+    frame_meta: Dict[str, Any] | None = None,
 ) -> None:
     save_pointcloud_as_ply(
         run_dir / "cloud.ply",
@@ -957,12 +991,7 @@ def _write_outputs(
     np.save(run_dir / "intrinsics_network_frame.npy", raw.K_per_view_network.astype(np.float32))
 
     if aruco_alignment is not None and aruco_alignment.plane_frame is not None:
-        sim3_to_save = (
-            reflect_z_sim3_matrix(aruco_alignment.sim3)
-            if cfg.output.z_axis_points_down
-            else aruco_alignment.sim3.astype(np.float32)
-        )
-        np.save(run_dir / "sim3_to_output_frame.npy", sim3_to_save)
+        np.save(run_dir / "sim3_to_output_frame.npy", aruco_alignment.sim3.astype(np.float32))
         _write_aruco_markers_3d(
             aruco_alignment,
             edge_length_m=cfg.aruco.marker_edge_length_m,
@@ -985,7 +1014,7 @@ def _write_outputs(
         "num_surface_points": int(surface.points.shape[0]),
         "num_surface_triangles": int(surface.triangles.shape[0]),
         "num_aruco_detections": int(sum(len(d) for d in detections_per_view)),
-        "z_axis_points_down": bool(cfg.output.z_axis_points_down),
+        "frame": frame_meta,
         "aruco_alignment": None,
         "alignment_info": raw.alignment_info,
     }
@@ -1053,6 +1082,8 @@ def _log_to_rerun(
     confidence_percentile: float,
     rerun_cfg: RerunConfig,
 ) -> None:
+    if aruco_alignment is not None and aruco_alignment.plane_frame is not None:
+        log_world_up_z()
     cloud_pts_vis, cloud_rgb_vis, cloud_conf_vis = resample_cloud_for_logging(
         points=aligned_cloud,
         colors=aligned_colors,

@@ -30,7 +30,7 @@ import copy
 import json
 import os
 from pathlib import Path
-from typing import Optional, Any, Literal, Mapping, MutableMapping
+from typing import Any, List, Literal, Mapping, MutableMapping, Optional
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -116,13 +116,6 @@ class OutputConfig(BaseModel):
         default=True,
         description="Create/refresh a 'most-recent' symlink inside `root` after each run.",
     )
-    z_axis_points_down: bool = Field(
-        default=True,
-        description=(
-            "If true, negate world +Z in all exports and Rerun so the vertical axis **increases downward** "
-            "(Z toward the ground) instead of a typical ENU/graphics +Z up convention."
-        ),
-    )
     overwrite_existing_run: bool = Field(
         default=True,
         description=(
@@ -163,12 +156,22 @@ class ArucoConfig(BaseModel):
             "metric scale of the entire reconstruction, so measure it carefully."
         ),
     )
-    origin_marker_id: int | None = Field(
+    frame_marker_ids: Optional[List[int]] = Field(
         default=None,
         description=(
-            "If set, the ArUco frame's origin is the centroid of this marker's "
-            "four 3D corners, and its X axis points along that marker's top "
-            "edge. Otherwise the origin is the centroid of every triangulated corner."
+            "Output-frame origin = centroid of the corners of these markers "
+            "(fixed list, so the origin does not depend on which markers a run "
+            "reconstructs; missing ones are reported). null = every "
+            "reconstructed corner."
+        ),
+    )
+    x_axis_marker_ids: Optional[List[int]] = Field(
+        default=None,
+        description=(
+            "Two marker IDs [A, B]: output +X goes from the centre of A to the "
+            "centre of B, projected on the marker plane. Pick two markers far "
+            "apart. null = dominant in-plane direction of the corners (not "
+            "fixed between runs). Z always points towards the cameras; Y = Z x X."
         ),
     )
     min_views_per_marker: int = Field(
@@ -291,6 +294,16 @@ class ArucoConfig(BaseModel):
                 f"valid options: {sorted(ARUCO_DICTIONARIES.keys())}"
             )
         return normalized
+
+    @model_validator(mode="after")
+    def _check_frame_ids(self) -> "ArucoConfig":
+        ids = self.x_axis_marker_ids
+        if ids is not None:
+            if len(ids) != 2 or ids[0] == ids[1]:
+                raise ValueError(f"aruco.x_axis_marker_ids must be two different IDs, got {ids}")
+        if self.frame_marker_ids is not None and len(set(self.frame_marker_ids)) != len(self.frame_marker_ids):
+            raise ValueError(f"aruco.frame_marker_ids has duplicates: {self.frame_marker_ids}")
+        return self
 
     @property
     def marker_edge_length_m(self) -> float:

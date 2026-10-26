@@ -50,7 +50,7 @@
 
 # Sample being processed. Drives every auto-derived path — spell it exactly as
 # the folder names under DATA/.
-sample_name: "SAMPLE2"
+sample_name: "T2_P2_R2"
 
 # Roots that drive default path resolution. Relative (from cwd) or absolute.
 data_root:    "DATA"
@@ -68,7 +68,7 @@ results_date: null
 # Drop "acquisition" to re-run vision/registration on a sample already acquired
 # (or: --set stages=[vision,registration]). The standalone sub-commands
 # `spectra vision` and `spectra registration` ignore this list.
-stages: ["acquisition", "vision", "registration"]
+stages: ["acquisition", "vision", "validation"]
 
 
 
@@ -112,6 +112,7 @@ mufasa:
     - "registration/*.xlsx"          # error / timing reports
     - "registration/*.rrd"           # spectral point cloud for Rerun (registration.rerun)
     - "registration/*.rbl"           # its layout
+    - "validation/vision/*"          # spectra validate: metrics, error map, Rerun
 
 
 
@@ -216,7 +217,7 @@ acquisition:
   collision:
     enable: true
     floor_margin_mm: 5
-    sample_tol_mm: [30, 30, 15]
+    sample_tol_mm: [30, 30, 30]
     path_samples: 12
     validate_tol_mm: 5.0
     validate_tol_deg: 1.5
@@ -230,7 +231,7 @@ acquisition:
   viz:
     enable: true
     prelude_s: 5.0
-    target_tol_mm: [30, 30, 15]
+    target_tol_mm: [30, 30, 30]
     poll_hz: 20
     frustum_len_m: 0.025
     memory_limit: "512MB"
@@ -340,7 +341,6 @@ vision:
     root:                        null
     run_name:                    null
     update_most_recent_symlink:  false
-    z_axis_points_down:          true
     # Replace an existing run folder instead of suffixing it _01, _02, ...
     # Keep this true: the next stage reads the mesh from the un-suffixed path.
     overwrite_existing_run:      true
@@ -353,8 +353,14 @@ vision:
     # PHYSICAL marker edge length in MILLIMETRES. Single source of truth for
     # the whole pipeline (acquisition bootstrap/servo included) — this sets the metric scale of the reconstruction,
     # and registration inherits it. Measure it properly.
-    marker_edge_length_mm:  25
-    origin_marker_id:       null
+    marker_edge_length_mm:  9.97
+    # Output frame: markers at z = 0, +Z towards the cameras, right-handed,
+    # metres. Origin = centroid of the corners of `frame_marker_ids`; +X from
+    # the centre of x_axis_marker_ids[0] to that of x_axis_marker_ids[1]
+    # (pick two markers far apart). null = every corner / PCA direction,
+    # which is not fixed between runs. Same rule on the validation STL.
+    frame_marker_ids:       [0, 1, 2, 3, 4, 5]
+    x_axis_marker_ids:      [4, 1]
     min_views_per_marker:   2
     align_to_aruco:         true
     max_sim3_scale_deviation_when_poses_known: 0.05
@@ -555,3 +561,46 @@ registration:
       - [1.0, 0.5]
       - [0.5, 0.5]
       - [0.2, 0.5]
+
+# -----------------------------------------------------------------------------
+# Validation against ground-truth phantoms (spectra validate, README §9).
+# Data in <data_root>/validation/: the marker table + one STL per phantom
+# (the cassette with that phantom in the recess, CAD frame, mm, Z up).
+# A sample is mapped to its phantom by its name (T1_P2_R3 = phantom T1, pose
+# P2, repetition R3) or by `cases`. Add "validation" to `stages` to run it at
+# the end of `spectra full`. For the `frame` alignment set
+# vision.aruco.frame_marker_ids / x_axis_marker_ids for these runs.
+# -----------------------------------------------------------------------------
+validation:
+  fixture_table: "Tabella_marker_cassetta.xlsx"
+  phantoms:                         # name -> STL (+ optional roi_mm: [xmin, xmax, ymin, ymax], CAD)
+    T1: {stl: "Target1+Cassetta.stl"}
+    T2: {stl: "Target2+Cassetta.stl"}
+    T3: {stl: "Target3+Cassetta.stl"}
+    T4: {stl: "Target4+Cassetta.stl"}
+    T5: {stl: "Target5+Cassetta.stl"}
+  cases: {}                         # sample -> phantom, for samples not named as sample_pattern
+  sample_pattern: '^(?P<phantom>[^_]+)_(?P<pose>[^_]+)_(?P<rep>[^_]+)$'
+  model_label: null                 # name in the summary; null = backend + variant (mast3r-sfm)
+  vision:
+    source: mesh                    # mesh = surface_mesh.ply (what registration uses) | cloud
+    primary: icp                    # frame | kabsch | icp: the alignment of the summary
+    sample_spacing_mm: 0.25         # surface sampling step of STL and reconstruction
+    roi_margin_mm: 5.0              # around the phantom (XY box of the STL above the markers)
+    occluder_margin_mm: 20.0        # STL around the box that can hide it from the cameras
+    icp: {enabled: true, max_corr_mm: 2.0, iters: 50}
+    thresholds_mm: [1.0, 2.0]       # "% of points within"
+    height_bin_mm: 2.0              # error vs height above the marker plane
+    visibility_tol_mm: 1.0
+    error_map_max_mm: 2.0           # colour scale of error_map.ply / validation.rrd
+    save_error_map: true
+    save_rrd: true
+    fiducials:                      # per-bersaglio error: the holes of the STL found in the photos
+      enabled: true
+      polarity: bright              # bright = bersaglio lighter than the phantom (white on black) | dark
+      search_radius_mm: 2.0         # around the expected position (bersagli are >= 4 mm apart)
+      max_view_angle_deg: 60        # views within this angle of the hole axis
+      min_contrast: 20              # spot peak - background, grey levels 0-255
+      outlier_mm: 1.0               # views farther than this from the median are dropped
+      min_views: 2
+      save_sheet: true              # fiducials.png: photo crops around each bersaglio

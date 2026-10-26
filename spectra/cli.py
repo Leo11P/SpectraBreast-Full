@@ -10,6 +10,7 @@ Top-level commands::
     spectra viewer        # local 3D viewer (unchanged)
     spectra acquire       # robotic acquisition only (Fairino FR5 + RealSense)
     spectra calibrate     # hand-eye + intrinsics of the robot camera (+ validation)
+    spectra validate      # validation against ground-truth phantoms (README §9)
 
 Where vision / registration run is decided by `mufasa.enabled` in the YAML:
 true → they are submitted to Mufasa (SLURM) by `spectra/acquisition/remote.py`
@@ -172,14 +173,17 @@ def _run_on_mufasa(
     *,
     dry_run: bool = False,
     force_cpu: bool = False,
+    validate_all: bool = False,
 ) -> None:
-    """Submit `stages` to Mufasa (mufasa.enabled is true) and wait for them."""
+    """Submit `stages` to Mufasa (mufasa.enabled is true) and wait for them.
+    ``validate_all``: one job running `spectra validate --all` on every case there."""
     remote, _ = _load_script("remote")
-    print(f"[bold]{' + '.join(stages)} → Mufasa[/bold] (mufasa.enabled: true)")
+    print(f"[bold]{'validate --all' if validate_all else ' + '.join(stages)} → Mufasa[/bold] "
+          "(mufasa.enabled: true)")
     try:
         jobid, state = remote.submit(
             str(config), stages=stages, overrides=overrides, dry_run=dry_run,
-            extra_args=["--cpu"] if force_cpu else [],
+            extra_args=["--cpu"] if force_cpu else [], validate_all=validate_all,
         )
     except SystemExit as exc:          # remote.py reports errors as SystemExit(msg)
         print(f"[red]{escape(str(exc))}[/red]")
@@ -193,6 +197,7 @@ def _run_on_mufasa(
 _STAGE_PACKAGES = {
     "vision": ("torch", "PIL"),
     "registration": ("trimesh", "openpyxl"),
+    "validation": ("trimesh", "scipy", "openpyxl"),
 }
 
 
@@ -366,7 +371,7 @@ def full_cmd(
         print("[yellow]stages contains 'acquisition' but this is a SLURM job (no robot "
               "here): skipping the acquisition.[/yellow]")
         acquire = False
-    compute = [s for s in ("vision", "registration") if s in cfg.stages]
+    compute = [s for s in ("vision", "registration", "validation") if s in cfg.stages]
     on_mufasa = _mufasa_on(cfg)
     if acquire and not cfg.acquisition:
         raise typer.BadParameter("stages contains 'acquisition' but the config has no "
@@ -581,6 +586,89 @@ def calibrate_cmd(
 # =============================================================================
 # Entry point
 # =============================================================================
+
+# =============================================================================
+# validate — validation against ground truth (spectra/validation/)
+# =============================================================================
+
+@app.command("validate")
+def validate_cmd(
+    step: Optional[str] = typer.Argument(
+        None, help="run (default): validate --sample against its vision run | "
+                   "summary: every validated sample under results_root."),
+    modality: Optional[str] = typer.Option(
+        None, "--modality", "-m", help="vision (protocol phase 1). Omitted: every modality."),
+    config: Path = typer.Option(Path("configs/default.yaml"), "--config", "-c", exists=True,
+                                readable=True, help="Unified YAML (needs a `validation:` section)."),
+    sample: Optional[str] = typer.Option(None, "--sample", help="Sample to validate, e.g. T1_P1_R1."),
+    phantom: Optional[str] = typer.Option(
+        None, "--phantom", help="Phantom of the sample, when its name does not say it."),
+    date: Optional[str] = typer.Option(
+        None, "--date", help="Run-date folder dd-mm-yyyy (default today). The vision run "
+                             "used is that date's, else the most recent one."),
+    set_override: List[str] = typer.Option(
+        [], "--set", "-s", help="Dotted override, e.g. --set validation.vision.primary=kabsch"),
+    all_cases: bool = typer.Option(
+        False, "--all", help="Validate every sample with a vision run whose name says its "
+                             "phantom (e.g. T1_P1_R1), then write the summary."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print what would run, run nothing."),
+) -> None:
+    """Validation against ground-truth phantoms. `run`: one sample (--sample) or
+    every case (--all); on Mufasa when mufasa.enabled is true (like vision /
+    registration), else here. `summary`: always here, from the metrics.json
+    under results_root."""
+    from . import validation
+
+    try:
+        steps = validation.plan(modality, step)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+    cfg0 = load_unified_config(config)
+    if cfg0.validation is None:
+        raise typer.BadParameter(f"{config} has no `validation:` section.")
+    extra = ({"validation.cases": {**cfg0.validation.cases, (sample or cfg0.sample_name): phantom}}
+             if phantom else None)
+    ovr = _cli_overrides(sample, date, set_override, extra)
+    cfg = cfg0.with_overrides(ovr)
+    modalities = [m for m, _ in steps]
+    what = steps[0][1]
+    if all_cases and (sample or phantom):
+        raise typer.BadParameter("--all validates every case: drop --sample / --phantom.")
+    print(f"[bold]spectra validate[/bold] — {what}: {', '.join(modalities)}"
+          + ("" if what == "summary" else ", every case" if all_cases
+             else f", sample {cfg.sample_name!r}"))
+    try:
+        if what == "summary":
+            if dry_run:
+                print(f"\\[dry-run] would summarise {cfg.results_root}/*/*/validation/")
+                return
+            missing = _missing(("openpyxl",))
+            if missing:
+                print(f"[red]The summary needs {missing}.[/red] Run `uv sync`.")
+                raise typer.Exit(code=1)
+            validation.run_summary(cfg, modalities)
+            return
+        if _mufasa_on(cfg):
+            _run_on_mufasa(config, ovr, ["validation"], dry_run=dry_run, validate_all=all_cases)
+            return
+        if dry_run:
+            if all_cases:
+                cases = validation.find_cases(cfg)
+                print(f"\\[dry-run] would validate here {len(cases)} cases: "
+                      + ", ".join(f"{s} ({v})" for s, v in sorted(cases.items())))
+            else:
+                print(f"\\[dry-run] would validate {cfg.sample_name} here (mufasa.enabled is false).")
+            return
+        _require_local_processing(["validation"])
+        if all_cases:
+            validation.run_all(cfg, modalities)
+        else:
+            validation.run_validation_stage(cfg, modalities=modalities)
+    except SystemExit as exc:          # validation modules report errors as SystemExit(msg)
+        if exc.code not in (None, 0):
+            print(f"[red]{escape(str(exc))}[/red]")
+            raise typer.Exit(code=1) from None
+
 
 def main(argv: Optional[list[str]] = None) -> None:
     if argv is None:
