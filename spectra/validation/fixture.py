@@ -158,8 +158,12 @@ class Holes:
     def __len__(self) -> int:
         return len(self.mouth)
 
+    def subset(self, keep) -> "Holes":
+        keep = np.asarray(keep, dtype=bool)
+        return Holes(self.mouth[keep], self.axis[keep], self.diameter[keep], self.depth[keep])
 
-def find_holes(vertices: np.ndarray, faces: np.ndarray, max_diameter_mm: float = 3.0,
+
+def find_holes(vertices: np.ndarray, faces: np.ndarray, max_diameter_mm: float = 5.0,
                tol: float = 0.05) -> Holes:
     """Blind round holes on the flat faces of a mesh: groups of small planar
     regions (walls + floor) whose vertices all lie on a cylinder around the

@@ -11,7 +11,8 @@ reverse: ``polarity``). For each bersaglio:
 2. in every photo of the vision run where it is visible (facing the camera
    within ``max_view_angle_deg``, not hidden by the STL around it), the spot is
    looked for within ``search_radius_mm`` of the projected expected position
-   and its centre is taken (intensity-weighted centroid);
+   (capped at 45% of the smallest spacing between bersagli) and its centre
+   is taken (intensity-weighted centroid);
 3. a ray from the camera through that pixel hits the reconstructed mesh: the
    point where the reconstruction puts the bersaglio (what registration does
    with an HSI pixel);
@@ -63,6 +64,18 @@ def view_images(vision_dir: Path, meta: dict, n_views: int) -> tuple[Optional[Li
     if len(files) != n_views:
         return None, f"{len(files)} photos in {d} but {n_views} camera poses: cannot pair them"
     return files, ""
+
+
+def search_radius(holes: Holes, opt) -> float:
+    """search_radius_mm, capped at 45% of the smallest distance between two
+    bersagli, so that the search circles of two bersagli never overlap (the
+    spot of a neighbour cannot be taken for the right one)."""
+    r = float(opt.search_radius_mm)
+    if len(holes) > 1:
+        from scipy.spatial.distance import pdist
+
+        r = min(r, 0.45 * float(pdist(holes.mouth).min()))
+    return r
 
 
 def detect_spot(gray: np.ndarray, uv: Sequence[float], r_search: float, r_dot: float,
@@ -143,9 +156,10 @@ def measure(holes: Holes, *, T_pred: np.ndarray, cams: np.ndarray, K: np.ndarray
                               tol=visibility_tol, min_cos=min_cos)
     P = G.apply(T_pred, holes.mouth)                       # expected, output frame
     N = G.rotate(T_pred, holes.axis)
+    r_mm = search_radius(holes, opt)
     tri_all = mesh_v[mesh_f]
     cen = tri_all.mean(axis=1)
-    local = [tri_all[np.linalg.norm(cen - p, axis=1) < opt.search_radius_mm + 5.0] for p in P]
+    local = [tri_all[np.linalg.norm(cen - p, axis=1) < r_mm + 5.0] for p in P]
 
     hits: List[List[tuple]] = [[] for _ in fids]
     for v in np.flatnonzero(seen.any(axis=1)):
@@ -160,7 +174,7 @@ def measure(holes: Holes, *, T_pred: np.ndarray, cams: np.ndarray, K: np.ndarray
             uv = (Kv[0, 0] * Xc[0] / Xc[2] + Kv[0, 2], Kv[1, 1] * Xc[1] / Xc[2] + Kv[1, 2])
             to_cam = C - P[i]
             cos_view = float(N[i] @ to_cam / np.linalg.norm(to_cam))
-            r_search = opt.search_radius_mm * f_px / Xc[2]
+            r_search = r_mm * f_px / Xc[2]
             r_dot = 0.5 * float(holes.diameter[i]) * f_px / Xc[2]
             det = detect_spot(img, uv, r_search, r_dot, cos_view, opt.polarity, opt.min_contrast)
             rec = {"view": int(v), "image": Path(image_paths[v]).name,

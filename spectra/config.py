@@ -388,6 +388,9 @@ class ValidationICP(BaseModel):
     enabled: bool = True
     max_corr_mm: float = Field(default=2.0, gt=0.0)    # pairs farther than this are ignored
     iters: int = Field(default=50, ge=1)
+    #: Only the reconstruction less steep than this (deg from horizontal) drives
+    #: ICP: the height-field walls would bias it. null = all of it.
+    max_slope_deg: Optional[float] = Field(default=60.0, gt=0.0, le=90.0)
 
 
 class ValidationFiducials(BaseModel):
@@ -400,7 +403,8 @@ class ValidationFiducials(BaseModel):
     enabled: bool = True
     #: bright = bersaglio lighter than the phantom (white on black) | dark.
     polarity: Literal["bright", "dark"] = "bright"
-    search_radius_mm: float = Field(default=2.0, gt=0.0)        # around the expected position
+    #: around the expected position; capped at 45% of the smallest spacing between bersagli
+    search_radius_mm: float = Field(default=3.0, gt=0.0)
     max_view_angle_deg: float = Field(default=60.0, gt=0.0, lt=90.0)   # view vs hole axis
     min_contrast: float = Field(default=20.0, ge=0.0)          # spot peak - background, grey 0-255
     outlier_mm: float = Field(default=1.0, gt=0.0)             # views this far from the median: dropped

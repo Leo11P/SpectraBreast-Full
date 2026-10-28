@@ -912,7 +912,7 @@ The STL is aligned to the reconstruction in three ways:
 | --- | --- | --- |
 | `frame` | same rule as vision on the CAD markers (needs `frame_marker_ids` / `x_axis_marker_ids`) | everything, coordinates compared directly |
 | `kabsch` | rigid fit of the CAD marker corners on the reconstructed ones | everything (shape + position + scale) |
-| `icp` | kabsch refined by point-to-plane ICP on the phantom region, no scale | shape only |
+| `icp` | kabsch refined by point-to-plane ICP on the phantom region, no scale, only on the reconstruction less steep than `icp.max_slope_deg` (60°: the height-field walls would bias it) | shape only |
 
 For each alignment, in the phantom region (XY box of the STL above the marker
 plane + `roi_margin_mm`):
@@ -929,14 +929,15 @@ edge, every alignment is rigid, so a scale error shows up in the metrics.
 
 Fiducials (`fiducials` in `metrics.json`, `<alignment>.fiducials.*` in the
 summary): the bersagli, found in the STL as blind round holes on flat faces (up
-to 3 mm diameter), numbered by CAD Y then X; the point is the centre of the
-hole mouth. Each one is looked for in the photos of the vision run
+to 5 mm diameter) inside the phantom region, numbered by CAD Y then X; the point
+is the centre of the hole mouth. Each one is looked for in the photos of the vision run
 (`inputs_exif_canonical/`):
 
 1. expected position from the marker alignment (kabsch), so the id comes from the STL;
 2. in each photo where it faces the camera (within `max_view_angle_deg`) and is
    not hidden, the spot (`polarity`: bright = white on black) nearest to the
-   projected position, within `search_radius_mm`; its intensity-weighted centre;
+   projected position, within `search_radius_mm` (at most 45% of the smallest
+   spacing between bersagli); its intensity-weighted centre;
 3. a ray from the camera through that pixel onto the reconstructed mesh (what
    registration does with an HSI pixel);
 4. median over the views, dropping those farther than `outlier_mm`.

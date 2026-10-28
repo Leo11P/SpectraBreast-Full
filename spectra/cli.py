@@ -387,7 +387,18 @@ def full_cmd(
     if dry_run:
         if acquire:
             print("\\[dry-run] the acquisition would run here (robot not moved).")
-        if compute and on_mufasa:
+        if compute and on_mufasa and acquire:
+            # the photos do not exist yet: only check that Mufasa is reachable,
+            # as the real run does before the robot moves.
+            remote, _ = _load_script("remote")
+            try:
+                remote.preflight(str(config), ovr)
+            except SystemExit as exc:
+                print(f"[red]{escape(str(exc))}[/red]")
+                raise typer.Exit(code=1) from None
+            print(f"\\[dry-run] then {' + '.join(compute)} on Mufasa with the photos of the "
+                  "acquisition. To see the planned poses: spectra acquire --mode dry-run")
+        elif compute and on_mufasa:
             _run_on_mufasa(config, ovr, compute, dry_run=True, force_cpu=force_cpu)
         elif compute:
             from .orchestrator import run_full

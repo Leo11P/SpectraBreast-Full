@@ -143,6 +143,14 @@ def look_at_R(cam_pos, target, roll_deg=0.0):
     return R
 
 
+def _pair(r):
+    """(err, value) of a Fairino call that answers (err, value) on success but
+    may answer a bare error code (int) on failure (e.g. after a refused move)."""
+    if isinstance(r, (list, tuple)) and len(r) == 2:
+        return r[0], r[1]
+    return (r if isinstance(r, int) else -1), None
+
+
 # -----------------------------------------------------------------------------
 #  Robot: minimal wrapper around the official Fairino library (Robot.py)
 # -----------------------------------------------------------------------------
@@ -172,8 +180,8 @@ class RobotIO:
             return -1
 
     def get_joints(self):
-        err, j = self.rpc.GetActualJointPosDegree(0)
-        return list(j) if err == 0 else None
+        err, j = _pair(self.rpc.GetActualJointPosDegree(0))
+        return list(j) if err == 0 and j is not None else None
 
     def get_tcp_pose(self):
         r = self.rpc.GetActualTCPPose(0)
@@ -191,8 +199,15 @@ class RobotIO:
     def forward_kin(self, joints):
         """NATIVE controller FK: joints(deg) -> [x,y,z,rx,ry,rz] of the flange.
         THIS is our only kinematic truth."""
-        err, pose = self.rpc.GetForwardKin(list(map(float, joints)))
-        return list(pose) if err == 0 else None
+        err, pose = _pair(self.rpc.GetForwardKin(list(map(float, joints))))
+        return list(pose) if err == 0 and pose is not None else None
+
+    def inverse_kin_near(self, flange, q_ref):
+        """Joints (deg) reaching the flange pose with the solution NEAREST to
+        q_ref (same posture), or None."""
+        err, q = _pair(self.rpc.GetInverseKinRef(0, list(map(float, flange)),
+                                                 list(map(float, q_ref))))
+        return list(q) if err == 0 and q is not None else None
 
     def move_cart(self, desc_pose, tool, user, vel):
         return self.rpc.MoveCart(list(map(float, desc_pose)), int(tool), int(user),
@@ -726,8 +741,11 @@ def bootstrap(robot, rs, cfg, T_c2g, K, D):
     print(f"[bootstrap] per-marker spread (mm) = {np.round(disp,2).tolist()}")
     print(f"[bootstrap] base centroid (mm) = {np.round(centroid,1).tolist()}")
     print(f"[bootstrap] up = {np.round(up,3).tolist()}")
+    # base position of every marker seen here: the recentring aims at the FIXED
+    # centroid and uses these to measure the chain error at each pose.
+    centers_by_id = {int(mid): centers_base[k] for k, mid in enumerate(sorted(per_id_c))}
     return {"centroid": centroid, "up": up, "corners_base": corners_base,
-            "cam_pos": cam_pos}
+            "cam_pos": cam_pos, "centers_by_id": centers_by_id}
 
 
 def _orthonormal_basis(up):
@@ -765,10 +783,12 @@ def _surface_coverage(surf_pts_base, T_c2b, K, D, W, H, margin):
 
 def _evaluate_pose(centroid, up, u, v, az, tilt, dist, roll,
                    robot, T_c2g, K, D, W, H, margin, gimbal_margin,
-                   surf_pts=None, min_cov=0.0):
+                   surf_pts=None, min_cov=0.0, q_ref=None, ik_config=-1):
     """Evaluates ONE parametric look-at pose. Returns (pose_dict, None) if valid,
     otherwise (None, reason) with reason in {'vis','cov','gimbal','ik'}.
-    az/tilt in radians, dist in mm, roll in degrees."""
+    az/tilt in radians, dist in mm, roll in degrees. IK: the solution nearest
+    to q_ref if given (GetInverseKinRef), else configuration ik_config
+    (-1 = nearest to the robot's current joints, 0..7 = branch)."""
     direction = (math.cos(tilt) * up +
                  math.sin(tilt) * (math.cos(az) * u + math.sin(az) * v))
     cam_pos = centroid + dist * direction
@@ -797,11 +817,16 @@ def _evaluate_pose(centroid, up, u, v, az, tilt, dist, roll,
     # (d) reachability: the native IK must have a solution, and we STORE it:
     # it is used for MoveJ (joint space), which imposes no Cartesian straight line
     # and so does not run into the wrist singularities that stop MoveCart/MoveL.
-    err, joints_sol = robot.rpc.GetInverseKin(0, list(map(float, flange)), -1)
-    if err != 0:
+    if q_ref is not None:
+        err, joints_sol = _pair(robot.rpc.GetInverseKinRef(0, list(map(float, flange)),
+                                                           list(map(float, q_ref))))
+    else:
+        err, joints_sol = _pair(robot.rpc.GetInverseKin(0, list(map(float, flange)),
+                                                        int(ik_config)))
+    if err != 0 or joints_sol is None:
         return None, "ik"
-    return {"flange": flange, "joints": list(joints_sol),
-            "cam_T_base": T_c2b.copy()}, None
+    return {"flange": flange, "joints": list(map(float, joints_sol)),
+            "cam_T_base": T_c2b.copy(), "view": [az, tilt, dist, roll]}, None
 
 
 def _ik_retry_candidates(az, tilt, dist, roll, r):
@@ -836,7 +861,10 @@ def _ik_retry_candidates(az, tilt, dist, roll, r):
     return cands[:max_att]
 
 
-def generate_poses(target, cfg, robot, T_c2g, K, D):
+def _planning_ctx(target, cfg, robot, T_c2g, K, D):
+    """Evaluator of the look-at poses around the target (visibility, gimbal,
+    IK), shared by generate_poses and plan_sequence:
+    ev(az, tilt, dist, roll, q_ref=None, ik_config=-1) -> (pose|None, reason)."""
     centroid = target["centroid"]; up = target["up"]
     u, v = _orthonormal_basis(up)
     W = int(cfg["camera"]["width"]); H = int(cfg["camera"]["height"])
@@ -865,13 +893,20 @@ def generate_poses(target, cfg, robot, T_c2g, K, D):
     surf_pts = target.get("corners_base")
     if surf_pts is not None and len(np.asarray(surf_pts)) == 0:
         surf_pts = None
-    ik_retry = cfg.get("ik_retry", {}) or {}
-    retry_on = bool(ik_retry.get("enable", True))
 
-    def _eval(az, tilt, dist, roll):
+    def ev(az, tilt, dist, roll, q_ref=None, ik_config=-1):
         return _evaluate_pose(centroid, up, u, v, az, tilt, dist, roll,
                               robot, T_c2g, K, D, W, H, margin_of(dist), gimbal_margin,
-                              surf_pts=surf_pts, min_cov=min_cov)
+                              surf_pts=surf_pts, min_cov=min_cov, q_ref=q_ref,
+                              ik_config=ik_config)
+    return ev
+
+
+def generate_poses(target, cfg, robot, T_c2g, K, D):
+    _eval = _planning_ctx(target, cfg, robot, T_c2g, K, D)
+    min_cov = float(cfg.get("visibility", {}).get("min_marker_coverage", 0.0))
+    ik_retry = cfg.get("ik_retry", {}) or {}
+    retry_on = bool(ik_retry.get("enable", True))
 
     out = []
     skip = {"vis": 0, "cov": 0, "gimbal": 0, "ik": 0}
@@ -926,17 +961,48 @@ def generate_poses(target, cfg, robot, T_c2g, K, D):
 # -----------------------------------------------------------------------------
 #  Closed-loop recentring (position+orientation, damping, min-marker)
 # -----------------------------------------------------------------------------
-def recenter(robot, rs, cfg, T_c2g, K, D, centroid_hint, guard=None):
-    """Brings the marker centroid back to the image centre. Returns True if at
-    least one frame saw the markers (meaningful photo), False otherwise.
-    If 'guard' is given, every MoveL correction is collision-checked before
-    moving (recentring may take the camera outside the validated poses)."""
+def _project_px(P_base, T_c2b, K, D):
+    """Pixel of a base point seen from the camera pose T_c2b, or None if behind it."""
+    p = base_points_to_cam(P_base, T_c2b)[0]
+    if p[2] <= 1.0:
+        return None
+    uv, _ = cv.projectPoints(p.reshape(1, 3), np.zeros(3), np.zeros(3), K, D)
+    return uv.reshape(2)
+
+
+def _rot_towards(a, b, frac=1.0):
+    """frac x the smallest rotation taking direction a onto direction b."""
+    a = np.asarray(a, float) / np.linalg.norm(a)
+    b = np.asarray(b, float) / np.linalg.norm(b)
+    axis = np.cross(a, b)
+    s = float(np.linalg.norm(axis))
+    if s < 1e-12:
+        return np.eye(3)
+    ang = math.atan2(s, float(a @ b)) * frac
+    k = axis / s
+    Kx = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) + math.sin(ang) * Kx + (1 - math.cos(ang)) * (Kx @ Kx)
+
+
+def recenter(robot, rs, cfg, T_c2g, K, D, target, guard=None):
+    """Brings the FIXED target point of the bootstrap (target['centroid'], base
+    frame) to the image centre. Where that point really is in the image is
+    predicted with the native FK and corrected by the bootstrap markers in view
+    (median offset between where they are detected and where the FK puts them:
+    the chain error at this pose). Unlike the centroid of the markers in view,
+    the aim does not move when markers appear or disappear (e.g. hidden by the
+    phantom). The correction rotates the camera about its centre (same
+    position, smallest rotation: the roll chosen by the planner is kept), by
+    'damping' x the needed angle. Returns True if at least one frame saw the
+    markers (meaningful photo), False otherwise. If 'guard' is given, every
+    correction is collision-checked along its joint path before moving."""
     sv = cfg.get("servo", {})
     if not sv.get("enable", True):
         return True
     tol = float(sv.get("pixel_tol", 8)); max_iters = int(sv.get("max_iters", 4))
     vel = float(sv.get("vel", 12)); min_m = int(sv.get("min_markers", 2))
     damping = float(sv.get("damping", 0.6))
+    max_step = float(sv.get("max_joint_step_deg", 20.0))   # larger = posture flip: skip
     # detection robustness: the FIRST frame right after MoveJ can be
     # spoiled by vibration/exposure not yet settled -> 0 markers even
     # if the markers are perfectly visible in the stream. Settle a few frames
@@ -945,10 +1011,11 @@ def recenter(robot, rs, cfg, T_c2g, K, D, centroid_hint, guard=None):
     settle_s = float(sv.get("settle_before_detect_s", 0.4))
     detect_retries = int(sv.get("detect_retries", 4))
     n_avg = int(cfg.get("camera", {}).get("n_avg_frames", 5))
-    L = float(cfg["aruco"]["marker_length_mm"])
     cx, cy = K[0, 2], K[1, 2]
     detector = make_detector(cfg["aruco"]["dictionary"])
     tool = int(cfg["robot"]["tool"]); user = int(cfg["robot"]["user"])
+    aim3d = np.asarray(target["centroid"], float)
+    known = target.get("centers_by_id") or {}
 
     def _grab_detect():
         """Grab+detect ArUco, retrying on transient frames without markers.
@@ -978,46 +1045,57 @@ def recenter(robot, rs, cfg, T_c2g, K, D, centroid_hint, guard=None):
         if ids is None or len(corners) == 0:
             print(f"  [servo] it{it}: no marker in view "
                   f"({detect_retries} attempts)"); return False
-        if len(corners) < min_m:
-            print(f"  [servo] it{it}: only {len(corners)} markers (<{min_m}), not correcting")
-            return True
-        centers_px = np.array([mc.reshape(-1, 2).mean(axis=0) for mc in corners])
-        cpx = centers_px.mean(axis=0)
-        off = math.hypot(cpx[0] - cx, cpx[1] - cy)
-        if off <= tol:
-            print(f"  [servo] centred ({off:.0f}px) in {it} iter"); return True
         T_c2b, _ = camera_T_base(robot, T_c2g)
         if T_c2b is None:
             print("  [servo] FK not readable"); return True
-        cbase, dists = [], []
-        for mc in corners:
-            pose = estimate_marker_pose(mc, K, D, L)
-            if pose is not None:
-                cbase.append(cam_points_to_base(pose[1], T_c2b)[0])
-                dists.append(float(np.linalg.norm(pose[1])))
-        if len(cbase) < min_m:
+        res = []
+        for mc, mid in zip(corners, np.asarray(ids).ravel().tolist()):
+            if int(mid) not in known:
+                continue
+            pred = _project_px(known[int(mid)], T_c2b, K, D)
+            if pred is not None:
+                res.append(mc.reshape(-1, 2).mean(axis=0) - pred)
+        if len(res) < min_m:
+            print(f"  [servo] it{it}: {len(res)} bootstrap markers in view (<{min_m}), "
+                  "not correcting")
             return True
-        centroid = np.mean(cbase, axis=0); cur_d = float(np.mean(dists))
-        cam_cur = T_c2b[:3, 3]
-        zdes = centroid - cam_cur; zdes = zdes / (np.linalg.norm(zdes) + 1e-9)
-        cam_target = centroid - cur_d * zdes
-        cam_new = cam_cur + damping * (cam_target - cam_cur)
-        R = look_at_R(cam_new, centroid, 0.0)
-        T_new = np.eye(4); T_new[:3, :3] = R; T_new[:3, 3] = cam_new
+        aim = _project_px(aim3d, T_c2b, K, D)
+        if aim is None:
+            print("  [servo] target point behind the camera: not correcting"); return True
+        aim = aim + np.median(np.asarray(res), axis=0)
+        off = math.hypot(aim[0] - cx, aim[1] - cy)
+        if off <= tol:
+            print(f"  [servo] centred ({off:.0f}px) in {it} iter"); return True
+        nrm = cv.undistortPoints(aim.reshape(1, 1, 2).astype(np.float64), K, D).reshape(2)
+        ray = T_c2b[:3, :3] @ np.array([nrm[0], nrm[1], 1.0])
+        T_new = T_c2b.copy()
+        T_new[:3, :3] = _rot_towards(T_c2b[:3, 2], ray, damping) @ T_c2b[:3, :3]
         flange = gripper_pose_from_camera_T(T_new, T_c2g)
-        # collision-check the correction BEFORE moving (no contact with the
-        # sample, not even during the recentring moves).
+        # The correction is a joint-space move (MoveJ) to the IK solution
+        # NEAREST to the current joints: a Cartesian MoveL is refused by the
+        # controller when the target needs another joint configuration (e.g.
+        # from the "alternative IK" postures). Small correction -> small joint
+        # change; a big one means a posture flip: not corrected.
+        q_now = robot.get_joints()
+        q_new = robot.inverse_kin_near(flange, q_now) if q_now is not None else None
+        if q_new is None:
+            print("  [servo] no IK for the correction: not correcting"); return True
+        jump = max(abs(a - b) for a, b in zip(q_new, q_now))
+        if jump > max_step:
+            print(f"  [servo] correction needs {jump:.0f} deg on a joint (> {max_step:.0f}): "
+                  "not correcting"); return True
+        # collision-check the correction BEFORE moving, along the joint path
+        # (no contact with the sample, not even during the recentring moves).
         if guard is not None and guard.available and guard.validated:
-            e_ik, jsol = robot.rpc.GetInverseKin(0, list(map(float, flange)), -1)
-            if e_ik == 0 and jsol is not None:
-                ok_c, reasons = guard.config_safe(jsol)
-                if not ok_c:
-                    print(f"  [servo] correction ABORTED (collision): {'; '.join(reasons)}")
-                    return True
-        print(f"  [servo] it{it}: off {off:.0f}px, {len(corners)} markers -> correcting")
-        err = robot.move_l(flange, tool, user, vel)
+            ok_c, reasons = guard.path_safe(q_now, q_new)
+            if not ok_c:
+                print(f"  [servo] correction ABORTED (collision): {'; '.join(reasons)}")
+                return True
+        print(f"  [servo] it{it}: off {off:.0f}px ({len(res)} markers) -> correcting "
+              f"(max joint change {jump:.1f} deg)")
+        err = robot.move_j(q_new, tool, user, vel, desc_pose=flange)
         if err != 0:
-            print(f"  [servo] MoveL failed (code {err})"); return True
+            print(f"  [servo] MoveJ failed (code {err})"); return True
     print("  [servo] max_iters reached"); return True
 
 
@@ -1070,6 +1148,177 @@ def _reorder_poses_min_travel(poses, q_start):
     return out
 
 
+def _jdist(a, b):
+    return float(np.max(np.abs(np.asarray(a, float) - np.asarray(b, float))))
+
+
+#: Joint weights of the planning cost: moving shoulder/elbow (J1-J3) swings the
+#: whole arm, the wrist (J4-J6) only the camera: 1 deg of J1-J3 = 3 deg of wrist.
+_PLAN_W = np.array([3.0, 3.0, 3.0, 1.0, 1.0, 1.0])
+
+
+def _move_cost(a, b):
+    """Weighted joint distance used to choose between IK solutions."""
+    return float(np.max(_PLAN_W * np.abs(np.asarray(a, float) - np.asarray(b, float))))
+
+
+def _config_ok(guard, q):
+    if guard is None or not (guard.available and guard.validated):
+        return True
+    return guard.config_safe(q)[0]
+
+
+def _path_ok(guard, q0, q1):
+    if guard is None or not (guard.available and guard.validated):
+        return True
+    return guard.path_safe(q0, q1)[0]
+
+
+def _via_configs(target, cfg, robot, T_c2g, guard, q_home):
+    """Safe joint configurations with the camera HIGH above the sample, to change
+    arm configuration (e.g. a wrist flip) between two poses that cannot be
+    joined directly: the camera looks at the centroid from
+    planning.via_heights_mm (straight down and tilted 15 deg on 4 sides), 4
+    rolls, every IK branch (config 0..7); plus the start pose."""
+    pl = cfg.get("planning", {}) or {}
+    heights = [float(h) for h in pl.get("via_heights_mm", [220, 280])]
+    gimbal_margin = float(cfg.get("visibility", {}).get("gimbal_lock_margin_deg", 12))
+    centroid = np.asarray(target["centroid"], float); up = np.asarray(target["up"], float)
+    u, v = _orthonormal_basis(up)
+    out = []
+    if q_home is not None and _config_ok(guard, q_home):
+        out.append(list(map(float, q_home)))
+    for h in heights:
+        for tilt_deg, azs in ((0.0, (0.0,)), (15.0, (0.0, 90.0, 180.0, 270.0))):
+            for az_deg in azs:
+                t, a = math.radians(tilt_deg), math.radians(az_deg)
+                cam_pos = centroid + h * (math.cos(t) * up
+                                          + math.sin(t) * (math.cos(a) * u + math.sin(a) * v))
+                for roll in (0.0, 90.0, 180.0, 270.0):
+                    T = np.eye(4); T[:3, :3] = look_at_R(cam_pos, centroid, roll); T[:3, 3] = cam_pos
+                    flange = gripper_pose_from_camera_T(T, T_c2g)
+                    if abs(abs(flange[4]) - 90.0) < gimbal_margin:
+                        continue
+                    for c in range(8):
+                        err, q = _pair(robot.rpc.GetInverseKin(0, list(map(float, flange)), c))
+                        if err != 0 or q is None:
+                            continue
+                        q = list(map(float, q))
+                        if any(_jdist(q, s) < 1.0 for s in out):
+                            continue
+                        if _config_ok(guard, q):
+                            out.append(q)
+    return out
+
+
+def _via_route(q_from, arrivals, vias, guard):
+    """Cheapest safe route q_from -> via -> arrival. arrivals: list of joint
+    configs. Returns (via, index of the arrival) or None."""
+    pairs = sorted(((_move_cost(q_from, v) + _move_cost(v, q), iv, ia)
+                    for iv, v in enumerate(vias) for ia, q in enumerate(arrivals)))
+    first_ok = {}
+    for _, iv, ia in pairs:
+        if iv not in first_ok:
+            first_ok[iv] = _path_ok(guard, q_from, vias[iv])
+        if first_ok[iv] and _path_ok(guard, vias[iv], arrivals[ia]):
+            return vias[iv], ia
+    return None
+
+
+def plan_sequence(poses, q_start, target, cfg, robot, T_c2g, K, D, guard):
+    """Re-plans the (ordered) poses one after the other, so that the robot can
+    really go from each to the next:
+      - IK: the solution NEAREST to the previous pose (GetInverseKinRef), so
+        neighbours stay in the same arm configuration (no wrist flips);
+      - roll: the camera may turn about its optical axis within
+        +-planning.roll_range_deg of the layer roll (same viewpoint and framing);
+        the roll with the smallest joint change + roll_weight x |roll offset| is
+        taken. Kept small because MASt3R is not rotation invariant: the images
+        stay roughly upright;
+      - the joint path from the previous pose is collision-checked HERE
+        (camera-vs-link, floor, sample cube, limits);
+      - if no roll gives a safe direct path with that solution, the other arm
+        configurations are tried directly (nominal solution, every IK branch);
+      - only if none works, the arm changes configuration through a 'via' pose
+        high above the sample (_via_configs); if that fails too, the pose is
+        dropped.
+    Each returned pose has 'joints' / 'flange' / 'cam_T_base' / 'roll_deg' of the
+    chosen solution, 'via' ([] or [via joints]) and 'planned' = True."""
+    pl = cfg.get("planning", {}) or {}
+    if not bool(pl.get("enable", True)) or not poses:
+        return poses
+    rng = float(pl.get("roll_range_deg", 45.0))
+    step = max(1.0, float(pl.get("roll_step_deg", 15.0)))
+    rw = float(pl.get("roll_weight", 0.5))       # cost of 1 deg of roll, in deg of joint motion
+    offsets = [0.0] + [s * k * step for k in range(1, int(rng // step) + 1) for s in (1, -1)]
+    ev = _planning_ctx(target, cfg, robot, T_c2g, K, D)
+    vias = None
+    out, q_prev = [], list(map(float, q_start))
+    n_via = n_drop = 0
+    for wp in poses:
+        az, tilt, dist, roll0 = wp["view"]
+        cands = []
+        for off in offsets:
+            p, _ = ev(az, tilt, dist, roll0 + off, q_ref=q_prev)
+            if p is not None and _config_ok(guard, p["joints"]):
+                cands.append((_move_cost(p["joints"], q_prev) + rw * abs(off), off, p))
+        cands.sort(key=lambda c: c[0])
+        chosen, via = None, []
+        for _, off, p in cands:
+            if _path_ok(guard, q_prev, p["joints"]):
+                chosen = (off, p)
+                break
+        if chosen is None:
+            # the other arm configurations, still DIRECTLY: the nominal solution
+            # of generate_poses and every IK branch (config 0..7) of each roll.
+            more = []
+            if _config_ok(guard, wp["joints"]):
+                more.append((_move_cost(wp["joints"], q_prev), 0.0,
+                             {"flange": wp["flange"], "joints": list(map(float, wp["joints"])),
+                              "cam_T_base": wp["cam_T_base"]}))
+            for off in offsets:
+                for c in range(8):
+                    p, _ = ev(az, tilt, dist, roll0 + off, ik_config=c)
+                    if p is not None and _config_ok(guard, p["joints"]):
+                        more.append((_move_cost(p["joints"], q_prev) + rw * abs(off), off, p))
+            uniq = []
+            for c_ in sorted(cands + more, key=lambda c: c[0]):
+                if not any(_jdist(c_[2]["joints"], u_[2]["joints"]) < 1.0 for u_ in uniq):
+                    uniq.append(c_)
+            seen_ = cands
+            for _, off, p in uniq:
+                if any(p is s[2] for s in seen_):
+                    continue                              # already path-checked above
+                if _path_ok(guard, q_prev, p["joints"]):
+                    chosen = (off, p)
+                    break
+        if chosen is None:
+            if vias is None:
+                vias = _via_configs(target, cfg, robot, T_c2g, guard, q_start)
+                print(f"[plan] {len(vias)} safe via configurations above the sample")
+            arr = [(off, p) for _, off, p in uniq]
+            route = _via_route(q_prev, [a[1]["joints"] for a in arr], vias, guard) if arr else None
+            if route is None:
+                n_drop += 1
+                print(f"[plan] {wp['layer']} az={wp['azim_deg']:.0f}: no safe path, not even "
+                      "through a pose above the sample -> dropped")
+                continue
+            chosen, via = arr[route[1]], [route[0]]
+            n_via += 1
+        off, p = chosen
+        new = dict(wp)
+        new.update(flange=p["flange"], joints=p["joints"], cam_T_base=p["cam_T_base"],
+                   roll_deg=round(roll0 + off, 1), via=via, planned=True)
+        out.append(new)
+        q_prev = p["joints"]
+    jumps = [_jdist(a["joints"], b["joints"]) for a, b in zip(out[:-1], out[1:]) if not b["via"]]
+    print(f"[plan] {len(out)}/{len(poses)} poses planned in sequence; {n_via} reached through "
+          f"a pose above the sample, {n_drop} dropped; largest direct joint change "
+          f"{max(jumps) if jumps else 0:.0f} deg; roll offsets used "
+          f"{sorted({round(o['roll_deg'] - o['view'][3]) for o in out})} deg")
+    return out
+
+
 def run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir, use_viz=True):
     tool = int(cfg["robot"]["tool"]); user = int(cfg["robot"]["user"])
     vel = float(cfg["robot"].get("vel", 20))
@@ -1114,6 +1363,16 @@ def run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir, use_viz=True):
     except Exception as e:
         print(f"[collision] warning: guard not initialised ({e}); no geometric checks.")
         guard = None
+
+    # sequential planning: IK continuity between neighbours, free roll within a
+    # range, paths checked now, configuration changes through a pose above the
+    # sample (see plan_sequence). Needs the validated guard for the path checks.
+    poses = plan_sequence(poses, q_home, target, cfg, robot, T_c2g, K, D, guard)
+    for i, wp in enumerate(poses, 1):
+        if wp.get("planned"):
+            print(f"  {i:2d}: {wp['layer']:>14} az={wp['azim_deg']:>5.0f} roll={wp['roll_deg']:>6.1f}"
+                  f"  joints={[round(v, 1) for v in wp['joints']]}"
+                  + ("  (through a pose above the sample)" if wp["via"] else ""))
 
     # per-pose (arrival) safety check, computed ONCE and reused both to
     # colour the Rerun preview (red = not safely reachable) and
@@ -1216,7 +1475,19 @@ def run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir, use_viz=True):
         # (vs cube/floor/self/camera-link) AND the joint PATH q_prev->target
         # (camera-vs-link during the motion). If the direct path collides, try a
         # detour via 'home'; if that is not free either, skip the pose.
-        if guard is not None:
+        planned_ok = False
+        if wp.get("planned"):
+            # the planned route, re-checked from where the robot really is (the
+            # servo may have moved it a little); otherwise the usual planner.
+            seq = [list(q) for q in wp.get("via", [])] + [list(wp["joints"])]
+            pts = [q_prev] + seq
+            planned_ok = all(_path_ok(guard, pts[k], pts[k + 1]) for k in range(len(seq)))
+            if planned_ok:
+                mode, wps_move = ("via" if wp.get("via") else "direct"), seq
+                info = "planned" + (" through a pose above the sample" if wp.get("via") else "")
+        if planned_ok:
+            pass
+        elif guard is not None:
             mode, wps_move, info = guard.plan_move(q_prev, wp, q_home)
         else:
             mode, wps_move, info = "direct", [wp["joints"]], ""
@@ -1227,7 +1498,7 @@ def run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir, use_viz=True):
         # configuration actually executed for the pose (may be an IK
         # alternative to wp['joints'] if the nominal one collided).
         q_final = wps_move[-1]
-        if mode == "detour":
+        if mode in ("detour", "via"):
             print(f"[{i}/{len(poses)}] {wp['layer']} az={wp['azim_deg']:.0f}: {info} "
                   f"-> final joints {[round(v,1) for v in q_final]}")
         else:
@@ -1280,7 +1551,7 @@ def run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir, use_viz=True):
         # immediately (no wait before); only once the pose is CONFIRMED
         # centred do we wait 'dwell' seconds and shoot. This way no time is
         # wasted waiting before knowing whether another move is needed.
-        seen = recenter(robot, rs, cfg, T_c2g, K, D, target["centroid"], guard=guard)
+        seen = recenter(robot, rs, cfg, T_c2g, K, D, target, guard=guard)
         if not seen:
             print("  sample not in view -> shot SKIPPED"); continue
 
@@ -1354,8 +1625,16 @@ def run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir, use_viz=True):
                     f"{[round(v,1) for v in q_home]}")
               robot.move_j(q_home, tool, user, vel)
           else:
-              print(f"\n[home] return to the start pose NOT safe "
-                    f"({'; '.join(reasons)}); leaving the robot where it is.")
+              route = _via_route(q_prev, [q_home],
+                                 _via_configs(target, cfg, robot, T_c2g, guard, None), guard)
+              if route is not None:
+                  print("\n[home] returning to the start pose through a pose above the sample")
+                  if robot.move_j(route[0], tool, user, vel) == 0:
+                      robot.move_j(q_home, tool, user, vel)
+              else:
+                  print(f"\n[home] return to the start pose NOT safe "
+                        f"({'; '.join(reasons)}), not even through a pose above the "
+                        "sample; leaving the robot where it is.")
     finally:
         # Phase 3: robot hidden, all acquired poses + target cube remain.
         if viz is not None:

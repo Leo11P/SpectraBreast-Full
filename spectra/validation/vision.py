@@ -6,7 +6,8 @@
      frame   same rule as vision on the CAD markers (origin / X from the IDs in
              the run's metadata) -> coordinates compared directly
      kabsch  rigid fit of the CAD corners on the reconstructed ones (all markers)
-     icp     kabsch refined by point-to-plane ICP on the phantom region (no scale)
+     icp     kabsch refined by point-to-plane ICP on the phantom region (no scale),
+             on the reconstruction less steep than icp.max_slope_deg
    Kabsch residual and leave-one-marker-out errors check the markers.
 3. Metrics per alignment, in the phantom region (XY box of the STL above the
    marker plane + roi_margin_mm, or validation.phantoms.<name>.roi_mm):
@@ -235,6 +236,12 @@ def validate_vision(cfg, vision_dir: Path, out_dir: Path) -> Dict[str, Any]:
     # ------------------------------------------------------------ samples --
     marker_z = float(np.mean([c[:, 2].mean() for c in fixture.corners_mm.values()]))
     box = _roi_box(phantom_cfg, v_cad, marker_z, opt.roi_margin_mm)
+    n_holes = len(holes)
+    if n_holes:
+        holes = holes.subset(in_xy(holes.mouth, box))      # only the phantom's holes
+        if len(holes) < n_holes:
+            warnings.append(f"{n_holes - len(holes)} holes of the STL outside the phantom "
+                            "region ignored")
     centre_cad = np.array([(box[0] + box[1]) / 2, (box[2] + box[3]) / 2, marker_z])
     above = v_cad[(v_cad[:, 2] > marker_z + 1.0) & in_xy(v_cad, box)]
     phantom_centre = ((above.min(axis=0) + above.max(axis=0)) / 2 if len(above)
@@ -275,11 +282,19 @@ def validate_vision(cfg, vision_dir: Path, out_dir: Path) -> Dict[str, Any]:
 
     # ---------------------------------------------------------------- ICP --
     if opt.icp.enabled:
-        T_c, icp_info = G.icp_point_to_plane(G.apply(T_k_inv, rec.points), stl_dist,
-                                             opt.icp.max_corr_mm, opt.icp.iters)
+        # The vision mesh is a height field: vertical walls become slanted strips
+        # that are not where the STL walls are; ICP would shift the whole STL to
+        # fit them. Only the parts less steep than max_slope_deg are used.
+        src = G.apply(T_k_inv, rec.points)
+        use = np.ones(len(src), dtype=bool)
+        if opt.icp.max_slope_deg is not None and rec.normals is not None:
+            nz = np.abs(G.rotate(T_k_inv, rec.normals)[:, 2])
+            use = nz >= np.cos(np.radians(opt.icp.max_slope_deg))
+        T_c, icp_info = G.icp_point_to_plane(src[use], stl_dist, opt.icp.max_corr_mm, opt.icp.iters)
         transforms["icp"] = T_k @ G.inv(T_c)
         icp_info.update(rotation_deg=G.rot_angle_deg(T_c),
-                        shift_at_roi_mm=float(np.linalg.norm(G.apply(T_c, centre_cad[None]) - centre_cad)))
+                        shift_at_roi_mm=float(np.linalg.norm(G.apply(T_c, centre_cad[None]) - centre_cad)),
+                        max_slope_deg=opt.icp.max_slope_deg, used_fraction=float(use.mean()))
         align["icp"] = icp_info
 
     # --------------------------------------------------------- visibility --
@@ -356,7 +371,8 @@ def validate_vision(cfg, vision_dir: Path, out_dir: Path) -> Dict[str, Any]:
         "vision_frame": run["frame"], "timings": run["timings"],
         "scale": "kept: the ArUco scale set by vision; every alignment is rigid (no rescaling)",
         "views": views,
-        "fiducials": _fiducials(holes, transforms[primary], primary, fids, fid_err, fid_note),
+        "fiducials": _fiducials(holes, transforms[primary], primary, fids, fid_err, fid_note,
+                                F.search_radius(holes, opt.fiducials) if fids else None),
         "alignment": align, "metrics": metrics, "files": files, "warnings": warnings,
         "elapsed_s": round(time.time() - t0, 2),
     }
@@ -406,7 +422,8 @@ def _measure_fiducials(vision_dir: Path, run: dict, holes: Holes, T_k: np.ndarra
     return fids, None
 
 
-def _fiducials(holes: Holes, T: np.ndarray, alignment: str, fids=None, errs=None, note=None) -> dict:
+def _fiducials(holes: Holes, T: np.ndarray, alignment: str, fids=None, errs=None, note=None,
+               search_mm=None) -> dict:
     """The bersagli: position / axis in CAD, where they fall in the output frame
     under ``T`` (the primary alignment) and, when measured, where the
     reconstruction puts them and the error per alignment."""
@@ -424,7 +441,7 @@ def _fiducials(holes: Holes, T: np.ndarray, alignment: str, fids=None, errs=None
         "what": "blind round holes of the phantom STL; point = centre of the hole mouth "
                 "(on the surface), axis = out of the hole",
         "n": len(holes), "output_frame_alignment": alignment, "measured": bool(fids),
-        "note": note, "items": items,
+        "search_radius_mm": search_mm, "note": note, "items": items,
     }
 
 

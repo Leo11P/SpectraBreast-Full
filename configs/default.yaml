@@ -50,7 +50,7 @@
 
 # Sample being processed. Drives every auto-derived path — spell it exactly as
 # the folder names under DATA/.
-sample_name: "T2_P2_R2"
+sample_name: "T2_P2_R1"
 
 # Roots that drive default path resolution. Relative (from cwd) or absolute.
 data_root:    "DATA"
@@ -204,20 +204,34 @@ acquisition:
     tilt_step_deg: 4
     dist_frac: 0.06
 
+  # Sequential planning of the poses (acquire.py plan_sequence): each pose takes
+  # the IK solution nearest to the previous one, with the camera roll free within
+  # +-roll_range_deg (MASt3R is not rotation invariant: keep it small), and the
+  # path between poses is collision-checked before moving. When two poses cannot
+  # be joined, the arm changes configuration through a pose above the sample
+  # (camera looking down from via_heights_mm).
+  planning:
+    enable: true
+    roll_range_deg: 45
+    roll_step_deg: 15
+    roll_weight: 0.5           # 1 deg of roll costs as much as 0.5 deg of joint motion
+    via_heights_mm: [220, 280]
+
   servo:                       # ricentraggio closed-loop a ogni posa
     enable: true
     pixel_tol: 40
     max_iters: 5
     vel: 15
     min_markers: 2
-    damping: 0.6
+    damping: 0.6               # fraction of the re-pointing rotation applied per iteration
+    max_joint_step_deg: 20     # a correction needing more on a joint (posture flip) is not done
     settle_before_detect_s: 0.4
     detect_retries: 4
 
   collision:
     enable: true
     floor_margin_mm: 5
-    sample_tol_mm: [30, 30, 30]
+    sample_tol_mm: [30, 30, 20]
     path_samples: 12
     validate_tol_mm: 5.0
     validate_tol_deg: 1.5
@@ -231,7 +245,7 @@ acquisition:
   viz:
     enable: true
     prelude_s: 5.0
-    target_tol_mm: [30, 30, 30]
+    target_tol_mm: [30, 30, 20]
     poll_hz: 20
     frustum_len_m: 0.025
     memory_limit: "512MB"
@@ -249,7 +263,7 @@ acquisition:
       n_poses: 4
       azimuth_span_deg: 360
       azimuth_start_deg: 0
-      roll_deg: 0
+      roll_deg: 180
       depth: false
 
     - name: mid_oblique
@@ -258,7 +272,7 @@ acquisition:
       n_poses: 6
       azimuth_span_deg: 360
       azimuth_start_deg: 20
-      roll_deg: 0
+      roll_deg: 180
       depth: false
 
     - name: close_frontal
@@ -267,7 +281,7 @@ acquisition:
       n_poses: 15
       azimuth_span_deg: 360
       azimuth_start_deg: 0
-      roll_deg: 0
+      roll_deg: 180
       depth: false
 
 
@@ -584,11 +598,11 @@ validation:
   model_label: null                 # name in the summary; null = backend + variant (mast3r-sfm)
   vision:
     source: mesh                    # mesh = surface_mesh.ply (what registration uses) | cloud
-    primary: icp                    # frame | kabsch | icp: the alignment of the summary
+    primary: frame                    # frame | kabsch | icp: the alignment of the summary
     sample_spacing_mm: 0.25         # surface sampling step of STL and reconstruction
     roi_margin_mm: 5.0              # around the phantom (XY box of the STL above the markers)
     occluder_margin_mm: 20.0        # STL around the box that can hide it from the cameras
-    icp: {enabled: true, max_corr_mm: 2.0, iters: 50}
+    icp: {enabled: true, max_corr_mm: 2.0, iters: 50, max_slope_deg: 60}   # ICP only where less steep (null = all)
     thresholds_mm: [1.0, 2.0]       # "% of points within"
     height_bin_mm: 2.0              # error vs height above the marker plane
     visibility_tol_mm: 1.0
@@ -598,7 +612,7 @@ validation:
     fiducials:                      # per-bersaglio error: the holes of the STL found in the photos
       enabled: true
       polarity: bright              # bright = bersaglio lighter than the phantom (white on black) | dark
-      search_radius_mm: 2.0         # around the expected position (bersagli are >= 4 mm apart)
+      search_radius_mm: 3.0         # around the expected position; at most 45% of the spacing between bersagli
       max_view_angle_deg: 60        # views within this angle of the hole axis
       min_contrast: 20              # spot peak - background, grey levels 0-255
       outlier_mm: 1.0               # views farther than this from the median are dropped
