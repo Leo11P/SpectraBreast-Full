@@ -56,7 +56,7 @@ def valid_joints(q):
 class RobotIO(ac.RobotIO):  # serve per comunicare con il robot e deriva da acquire.py
     """Riusa i metodi originali, ma abilita il robot solo prima del moto."""
     def __init__(self, ip):     # ip è l'indirizzo del controller del robot.
-        from fairino_sdk import Robot
+        from fairino import Robot
         self.rpc = Robot.RPC(ip)         # [ORIGINALE] stessa connessione, self.rpc è il nome con cui il programma conserva il collegamento al robot.
         # Non chiamiamo il costruttore originale: abilitava subito il robot e
         # forzava is_connect=True. Qui una connessione difettosa deve fallire.
@@ -157,7 +157,7 @@ def arc_camera_poses(T_start, center, up):
 
     Ruota sia posizione sia orientamento iniziale, senza un ripuntamento iniziale.
     Se inizialmente il campione e centrato, resta nella stessa direzione nelle
-    pose desiderate. Non e una garanzia sul tratto MoveJ fra queste pose.
+    pose desiderate. Non e' una garanzia sul tratto MoveJ fra queste pose.
     """
     center = np.asarray(center, float)
     offset = T_start[:3, 3] - center
