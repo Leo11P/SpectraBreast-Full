@@ -24,9 +24,11 @@
 #     RESULTS/<dd-mm-yyyy>/<sample>/registration/
 #     RESULTS/<dd-mm-yyyy>/_batch/batch_summary.xlsx
 #
-#   Camera calibration (`spectra calibrate`, robot PC) — fixed layout.
+#   Camera calibration (`spectra calibrate`, robot PC) — fixed layout, one
+#   folder per camera (acquisition.camera.type).
 #
-#     DATA/camera_calibration/
+#     DATA/camera_calibration/               RealSense
+#     DATA/camera_calibration_gc1020c/       Prosilica GC1020C
 #       input/{calibration,validation}/      imgXXXX.png + posaXXXX.txt
 #       output/{calibration,intrinsics,validation}/
 #
@@ -108,11 +110,15 @@ mufasa:
   wait: true                         # wait for the job to finish ...
   poll_s: 20
   pull_results: true                 # ... and download pull_patterns:
+  detach_pull: true                  # download in a background process: closing the terminal does not stop it (needs ssh_key_path)
   pull_patterns:                     # relative to RESULTS/<dd-mm-yyyy>/<sample>/
     - "registration/*.xlsx"          # error / timing reports
     - "registration/*.rrd"           # spectral point cloud for Rerun (registration.rerun)
     - "registration/*.rbl"           # its layout
     - "validation/vision/*"          # spectra validate: metrics, error map, Rerun
+    - "validation/registration/*"    # phase 2: metrics, overlay + the registration Excel reports
+    - "validation/timing/*"          # timing of the whole run (always downloaded)
+    - "vision/*"
 
 
 
@@ -151,38 +157,68 @@ acquisition:
     euler_order: ZYX
 
   camera:
-    width: 1280
-    height: 800
-    fps: 10
+    # Camera on the flange, one at a time: realsense (D456) | gc1020c (Prosilica
+    # GC1020C, through Vimba X). Each camera has its own intrinsics, hand-eye and
+    # collision box (its block below) and its own `spectra calibrate` data:
+    #   realsense -> DATA/camera_calibration/
+    #   gc1020c   -> DATA/camera_calibration_gc1020c/
+    # Keys at this level are shared; the same key in the selected block wins.
+    type: realsense
     n_avg_frames: 5
-    # Intrinsics used for solvePnP and saved into camera_parameters/.
-    #   null (default): RealSense factory intrinsics of the running color stream
-    #                   (always matching width/height).
-    #   override      : a JSON with K and D, e.g. the output of
-    #                   `spectra calibrate --modality intrinsics`:
-    #                   DATA/camera_calibration/output/intrinsics/intrinsics_opencv.json
-    #                   Relative to the cwd. Aborts if it is >5% off the factory
-    #                   values (other resolution).
-    intrinsics: null
-    # MASTER depth: abilita lo STREAM depth della RealSense (allineato al color).
-    # Ogni layer decide col proprio 'depth:' se salvare la mappa depth.
-    depth: true
 
-  hand_eye:
-    # T_cam2gripper 4x4 (rotation + translation in mm).
-    #   null      : the output of `spectra calibrate`,
-    #               DATA/camera_calibration/output/calibration/cam2gripper.txt
-    #   4x4 list  : used as written (e.g. to pin an older calibration)
-    T_cam2gripper: null
+    realsense:
+      width: 1280
+      height: 800
+      fps: 10
+      # Intrinsics used for solvePnP and saved into camera_parameters/.
+      #   null (default): RealSense factory intrinsics of the running color stream
+      #                   (always matching width/height).
+      #   override      : a JSON with K and D, e.g. the output of
+      #                   `spectra calibrate --modality intrinsics`:
+      #                   DATA/camera_calibration/output/intrinsics/intrinsics_opencv.json
+      #                   Relative to the cwd. Aborts if it is >5% off the factory
+      #                   values (other resolution).
+      intrinsics: null
+      # MASTER depth: abilita lo STREAM depth della RealSense (allineato al color).
+      # Ogni layer decide col proprio 'depth:' se salvare la mappa depth.
+      depth: true
+      # T_cam2gripper 4x4 (rotation + translation in mm).
+      #   null      : the output of `spectra calibrate`,
+      #               DATA/camera_calibration/output/calibration/cam2gripper.txt
+      #   4x4 list  : used as written (e.g. to pin an older calibration)
+      T_cam2gripper: null
+      # Ingombro fisico camera+adattatore (RealSense D456 + staffa): collisioni + viz.
+      camera_box:
+        length_mm: 124.0
+        width_mm: 26.0
+        height_mm: 29.0
+        support_extension_mm: 70.0
+        collision_margin_mm: 5.0
 
-
-  camera_box:
-    # Ingombro fisico camera+adattatore (RealSense D456 + staffa): collisioni + viz.
-    length_mm: 124.0
-    width_mm: 26.0
-    height_mm: 29.0
-    support_extension_mm: 70.0
-    collision_margin_mm: 5.0
+    gc1020c:
+      # Prosilica GC1020C (GigE Vision). Needs Vimba X on the robot PC and the PC's
+      # network adapter on the camera's subnet (README §1.7). Only one program at a
+      # time can stream from it: close Vimba X Viewer / arv-viewer first.
+      id: null               # IP (e.g. "192.168.1.121") or Vimba X camera ID; null = the only camera
+      width: 1024
+      height: 768
+      exposure_us: null      # null = auto exposure; a number = manual, in microseconds
+      gain_db: null          # null = auto gain; a number = manual, in dB
+      white_balance_auto: true
+      packet_size: null      # bytes; null = negotiated by Vimba X, 1500 on a USB-Ethernet adapter
+      pixel_format: null     # null = BGR8/RGB8 from the camera, else Bayer debayered on the PC
+      # No factory intrinsics. null = the OpenCV calibration of this camera,
+      # DATA/camera_calibration_gc1020c/output/intrinsics/intrinsics_opencv.json
+      # (`spectra calibrate --modality intrinsics`); or a JSON path with K and D.
+      intrinsics: null
+      # null = DATA/camera_calibration_gc1020c/output/calibration/cam2gripper.txt
+      T_cam2gripper: null
+      # Camera + lens + bracket envelope, in the camera frame (collisions + viz):
+      # length_mm along the image x axis, width_mm along y, height_mm along the
+      # optical axis centred on the camera origin, support_extension_mm behind it
+      # towards the flange, collision_margin_mm added on every side. TO MEASURE:
+      # acquisition and dry-run refuse to start while it is null.
+      camera_box: null
 
   target:
     n_bootstrap_frames: 8      # frame aggregati (mediana per-marker) nel bootstrap
@@ -221,7 +257,7 @@ acquisition:
     enable: true
     pixel_tol: 40
     max_iters: 5
-    vel: 15
+    vel: 40
     min_markers: 2
     damping: 0.6               # fraction of the re-pointing rotation applied per iteration
     max_joint_step_deg: 20     # a correction needing more on a joint (posture flip) is not done
@@ -263,25 +299,25 @@ acquisition:
       n_poses: 4
       azimuth_span_deg: 360
       azimuth_start_deg: 0
-      roll_deg: 180
+      roll_deg: 0
       depth: false
 
     - name: mid_oblique
-      distance_mm: 120
-      tilt_deg: 40
-      n_poses: 6
+      distance_mm: 130
+      tilt_deg: 35
+      n_poses: 8
       azimuth_span_deg: 360
-      azimuth_start_deg: 20
-      roll_deg: 180
+      azimuth_start_deg: 0
+      roll_deg: 0
       depth: false
 
     - name: close_frontal
-      distance_mm: 100
-      tilt_deg: 60
+      distance_mm: 120
+      tilt_deg: 50
       n_poses: 15
       azimuth_span_deg: 360
       azimuth_start_deg: 0
-      roll_deg: 180
+      roll_deg: 0
       depth: false
 
 
@@ -289,11 +325,12 @@ acquisition:
 # =============================================================================
 # CALIBRATION (hand-eye camera -> flange + intrinsics, drag-mode views)
 # =============================================================================
-# `spectra calibrate` on the robot PC. Robot (ip, tool, euler_order) and camera
-# stream (width, height, fps, n_avg_frames) come from `acquisition.robot` /
-# `acquisition.camera`, so they are not repeated here. Data in
-# DATA/camera_calibration/ (layout at the top of this file). The active tool on
-# the controller must be acquisition.robot.tool (0 = bare flange).
+# `spectra calibrate` on the robot PC, for the camera of acquisition.camera.type.
+# Robot (ip, tool, euler_order) and camera (width, height, fps, n_avg_frames, ...)
+# come from `acquisition.robot` / `acquisition.camera`, so they are not repeated
+# here. Data in DATA/camera_calibration/ (RealSense) or
+# DATA/camera_calibration_<type>/ (layout at the top of this file). The active
+# tool on the controller must be acquisition.robot.tool (0 = bare flange).
 calibration:
   board:
     chessboard_size: [7, 4]      # INNER corners (columns, rows)
@@ -301,7 +338,8 @@ calibration:
 
   # K, D used by BOTH hand-eye and validation:
   #   realsense -> input/calibration/intrinsics_realsense.json (factory values,
-  #                written by the calibration acquisition, else read from the camera)
+  #                written by the calibration acquisition, else read from the camera;
+  #                RealSense only)
   #   opencv    -> output/intrinsics/intrinsics_opencv.json (`--modality intrinsics`)
   #   file      -> any JSON {"K": 3x3, "D": [[k1,k2,p1,p2,k3]]} given in `file`
   intrinsics:
@@ -323,7 +361,8 @@ calibration:
   validation:
     save_overlay: true           # observed (green) vs predicted (red) corners
 
-  # Colour sensor during the calibration views only.
+  # Colour sensor during the calibration views only. RealSense only: the GC1020C
+  # uses its acquisition.camera.gc1020c settings in the calibration views too.
   camera:
     frame_timeout_ms: 10000
     auto_exposure: false         # false = manual exposure/gain (stable corners between frames)
@@ -367,7 +406,7 @@ vision:
     # PHYSICAL marker edge length in MILLIMETRES. Single source of truth for
     # the whole pipeline (acquisition bootstrap/servo included) — this sets the metric scale of the reconstruction,
     # and registration inherits it. Measure it properly.
-    marker_edge_length_mm:  9.97
+    marker_edge_length_mm:  7.4 #9.6
     # Output frame: markers at z = 0, +Z towards the cameras, right-handed,
     # metres. Origin = centroid of the corners of `frame_marker_ids`; +X from
     # the centre of x_axis_marker_ids[0] to that of x_axis_marker_ids[1]
@@ -378,6 +417,15 @@ vision:
     min_views_per_marker:   2
     align_to_aruco:         true
     max_sim3_scale_deviation_when_poses_known: 0.05
+    # Metric scale (sfm; with the robot poses the frame is already metric and
+    # this is only checked):
+    #   markers = from the edge of each marker (marker_edge_length_mm, ~10 mm)
+    #   centers = from the distances between the marker centres, fitted on the
+    #             cassette table (~50 mm baselines, independent of the edge).
+    #             The markers are then the scale reference: their residual in
+    #             the validation is no longer an independent check.
+    scale_from:             centers
+    centers_table:          null      # null -> DATA/validation/<validation.fixture_table>
     detection_draw_scale:   2.0
     bundle_adjustment:      false
     ba_max_iters:           1000
@@ -415,6 +463,16 @@ vision:
     sfm_min_conf_thr: 1.5
     sfm_clean_depth: true
     image_size: 512
+    # MASt3R input zoom: MASt3R gets the central 1/zoom of every image (the same
+    # window for all, resized to image_size) -> zoom x more pixels on the sample,
+    # same network size and time. 1 = whole image (off); a number >= 1; auto =
+    # the largest zoom (<= zoom_max) that keeps every detected ArUco corner,
+    # with zoom_margin, in the window. ArUco detection and colours use the whole
+    # images, outputs stay in the original pixels; the crops MASt3R saw are in
+    # <run>/inputs_mast3r_zoom/.
+    zoom:          auto
+    zoom_max:      2.5     # 2.5 = 1 network pixel per image pixel (1280-px images, image_size 512)
+    zoom_margin:   0.9     # window half-size >= (1 + margin) x the farthest marker corner from the centre
     neighbor_window: 2
     desc_conf_thr: 0.1
     dense_conf_thr: 12.0
@@ -476,10 +534,17 @@ registration:
   #   sweep  : one run per (res_reg, res_pc) pair, best pair kept
   mode: "sweep"
 
+  # What the HSI is registered on (the homography is the same; what changes
+  # is the 3D surface the pixels are lifted onto):
+  #   mesh  : surface_mesh.ply — height field, holes filled + smoothed
+  #   cloud : cloud.ply — fused cloud as is; median Z per render pixel,
+  #           pixels with no point stay empty
+  source: "mesh"
+
   # null → derived from sample_name + results_date:
   #   hsi_hdr      = DATA/input_registration/<sample>/<sample>_raw.hdr
   #   liveview_png = DATA/input_registration/<sample>/<sample>_raw.png  (ROI only)
-  #   mesh         = RESULTS/<dd-mm-yyyy>/<sample>/vision/surface_mesh.ply
+  #   mesh         = RESULTS/<dd-mm-yyyy>/<sample>/vision/surface_mesh.ply  (cloud.ply with source: cloud)
   #   aruco_json   = RESULTS/<dd-mm-yyyy>/<sample>/vision/aruco_markers_3d.json
   #   output_dir   = RESULTS/<dd-mm-yyyy>/<sample>/registration
   #
@@ -588,18 +653,18 @@ registration:
 validation:
   fixture_table: "Tabella_marker_cassetta.xlsx"
   phantoms:                         # name -> STL (+ optional roi_mm: [xmin, xmax, ymin, ymax], CAD)
-    T1: {stl: "Target1+Cassetta.stl"}
-    T2: {stl: "Target2+Cassetta.stl"}
-    T3: {stl: "Target3+Cassetta.stl"}
-    T4: {stl: "Target4+Cassetta.stl"}
-    T5: {stl: "Target5+Cassetta.stl"}
+    T1: {stl: "Target1+Cassetta (3mm).stl"}
+    T2: {stl: "Target2+Cassetta (3mm).stl"}
+    T3: {stl: "Target3+Cassetta (3mm).stl"}
+    T4: {stl: "Target4+Cassetta (3mm).stl"}
+    T5: {stl: "Target5+Cassetta (3mm).stl"}
   cases: {}                         # sample -> phantom, for samples not named as sample_pattern
   sample_pattern: '^(?P<phantom>[^_]+)_(?P<pose>[^_]+)_(?P<rep>[^_]+)$'
   model_label: null                 # name in the summary; null = backend + variant (mast3r-sfm)
   vision:
-    source: mesh                    # mesh = surface_mesh.ply (what registration uses) | cloud
-    primary: frame                    # frame | kabsch | icp: the alignment of the summary
-    sample_spacing_mm: 0.25         # surface sampling step of STL and reconstruction
+    source: cloud                    # mesh = surface_mesh.ply (what registration uses) | cloud
+    primary: frame                  # frame | kabsch | icp: the alignment of the summary
+    sample_spacing_mm: 0.10         # surface sampling step of STL and reconstruction
     roi_margin_mm: 5.0              # around the phantom (XY box of the STL above the markers)
     occluder_margin_mm: 20.0        # STL around the box that can hide it from the cameras
     icp: {enabled: true, max_corr_mm: 2.0, iters: 50, max_slope_deg: 60}   # ICP only where less steep (null = all)
@@ -612,9 +677,14 @@ validation:
     fiducials:                      # per-bersaglio error: the holes of the STL found in the photos
       enabled: true
       polarity: bright              # bright = bersaglio lighter than the phantom (white on black) | dark
-      search_radius_mm: 3.0         # around the expected position; at most 45% of the spacing between bersagli
+      search_radius_mm: 6.0         # around the expected position; at most 45% of the spacing between bersagli
       max_view_angle_deg: 60        # views within this angle of the hole axis
       min_contrast: 20              # spot peak - background, grey levels 0-255
       outlier_mm: 1.0               # views farther than this from the median are dropped
       min_views: 2
       save_sheet: true              # fiducials.png: photo crops around each bersaglio
+  registration:                     # phase 2: HSI -> 3D, leave-one-marker-out vs the markers of vision
+    min_fit_markers: 3              # markers the homography is fitted on, at least
+    lookup: bicubic                 # bicubic | bilinear (3D lookup on the render)
+    thresholds: {reproj_px: 2.0, tre_mm: 1.5}   # protocol phase 2
+    save_overlay: true              # overlay.png: detected corners (green) vs hold-out predictions (red)

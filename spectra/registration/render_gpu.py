@@ -389,6 +389,14 @@ def render_orthographic_topview_gpu(
     origin_xy   : (xmin, ymin)
     res         : resolution_mm_per_px
     """
+    # Point cloud (registration.source = cloud): binned on the CPU, no ray casting.
+    from .pipeline import PointCloudSurface, render_orthographic_topview_cloud
+    if isinstance(mesh, PointCloudSurface):
+        return render_orthographic_topview_cloud(
+            mesh, resolution_mm_per_px, margin_mm,
+            xmin_override=xmin_override, xmax_override=xmax_override,
+            ymin_override=ymin_override, ymax_override=ymax_override)
+
     # ── Determinazione device ────────────────────────────────────────────────
     want_gpu   = device != 'cpu'   # False solo se esplicitamente 'cpu'
 

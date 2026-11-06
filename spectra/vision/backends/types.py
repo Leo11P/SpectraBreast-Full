@@ -26,6 +26,11 @@ class BackendInputs:
     K_orig_gt: np.ndarray | None = None          # [3, 3], shared intrinsics
     cam2ee: np.ndarray | None = None             # [4, 4], camera-in-EE
     distortion_coeffs: np.ndarray | None = None  # [5], distortion (unused today)
+    # vision.mast3r.zoom: MASt3R gets this window of every image instead of the
+    # whole of it — (x0, y0, w, h) in original pixels, the same for every image
+    # — read from these files (crops of image_paths).
+    network_crop: tuple | None = None
+    network_image_paths: List[Path] | None = None
 
 
 @dataclass

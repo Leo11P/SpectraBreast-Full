@@ -199,9 +199,9 @@ class PipelineViz:
             vc = yaml.safe_load(f) or {}
         CB = dict(vc.get("camera_box", {}))
         CB["T_cam2gripper"] = np.array(CB["T_cam2gripper"], dtype=float)
-        print("[viz] warning: 'camera_box:' missing in default.yaml[acquisition], using "
-              f"{cfg_path} (add 'camera_box:' to default.yaml[acquisition] to remove "
-              "this dependency)")
+        print("[viz] warning: 'camera_box:' missing in default.yaml "
+              f"(acquisition.camera.<type>.camera_box), using {cfg_path} (add it to "
+              "remove this dependency)")
         return CB
 
     def start(self, centroid_mm):

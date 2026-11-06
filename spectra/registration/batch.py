@@ -6,7 +6,8 @@ For every subdirectory ``<data_root>/input_registration/<sample>/`` that
 satisfies ALL of:
 
 1. ``<sample>_raw.hdr`` exists inside it (the HSI cube).
-2. ``surface_mesh.ply`` exists in the sample's vision run.
+2. ``surface_mesh.ply`` (``cloud.ply`` with ``registration.source: cloud``)
+   exists in the sample's vision run.
 3. ``aruco_markers_3d.json`` exists in the same vision run.
 4. (When ``cfg.batch.roi_mode`` is true) ``<sample>_raw.png`` sits next to
    the ``.hdr``.
@@ -82,6 +83,7 @@ def discover_samples(
     sample_regex: Optional[str] = None,
     results_date: Optional[str] = None,
     marker_edge_length_mm: Optional[float] = None,
+    surface_name: str = "surface_mesh.ply",
 ) -> list[dict]:
     """Return one dict per ready-to-run sample under ``data_root``.
 
@@ -125,14 +127,14 @@ def discover_samples(
         vision_dir, is_fallback = find_vision_dir(results_root, sample, results_date)
         if is_fallback:
             print(f"[batch] WARNING {sample}: no vision run for this date, using {vision_dir}")
-        mesh = vision_dir / "surface_mesh.ply"
+        mesh = vision_dir / surface_name
         aruco = vision_dir / "aruco_markers_3d.json"
 
         missing = []
         if not hdr.is_file():
             missing.append(f"{sample}_raw.hdr")
         if not mesh.is_file():
-            missing.append("vision/surface_mesh.ply")
+            missing.append(f"vision/{surface_name}")
         if not aruco.is_file():
             missing.append("vision/aruco_markers_3d.json")
         if roi_mode and not png.is_file():
@@ -527,7 +529,7 @@ def run_batch(
     Excel goes to ``<results_root>/<results_date>/_batch/batch_summary.xlsx``.
     ``results_date`` defaults to today.
     """
-    from ..orchestrator import batch_summary_dir, today_folder
+    from ..orchestrator import batch_summary_dir, registration_surface_name, today_folder
 
     results_date = results_date or today_folder()
     roi_mode = bool(cfg.batch.roi_mode)
@@ -546,6 +548,7 @@ def run_batch(
         sample_regex=cfg.batch.sample_regex,
         results_date=results_date,
         marker_edge_length_mm=cfg.detection.marker_edge_length_mm,
+        surface_name=registration_surface_name(cfg.source),
     )
     if not pairs:
         print("\n[batch] No ready samples found. Exiting.")

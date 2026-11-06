@@ -29,6 +29,10 @@ import numpy as np
 
 from ..config import RegistrationConfig
 from .pipeline import load_mesh
+
+#: Sub-phases of the last run_sweep ([{name, seconds}]), read by the timing
+#: of the run (spectra/timing.py via the orchestrator).
+LAST_TIMINGS: list[dict] = []
 from .pipeline_roi import run_full_pipeline_roi
 from .runner import read_vision_timings
 
@@ -538,6 +542,15 @@ def run_sweep(
         rows.append(row)
         print(f"\n[sweep] Progress: {i + 1}/{len(pairs)} done.\n")
 
+    LAST_TIMINGS.clear()
+    if render_times:
+        LAST_TIMINGS.append({"name": f"renders ({len(render_times)} resolutions)",
+                             "seconds": float(sum(render_times.values()))})
+    for r_ in rows:
+        LAST_TIMINGS.append({"name": f"pair reg {r_['res_reg_mm_pix']} / pc {r_['res_pc_mm_pix']} "
+                                     f"(registration + export)",
+                             "seconds": float(r_.get("pipeline_s") or 0.0)})
+    t_best = time.time()
     best_idx, best_val = _find_best_row(rows)
     if best_idx >= 0:
         br = rows[best_idx]
@@ -562,6 +575,9 @@ def run_sweep(
                 print(f"[sweep] ERROR re-running best pair: {e}")
                 traceback.print_exc()
 
+    if best_idx >= 0 and do_best_rerun:
+        LAST_TIMINGS.append({"name": "best pair re-run (point cloud + Rerun)",
+                             "seconds": time.time() - t_best})
     try:
         shutil.rmtree(sweep_tmp)
         print(f"[sweep] Removed temp dir: {sweep_tmp}")

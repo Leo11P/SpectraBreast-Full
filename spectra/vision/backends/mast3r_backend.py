@@ -85,15 +85,22 @@ class ImageGeometry:
         )
 
 
-def _compute_image_geometry(image: torch.Tensor, image_size: int, patch_size: int, square_ok: bool = False) -> ImageGeometry:
+def _compute_image_geometry(image: torch.Tensor, image_size: int, patch_size: int, square_ok: bool = False,
+                            crop=None) -> ImageGeometry:
+    """Original image -> MASt3R input, as dust3r's load_images does it (long side
+    resized to image_size, centre crop to a multiple of patch_size). ``crop`` =
+    (x0, y0, w, h): MASt3R gets that window of the image (vision.mast3r.zoom)
+    instead of the whole of it; the geometry still refers to the WHOLE original
+    image (its pixels, its intrinsics)."""
     H0, W0 = int(image.shape[1]), int(image.shape[2])
+    x0, y0, Wc, Hc = (0, 0, W0, H0) if crop is None else tuple(int(c) for c in crop)
     if image_size == 224:
         raise ValueError("MASt3R backend expects image_size != 224 so crop is trackable exactly.")
 
-    long_edge = max(W0, H0)
+    long_edge = max(Wc, Hc)
     scale = image_size / float(long_edge)
-    resized_width = int(round(W0 * scale))
-    resized_height = int(round(H0 * scale))
+    resized_width = int(round(Wc * scale))
+    resized_height = int(round(Hc * scale))
 
     cx = resized_width // 2
     cy = resized_height // 2
@@ -102,20 +109,23 @@ def _compute_image_geometry(image: torch.Tensor, image_size: int, patch_size: in
     if (not square_ok) and resized_width == resized_height:
         halfh = 3 * halfw / 4
 
-    crop_left = float(cx - halfw)
-    crop_top = float(cy - halfh)
     network_width = int(round(2 * halfw))
     network_height = int(round(2 * halfh))
+    scale_x = resized_width / float(Wc)
+    scale_y = resized_height / float(Hc)
+    # the window offset, at the network scale, adds to the centre crop
+    crop_left = float(cx - halfw) + x0 * scale_x
+    crop_top = float(cy - halfh) + y0 * scale_y
 
     return ImageGeometry(
         original_height=H0,
         original_width=W0,
-        resized_height=resized_height,
-        resized_width=resized_width,
+        resized_height=int(round(H0 * scale_y)),   # the whole image at the network scale
+        resized_width=int(round(W0 * scale_x)),
         network_height=network_height,
         network_width=network_width,
-        scale_x=resized_width / float(W0),
-        scale_y=resized_height / float(H0),
+        scale_x=scale_x,
+        scale_y=scale_y,
         crop_left=crop_left,
         crop_top=crop_top,
     )
@@ -589,7 +599,9 @@ def _run_mast3r_sfm(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReco
         raise RuntimeError("MASt3R-SfM backend needs at least two images.")
 
     mcfg: Mast3rConfig = cfg.mast3r
-    filelist = [str(path) for path in image_paths]
+    # MASt3R reads the zoom crops when vision.mast3r.zoom is on; colours and
+    # geometry refer to the whole images.
+    filelist = [str(path) for path in (inputs.network_image_paths or image_paths)]
     orig_images = [_read_image_rgb_with_exif(path) for path in image_paths]  # [3, H, W] uint8
 
     model = AsymmetricMASt3R.from_pretrained(mcfg.model_name).to(device)
@@ -597,7 +609,8 @@ def _run_mast3r_sfm(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReco
     patch_size = int(getattr(model, "patch_size", 16))
     imgs_mast3r = load_images(filelist, size=mcfg.image_size, verbose=True, patch_size=patch_size)
     geometries = [
-        _compute_image_geometry(image, image_size=mcfg.image_size, patch_size=patch_size, square_ok=False)
+        _compute_image_geometry(image, image_size=mcfg.image_size, patch_size=patch_size, square_ok=False,
+                                crop=inputs.network_crop)
         for image in orig_images
     ]
 
@@ -795,10 +808,13 @@ def run_mast3r(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReconstru
     model.eval()
     patch_size = int(getattr(model, "patch_size", 16))
 
-    filelist = [str(path) for path in image_paths]
+    # MASt3R reads the zoom crops when vision.mast3r.zoom is on; colours and
+    # geometry refer to the whole images.
+    filelist = [str(path) for path in (inputs.network_image_paths or image_paths)]
     imgs_mast3r = load_images(filelist, size=mcfg.image_size, verbose=True, patch_size=patch_size)
     geometries = [
-        _compute_image_geometry(image, image_size=mcfg.image_size, patch_size=patch_size, square_ok=False)
+        _compute_image_geometry(image, image_size=mcfg.image_size, patch_size=patch_size, square_ok=False,
+                                crop=inputs.network_crop)
         for image in orig_images
     ]
     K_network = (

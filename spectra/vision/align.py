@@ -83,6 +83,9 @@ class ArucoAlignment:
     warnings: List[str] = field(default_factory=list)
     # How origin and axes were defined (written to reconstruction_metadata.json).
     frame_info: Dict[str, Any] = field(default_factory=dict)
+    # How the scale was set: scale_from ('markers' | 'centers') and, for
+    # 'centers', the fit on the table (written to reconstruction_metadata.json).
+    scale_info: Dict[str, Any] = field(default_factory=dict)
     # Populated when `align_with_aruco(..., use_bundle_adjustment=True)`. When
     # present, the pipeline should apply ``bundle_adjustment.delta_T_per_view``
     # + ``bundle_adjustment.scale_m_per_backend`` to the back-end's per-view
@@ -315,6 +318,60 @@ def estimate_metric_scale(
     return med, mad
 
 
+def _similarity(a: np.ndarray, b: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    """Least-squares similarity (Umeyama) ``b ~ s * R @ a + t`` -> (s, R, t)."""
+    ma, mb = a.mean(axis=0), b.mean(axis=0)
+    a0, b0 = a - ma, b - mb
+    U, S, Vt = np.linalg.svd(b0.T @ a0 / len(a))
+    D = np.eye(3)
+    D[2, 2] = np.sign(np.linalg.det(U @ Vt))
+    R = U @ D @ Vt
+    s = float(np.trace(np.diag(S) @ D) / (a0 ** 2).sum(axis=1).mean())
+    return s, R, mb - s * R @ ma
+
+
+def scale_from_centers(
+    markers: Mapping[int, MarkerTriangulation],
+    table_centers_m: Mapping[int, np.ndarray],
+    min_markers: int = 4,
+) -> Dict[str, Any]:
+    """Metric scale from the distances between the marker centres.
+
+    Similarity of the reconstructed centres (mean of the 4 corners) onto the
+    centres of the cassette table (metres): ``scale`` is such that
+    ``x_metric = scale * x_input``. Baselines of ~50 mm instead of the ~10 mm
+    edge of one marker, and independent of the edge length (the centre of a
+    square does not depend on its size).
+
+    Also returned: the residual of each centre after the fit and the scale
+    with each marker left out (its spread tells how much one marker weighs).
+    Raises ValueError with fewer than ``min_markers`` markers of the table or
+    with (nearly) collinear centres.
+    """
+    ids = sorted(int(i) for i in markers if int(i) in table_centers_m)
+    if len(ids) < min_markers:
+        raise ValueError(f"{len(ids)} reconstructed markers are in the table ({ids}), "
+                         f"at least {min_markers} are needed")
+    a = np.array([np.asarray(markers[i].corners_3d, dtype=np.float64).reshape(4, 3).mean(axis=0)
+                  for i in ids])
+    b = np.array([np.asarray(table_centers_m[i], dtype=np.float64).reshape(3) for i in ids])
+    sv = np.linalg.svd(b - b.mean(axis=0), compute_uv=False)
+    if sv[1] < 0.2 * sv[0]:
+        raise ValueError(f"the centres of markers {ids} are nearly collinear")
+    s, R, t = _similarity(a, b)
+    res = np.linalg.norm((s * (R @ a.T)).T + t - b, axis=1)
+    loo = [_similarity(np.delete(a, k, axis=0), np.delete(b, k, axis=0))[0] for k in range(len(ids))]
+    return {
+        "scale": s,
+        "marker_ids": ids,
+        "residual_rms_m": float(np.sqrt(np.mean(res ** 2))),
+        "residual_max_m": float(res.max()),
+        "residual_per_marker_m": {str(i): float(r) for i, r in zip(ids, res)},
+        "leave_one_out_scales": [float(x) for x in loo],
+        "leave_one_out_spread": float((max(loo) - min(loo)) / s),
+    }
+
+
 def fit_marker_plane(
     markers: Mapping[int, MarkerTriangulation],
     *,
@@ -527,6 +584,8 @@ def align_with_aruco(
     ba_options: Mapping[str, Any] | None = None,
     frame_marker_ids: Sequence[int] | None = None,
     x_axis_marker_ids: Sequence[int] | None = None,
+    scale_from: str = "markers",
+    table_centers_m: Mapping[int, np.ndarray] | None = None,
 ) -> ArucoAlignment:
     """One-call convenience: triangulate (or jointly BA) + fit plane + build Sim3.
 
@@ -545,6 +604,12 @@ def align_with_aruco(
     If ``enforce_metric_scale`` is False, the returned Sim3 uses scale=1 and
     only rotates/translates — useful when the input frame is already metric
     (e.g. right after BA, which always produces metric output).
+
+    ``scale_from``: ``"markers"`` = scale from the marker edge (above);
+    ``"centers"`` = from the distances between the marker centres, fitted on
+    ``table_centers_m`` ({id: centre in metres}, :func:`scale_from_centers`).
+    After BA (metric from the edge) the centres give the correction to apply.
+    If the fit is not possible the edge is used, with a warning.
 
     The output frame: Z towards the cameras (``T_world_cam_per_view`` gives
     their centres), origin/X from ``frame_marker_ids``/``x_axis_marker_ids``
@@ -632,6 +697,29 @@ def align_with_aruco(
 
         effective_scale = float(scale) if enforce_metric_scale else 1.0
 
+    # 'centers': the scale from the distances between the marker centres
+    # replaces the one from the edge (after BA, which is metric from the edge,
+    # it is the correction to apply). Not applied when the frame is metric.
+    scale_info: Dict[str, Any] = {"scale_from": "markers"}
+    if scale_from == "centers":
+        try:
+            c = scale_from_centers(markers, table_centers_m or {})
+        except ValueError as exc:
+            warnings.append(f"scale from the marker centres not possible ({exc}): "
+                            "the marker edge is used")
+            scale_info["centers_failed"] = str(exc)
+        else:
+            edge_scale = float(scale)                  # 1.0 after BA (already metric)
+            scale_info = {"scale_from": "centers", "edge_scale": edge_scale, **c,
+                          "edge_vs_centers_pct": 100.0 * (edge_scale / c["scale"] - 1.0),
+                          "applied": bool(enforce_metric_scale)}
+            scale = c["scale"]
+            loo = np.asarray(c["leave_one_out_scales"])
+            mad = float(np.median(np.abs(loo - np.median(loo))))
+            effective_scale = float(scale) if enforce_metric_scale else 1.0
+    elif scale_from != "markers":
+        raise ValueError(f"scale_from must be 'markers' or 'centers', got {scale_from!r}")
+
     # Camera centres in the same frame as `markers` (BA refines the cameras).
     T_cams = ba_result.T_world_cam_refined if ba_result is not None else T_world_cam_per_view
     cam_centres = np.asarray(T_cams, dtype=np.float64)[:, :3, 3]
@@ -669,6 +757,7 @@ def align_with_aruco(
         warnings=warnings,
         bundle_adjustment=ba_result,
         frame_info=frame_info,
+        scale_info=scale_info,
     )
 
 

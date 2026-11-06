@@ -33,9 +33,12 @@
 #       run it IS the default config (single source of the marker edge); the
 #       repo's configs/default.yaml on Mufasa is neither read nor modified.
 #    4. sbatch a job script that runs `spectra full` on a GPU node
-#    5. optionally wait, then download only mufasa.pull_patterns (default: the
-#       registration Excel reports + the spectral Rerun recording) into the
-#       local RESULTS/<date>/<sample>/. Everything else stays on Mufasa.
+#    5. download only mufasa.pull_patterns (default: the registration Excel
+#       reports, the spectral Rerun recording, the validation and the timing)
+#       into the local RESULTS/<date>/<sample>/, from a process DETACHED from
+#       the terminal (`--watch`, mufasa.detach_pull): closing the terminal does
+#       not stop it. Log: RESULTS/<date>/<sample>/_job/pull_<jobid>.log.
+#       Everything else stays on Mufasa.
 #
 #  Requires: paramiko, pyyaml   (pip install paramiko pyyaml)
 # =============================================================================
@@ -47,10 +50,13 @@ import datetime as _dt
 import fnmatch
 import getpass
 import hashlib
+import json
 import os
 import posixpath
 import shlex
 import stat
+import subprocess
+import sys
 import time
 
 import yaml
@@ -79,10 +85,23 @@ DEFAULTS = {
     "slurm_bin_dirs": [],
     "partition": "jobs", "qos": "gpuwide", "gres": "gpu:4g.20gb:1",
     "cpus": 8, "mem": "64G", "time": "12:00:00", "job_name": "spectra",
-    "wait": True, "poll_s": 20, "pull_results": True,
+    "wait": True, "poll_s": 20, "pull_results": True, "detach_pull": True,
     "pull_patterns": ["registration/*.xlsx", "registration/*.rrd", "registration/*.rbl",
-                      "validation/vision/*"],
+                      "validation/vision/*", "validation/registration/*", "validation/timing/*"],
 }
+# Always downloaded with the stages' results: the timing of the run (spectra/timing.py).
+ALWAYS_PULL = ("validation/timing/*",)
+
+
+def _timing():
+    """spectra/timing.py, loaded by path (this script runs standalone)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "spectra_timing", os.path.join(os.path.dirname(ROOT), "timing.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # --------------------------------------------------------------------------- #
@@ -179,6 +198,17 @@ def vision_runs(results_root, sample, isfile, listdir, join):
         if _day(name) and all(isfile(join(d, f)) for f in VISION_REQUIRED):
             out[name] = d
     return out
+
+
+def vision_files(full, stages):
+    """Files of a vision run the job reads: + cloud.ply when registration (or
+    its validation) or the vision validation works on the point cloud."""
+    files = VISION_VALIDATION if "validation" in stages else VISION_HANDOFF
+    reg_cloud = (("registration" in stages or "validation" in stages)
+                 and (full.get("registration") or {}).get("source") == "cloud")
+    val_cloud = "validation" in stages and (
+        ((full.get("validation") or {}).get("vision") or {}).get("source") == "cloud")
+    return files + ("cloud.ply",) if (reg_cloud or val_cloud) else files
 
 
 def registration_inputs(full, sample):
@@ -426,7 +456,16 @@ def plan_run(sftp, full, sample, paths, stages, date):
         else:
             raise SystemExit(f"[remote] registration needs input_registration/{sample}/{need}, "
                              "neither on this PC nor on Mufasa")
-    if "validation" in stages:
+    if "validation" in stages and "registration" not in stages:
+        # The registration validation (phase 2) reads the HSI cube: sent when it is
+        # here; without it on Mufasa that modality is skipped, not an error.
+        need = registration_inputs(full, sample)
+        if all(os.path.isfile(os.path.join(paths["registration"], n)) for n in need):
+            syncs.append(("input_registration", paths["registration"], r_reg, None, False))
+    # DATA/validation: the marker table + STL of a validation job, and the
+    # table that vision reads with vision.aruco.scale_from 'centers'.
+    centers = ((full.get("vision") or {}).get("aruco") or {}).get("scale_from") == "centers"
+    if "validation" in stages or ("vision" in stages and centers):
         syncs += validation_sync(sftp, paths)
     if ("registration" in stages or "validation" in stages) and "vision" not in stages:
         # The job takes `date`'s vision run, else the most recent one (pipeline
@@ -440,7 +479,7 @@ def plan_run(sftp, full, sample, paths, stages, date):
         if l_day and (l_day == date or not r_day or (r_day != date and _day(l_day) > _day(r_day))):
             syncs.append(("vision run", loc[l_day],
                           posixpath.join(paths["r_results"], l_day, sample, "vision"),
-                          VISION_VALIDATION if "validation" in stages else VISION_HANDOFF, False))
+                          vision_files(full, stages), False))
         elif r_day:
             print(f"[remote] {' + '.join(s for s in stages if s != 'vision')} uses the "
                   f"vision run on Mufasa: {rem[r_day]}")
@@ -468,12 +507,13 @@ def pull_validation_all(sftp, r_results, local_results, date):
     n = 0
     r_day = posixpath.join(r_results, date)
     for sample in sorted(r_listdir(sftp, r_day)):
-        src = posixpath.join(r_day, sample, "validation", "vision", "metrics.json")
-        if r_isfile(sftp, src):
-            dst = os.path.join(local_results, date, sample, "validation", "vision")
-            os.makedirs(dst, exist_ok=True)
-            sftp.get(src, os.path.join(dst, "metrics.json"))
-            n += 1
+        for modality in ("vision", "registration"):
+            src = posixpath.join(r_day, sample, "validation", modality, "metrics.json")
+            if r_isfile(sftp, src):
+                dst = os.path.join(local_results, date, sample, "validation", modality)
+                os.makedirs(dst, exist_ok=True)
+                sftp.get(src, os.path.join(dst, "metrics.json"))
+                n += 1
     n += pull_selected(sftp, r_results, local_results, ["_validation/*"])
     return n
 
@@ -548,11 +588,18 @@ def preflight(config_path=DEFAULT_CONFIG, overrides=None):
 
 
 def submit(config_path=DEFAULT_CONFIG, *, stages=None, overrides=None,
-           wait=None, pull=None, dry_run=False, extra_args=(), validate_all=False):
+           wait=None, pull=None, dry_run=False, extra_args=(), validate_all=False,
+           new_timing=True):
     """Syncs what `stages` need, submits the SLURM job and (optionally) waits
-    for it and downloads the selected results. Returns (jobid, final_state).
+    for it. The results are downloaded by a DETACHED process (`--watch`), which
+    keeps going if this terminal is closed (mufasa.detach_pull; without an SSH
+    key it cannot log in alone: then they are downloaded here, as before).
+    Returns (jobid, final_state).
     ``validate_all``: one job running `spectra validate --all` on every case
-    whose vision run is on Mufasa (only DATA/validation is synced)."""
+    whose vision run is on Mufasa (only DATA/validation is synced).
+    ``new_timing``: start a new timing record of the sample (False: `spectra
+    full` already started it with the acquisition)."""
+    t_up0 = time.time()
     full, r, sample, paths = load_settings(config_path, overrides)
     if stages is None:
         stages = full.get("stages") or list(COMPUTE_STAGES)
@@ -563,11 +610,26 @@ def submit(config_path=DEFAULT_CONFIG, *, stages=None, overrides=None,
     date = full.get("results_date") or time.strftime(DATE_FORMAT)
     r_sample = posixpath.join(paths["r_results"], date, "_validation" if validate_all else sample)
     job_dir = posixpath.join(r_sample, "_job")
+    local_job = os.path.join(paths["results_root"], date,
+                             "_validation" if validate_all else sample, "_job")
+    tm = _timing()
+    tfile = None if (validate_all or dry_run) else tm.timing_dir(
+        paths["results_root"], date, sample) / tm.LOCAL
+    if tfile is not None and new_timing:
+        tm.reset(tfile, sample=sample, date=date, stages=list(stages))
+    up_subs, t_lap = [], time.time()
+
+    def lap(name):
+        nonlocal t_lap
+        now = time.time()
+        up_subs.append({"name": name, "seconds": now - t_lap})
+        t_lap = now
 
     client = connect(r)
     try:
         sftp = client.open_sftp()
         check_remote_repo(sftp, r)                        # before uploading anything
+        lap("connect + checks")
         if validate_all:
             stages, syncs = ["validation"], validation_sync(sftp, paths)
             print(f"[remote] validate --all on Mufasa (every case with a vision run there) -> "
@@ -587,6 +649,7 @@ def submit(config_path=DEFAULT_CONFIG, *, stages=None, overrides=None,
                   + (f", {'would remove' if dry_run else 'removed'} {len(gone)} stale "
                      f"{gone[:5]}{' ...' if len(gone) > 5 else ''}" if gone else "")
                   + f"  ({rdir})")
+            lap(f"sync {label}: {len(up)} files")
 
         run_config_text = render_run_config(full, sample, paths, stages, local_mm, date)
         if dry_run:
@@ -603,6 +666,7 @@ def submit(config_path=DEFAULT_CONFIG, *, stages=None, overrides=None,
             print("[remote] input_vision verified on Mufasa (SHA256SUMS)")
         elif "vision" in stages:
             print("[remote] warning: no SHA256SUMS, images/poses not checksum-verified")
+        lap("checksum verification on Mufasa")
 
         sftp_makedirs(sftp, job_dir)
         run_config = posixpath.join(job_dir, "run_config.yaml")
@@ -623,44 +687,209 @@ def submit(config_path=DEFAULT_CONFIG, *, stages=None, overrides=None,
             raise SystemExit(f"[remote] sbatch failed:\n{err or out}")
         print(f"[remote] submitted job {jobid} (qos {r['qos']}). "
               f"Log on Mufasa: {job_dir}/slurm-{jobid}.out")
+        lap("job script + sbatch")
+        if tfile is not None:
+            tm.add(tfile, "upload to Mufasa + submit", t_up0, time.time(), where="this PC",
+                   subphases=up_subs)
+        spec = {"config": os.path.abspath(config_path), "overrides": overrides or {},
+                "cwd": os.getcwd(), "jobid": jobid, "stages": list(stages), "date": date,
+                "sample": sample, "validate_all": validate_all, "r_sample": r_sample,
+                "job_dir": job_dir, "local_job": local_job, "pull": bool(pull),
+                "timing": str(tfile) if tfile is not None else None}
+        watcher = spawn_watcher(spec, r) if pull else None
         if not wait:
+            if watcher:
+                print(f"[remote] the results will be downloaded in the background when the "
+                      f"job ends (log: {watcher['log']})")
             return jobid, "SUBMITTED"
 
-        print(f"[remote] waiting for job {jobid} (poll {r['poll_s']}s; Ctrl-C stops "
-              "waiting, the job keeps running on Mufasa)")
-        last, state, unknown = None, "UNKNOWN", 0
-        while True:
-            state = job_state(client, r, jobid)
-            if state != last:
-                print(f"  [{time.strftime('%H:%M:%S')}] {state}", flush=True)
-                last = state
-            # UNKNOWN right after sbatch can be a short accounting delay
-            unknown = unknown + 1 if state == "UNKNOWN" else 0
-            if state in TERMINAL_STATES or unknown >= 3:
-                break
-            time.sleep(int(r["poll_s"]))
-        if state == "UNKNOWN":
-            print(f"[remote] warning: cannot read the state of job {jobid} "
-                  "(check mufasa.slurm_bin_dirs); it may still be running")
+        print(f"[remote] waiting for job {jobid} (poll {r['poll_s']}s; Ctrl-C or closing "
+              "the terminal stops waiting here, the job keeps running on Mufasa"
+              + (" and the results are still downloaded)" if watcher else ")"))
+        state = wait_job(client, r, jobid, verbose=True)
         _, tail, _ = run_cmd(client, r, f"tail -n 30 {job_dir}/slurm-{jobid}.out 2>/dev/null")
         if tail:
             print("--- last lines of the job log ---\n" + tail + "\n---")
         print(f"[remote] results on Mufasa: {r_sample}")
-        if pull and validate_all:
-            n = pull_validation_all(sftp, paths["r_results"], paths["results_root"], date)
-            print(f"[remote] downloaded {n} files (every case's metrics.json of {date} + "
-                  f"RESULTS/_validation/) into {paths['results_root']}")
-        elif pull:
-            # only the stages this job ran: older files of other stages stay there
-            patterns = [p for p in r["pull_patterns"]
-                        if p.split("/")[0] in stages or "/" not in p]
-            local_sample = os.path.join(paths["results_root"], date, sample)
-            n = pull_selected(sftp, r_sample, local_sample, patterns)
-            print(f"[remote] downloaded {n} files into {local_sample} "
-                  f"(mufasa.pull_patterns of {' + '.join(stages)}: {patterns})")
+        if not pull:
+            return jobid, state
+        if watcher:
+            print(f"[remote] download in the background (log: {watcher['log']}) ...")
+            done = wait_marker(watcher["done"], timeout_s=3600)
+            if done:
+                print(f"[remote] downloaded {done.get('n_files', 0)} files into "
+                      f"{done.get('local_dir')}" + (f" ({done['error']})" if done.get("error") else ""))
+            else:
+                print(f"[remote] the download is still running in the background: {watcher['log']}")
+        else:
+            finish(client, sftp, r, spec, state)
         return jobid, state
     finally:
         client.close()
+
+
+def wait_job(client, r, jobid, verbose=False):
+    """Polls the job until it ends; returns its final state."""
+    last, state, unknown = None, "UNKNOWN", 0
+    while True:
+        state = job_state(client, r, jobid)
+        if verbose and state != last:
+            print(f"  [{time.strftime('%H:%M:%S')}] {state}", flush=True)
+            last = state
+        # UNKNOWN right after sbatch can be a short accounting delay
+        unknown = unknown + 1 if state == "UNKNOWN" else 0
+        if state in TERMINAL_STATES or unknown >= 3:
+            break
+        time.sleep(int(r["poll_s"]))
+    if state == "UNKNOWN":
+        print(f"[remote] warning: cannot read the state of job {jobid} "
+              "(check mufasa.slurm_bin_dirs); it may still be running")
+    return state
+
+
+def job_times(client, r, jobid):
+    """(submit, start, end) of the job as epoch seconds (sacct), or None."""
+    _, out, _ = run_cmd(client, r, f"sacct -j {jobid} -n -X -P --format=Submit,Start,End")
+    try:
+        vals = out.splitlines()[0].strip().split("|")
+        return tuple(_dt.datetime.strptime(v, "%Y-%m-%dT%H:%M:%S").timestamp() for v in vals[:3])
+    except Exception:
+        return None
+
+
+def finish(client, sftp, r, spec, state):
+    """After the job: SLURM queue / job times and the download into the timing
+    record, the download itself, timing.xlsx. Returns the number of files."""
+    tm = _timing()
+    paths = load_settings(spec["config"], spec["overrides"])[3]
+    tfile = spec.get("timing")
+    times = job_times(client, r, spec["jobid"]) if tfile and not spec.get("_timed") else None
+    if times:
+        sub, start, end = times
+        tm.add(tfile, "SLURM queue (pending)", sub, start, where="Mufasa")
+        tm.add(tfile, "SLURM job (on Mufasa)", start, end, where="Mufasa", note=state)
+        spec["_timed"] = True             # a retry of the download does not add them again
+    t0 = time.time()
+    date, sample, stages = spec["date"], spec["sample"], spec["stages"]
+    if spec["validate_all"]:
+        n = pull_validation_all(sftp, paths["r_results"], paths["results_root"], date)
+        print(f"[remote] downloaded {n} files (every case's metrics.json of {date} + "
+              f"RESULTS/_validation/) into {paths['results_root']}")
+        local = paths["results_root"]
+    else:
+        # only the stages this job ran (older files of other stages stay
+        # there) + the timing of the run
+        patterns = [p for p in r["pull_patterns"]
+                    if p.split("/")[0] in stages or "/" not in p or p in ALWAYS_PULL]
+        patterns += [p for p in ALWAYS_PULL if p not in patterns]
+        local = os.path.join(paths["results_root"], date, sample)
+        n = pull_selected(sftp, spec["r_sample"], local, patterns)
+        print(f"[remote] downloaded {n} files into {local} "
+              f"(mufasa.pull_patterns of {' + '.join(stages)}: {patterns})")
+    if tfile:
+        tm.add(tfile, "download to this PC", t0, time.time(), where="this PC",
+               subphases=[{"name": f"{n} files", "seconds": time.time() - t0}])
+        try:
+            tm.write_xlsx(os.path.dirname(tfile), sample=sample, date=date)
+        except Exception as exc:
+            print(f"[timing] timing.xlsx not written: {exc}")
+    return n, local
+
+
+# --------------------------------------------------------------------------- #
+# Download in the background (survives the terminal being closed)
+# --------------------------------------------------------------------------- #
+def spawn_watcher(spec, r):
+    """Starts `remote.py --watch <spec>` detached from this terminal: it waits
+    for the job, downloads the results and writes the timing. Returns
+    {log, done} paths, or None (then the caller downloads itself)."""
+    if not r.get("detach_pull", True):
+        return None
+    if not r.get("ssh_key_path"):
+        print("[remote] no mufasa.ssh_key_path: the download cannot run in the background "
+              "(it needs the password), it is done here at the end of the job")
+        return None
+    os.makedirs(spec["local_job"], exist_ok=True)
+    base = os.path.join(spec["local_job"], f"pull_{spec['jobid']}")
+    spec_path, log, done = base + ".json", base + ".log", base + ".done"
+    for p in (done,):
+        if os.path.exists(p):
+            os.remove(p)
+    with open(spec_path, "w", encoding="utf-8") as f:
+        json.dump(spec, f, indent=2, default=str)
+    cmd = [sys.executable, os.path.abspath(__file__), "--watch", spec_path]
+    logf = open(log, "a", encoding="utf-8")
+    kw = dict(cwd=spec["cwd"], stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
+              close_fds=True)
+    try:
+        if os.name == "nt":
+            # no console (closing the terminal does not kill it), own process
+            # group, and out of the job object of `uv run` (which kills its
+            # children when it exits) when that job allows it.
+            flags = 0x00000008 | 0x00000200            # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            try:
+                subprocess.Popen(cmd, creationflags=flags | 0x01000000, **kw)  # | BREAKAWAY_FROM_JOB
+            except OSError:
+                subprocess.Popen(cmd, creationflags=flags, **kw)
+        else:
+            subprocess.Popen(cmd, start_new_session=True, **kw)
+    except Exception as exc:
+        print(f"[remote] background download not started ({exc}): it is done here")
+        return None
+    finally:
+        logf.close()
+    print(f"[remote] background download started for job {spec['jobid']} (log: {log})")
+    return {"log": log, "done": done}
+
+
+def wait_marker(path, timeout_s=3600, poll_s=5):
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        time.sleep(poll_s)
+    return None
+
+
+def watch(spec_path):
+    """Body of the detached process: wait for the job, download, timing.
+    Reconnects if the connection drops (VPN, sleep) while waiting."""
+    with open(spec_path, encoding="utf-8") as f:
+        spec = json.load(f)
+    os.chdir(spec["cwd"])
+    print(f"[watch] {time.strftime('%Y-%m-%d %H:%M:%S')} job {spec['jobid']} ({spec['sample']})",
+          flush=True)
+    r = load_settings(spec["config"], spec["overrides"])[1]
+    done = os.path.join(spec["local_job"], f"pull_{spec['jobid']}.done")
+    result = {"jobid": spec["jobid"], "n_files": 0, "local_dir": None}
+    state, fails = "UNKNOWN", 0
+    while True:
+        try:
+            client = connect(r)
+            try:
+                state = wait_job(client, r, spec["jobid"])
+                print(f"[watch] {time.strftime('%H:%M:%S')} job ended: {state}", flush=True)
+                sftp = client.open_sftp()
+                result["n_files"], result["local_dir"] = finish(client, sftp, r, spec, state)
+            finally:
+                client.close()
+            break
+        except (Exception, SystemExit) as exc:
+            fails += 1
+            print(f"[watch] {time.strftime('%H:%M:%S')} error ({exc}); retry {fails}/60 in 60 s",
+                  flush=True)
+            if fails >= 60:
+                result["error"] = str(exc)
+                break
+            time.sleep(60)
+    result["state"] = state
+    with open(done, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+    print(f"[watch] {time.strftime('%Y-%m-%d %H:%M:%S')} done: {result}", flush=True)
 
 
 def main():
@@ -674,7 +903,12 @@ def main():
     ap.add_argument("--no-pull", action="store_true", help="do not download the results")
     ap.add_argument("--dry-run", action="store_true",
                     help="print what would be uploaded and the run config, send nothing")
+    ap.add_argument("--watch", default=None, metavar="SPEC_JSON",
+                    help=argparse.SUPPRESS)       # the detached download (spawn_watcher)
     args = ap.parse_args()
+    if args.watch:
+        watch(args.watch)
+        return
     submit(args.config, stages=args.stages,
            overrides={"sample_name": args.sample} if args.sample else None,
            wait=False if args.no_wait else None,

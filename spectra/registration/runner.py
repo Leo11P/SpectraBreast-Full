@@ -120,7 +120,8 @@ def _validate_inputs_exist(cfg: RegistrationConfig) -> list[str]:
         # on disk and reports (then skips) the ones that are not ready.
         return errors
 
-    checks = [(p.hsi_hdr, "HSI .hdr"), (p.mesh, "Mesh"), (p.aruco_json, "ArUco JSON")]
+    checks = [(p.hsi_hdr, "HSI .hdr"), (p.mesh, f"Surface ({cfg.source})"),
+              (p.aruco_json, "ArUco JSON")]
     if cfg.mode == "roi" or (cfg.mode == "sweep" and cfg.sweep.roi_mode):
         checks += [(p.liveview_png, "LiveView PNG")]
     for path, label in checks:
@@ -149,7 +150,7 @@ def _print_summary(cfg: RegistrationConfig, sample_name: str) -> None:
     print(f"  Sample        : {sample_name if cfg.mode != 'batch' else '(all discovered)'}")
     if cfg.mode != "batch":
         print(f"  HSI           : {cfg.paths.hsi_hdr}")
-        print(f"  Mesh          : {cfg.paths.mesh}")
+        print(f"  Surface       : {cfg.paths.mesh}  (source: {cfg.source})")
         print(f"  ArUco JSON    : {cfg.paths.aruco_json}")
         if cfg.mode == "roi" or (cfg.mode == "sweep" and cfg.sweep.roi_mode):
             print(f"  LiveView PNG  : {cfg.paths.liveview_png}")
@@ -248,6 +249,7 @@ def run_registration(
     if dry_run:
         if cfg.mode == "batch" and data_root is not None and results_root is not None:
             from .batch import discover_samples
+            from ..orchestrator import registration_surface_name
             discover_samples(
                 data_root=Path(data_root),
                 results_root=Path(results_root),
@@ -255,6 +257,7 @@ def run_registration(
                 sample_regex=cfg.batch.sample_regex,
                 results_date=results_date,
                 marker_edge_length_mm=cfg.detection.marker_edge_length_mm,
+                surface_name=registration_surface_name(cfg.source),
             )
         print("\n[Dry-run] Configuration valid; pipeline NOT executed.")
         return {"dry_run": True}
@@ -289,6 +292,7 @@ def run_registration(
 
     # ----- mode == "sweep" --------------------------------------------------
     if cfg.mode == "sweep":
+        from . import sweep as _sweep
         from .sweep import run_sweep
         xlsx_path = run_sweep(
             cfg=cfg,
@@ -298,7 +302,7 @@ def run_registration(
             sample_name=sample_name,
             render_fn=render_orthographic_topview_gpu if use_gpu_render else None,
         )
-        return {"summary_xlsx": xlsx_path}
+        return {"summary_xlsx": xlsx_path, "_subphases": list(_sweep.LAST_TIMINGS)}
 
     # ----- mode == "single" / "roi" -----------------------------------------
     return _run_single_or_roi(

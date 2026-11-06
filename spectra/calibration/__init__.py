@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Camera calibration for the robot acquisition (Fairino FR5 + RealSense):
-hand-eye (camera -> flange) and intrinsics from chessboard views acquired in
-drag mode, plus out-of-sample validation. CLI: ``spectra calibrate``.
+"""Camera calibration for the robot acquisition (Fairino FR5 + RealSense or
+Prosilica GC1020C): hand-eye (camera -> flange) and intrinsics from chessboard
+views acquired in drag mode, plus out-of-sample validation. CLI: ``spectra calibrate``.
 
-Settings: ``calibration:`` in the unified config (robot and camera stream from
-``acquisition.robot`` / ``acquisition.camera``). Data, fixed layout:
+Settings: ``calibration:`` in the unified config (robot and camera from
+``acquisition.robot`` / ``acquisition.camera``). Data, fixed layout, one folder
+per camera (``camera_calibration_gc1020c/`` for the GC1020C):
 
     <data_root>/camera_calibration/
         input/calibration/    imgXXXX.png + posaXXXX.txt (+ intrinsics_realsense.json)

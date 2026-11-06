@@ -198,6 +198,27 @@ class ArucoConfig(BaseModel):
             "0.05 means '5% tolerance'."
         ),
     )
+    scale_from: Literal["markers", "centers"] = Field(
+        default="markers",
+        description=(
+            "How the metric scale is set when the backend frame is not metric "
+            "(sfm). 'markers': from the edge of each marker "
+            "(marker_edge_length_mm, ~10 mm). 'centers': from the distances "
+            "between the marker centres, fitted on the cassette table "
+            "(centers_table): baselines of ~50 mm, independent of the edge "
+            "length. With the robot poses (dense) the frame is already metric: "
+            "the scale is only computed and checked."
+        ),
+    )
+    centers_table: Optional[Path] = Field(
+        default=None,
+        description=(
+            "Marker table used by scale_from 'centers' (xlsx, sheet 'Marker', "
+            "CAD mm; the same file as validation.fixture_table). null = "
+            "<data_root>/validation/<validation.fixture_table>, filled in from "
+            "the dataset layout."
+        ),
+    )
     detection_draw_scale: float = Field(
         default=2.0,
         gt=0.0,
@@ -364,6 +385,46 @@ class Mast3rConfig(BaseModel):
     sfm_min_conf_thr: float = Field(default=1.5, ge=0.0)
     sfm_clean_depth: bool = Field(default=True)
     image_size: int = Field(default=512, ge=64)
+    zoom: float | Literal["auto"] = Field(
+        default=1.0,
+        description=(
+            "MASt3R input zoom: MASt3R gets the central 1/zoom of every image "
+            "(the same window for all, resized to image_size) instead of the "
+            "whole image: zoom x more pixels on the sample, same network size "
+            "and time. 1 = whole image (off). 'auto' = the largest zoom "
+            "(<= zoom_max) whose window keeps every detected ArUco corner, "
+            "with zoom_margin. ArUco detection and colours use the whole "
+            "images; intrinsics and outputs are in the original pixels."
+        ),
+    )
+    zoom_max: float = Field(
+        default=2.5,
+        ge=1.0,
+        description=(
+            "Upper bound of zoom 'auto'. 2.5 = one network pixel per image "
+            "pixel for 1280-px images at image_size 512: beyond, the window is "
+            "only upsampled."
+        ),
+    )
+    zoom_margin: float = Field(
+        default=0.9,
+        ge=0.0,
+        description=(
+            "Zoom 'auto' (and the check of a fixed zoom): the window half-size "
+            "must be >= (1 + zoom_margin) x the distance of the farthest "
+            "detected marker corner from the image centre. The sample, taller "
+            "than the markers, reaches farther in oblique close views (up to "
+            "~1.9x on the T1 phantom at ~107 mm)."
+        ),
+    )
+
+    @field_validator("zoom")
+    @classmethod
+    def _check_zoom(cls, value):
+        if value != "auto" and float(value) < 1.0:
+            raise ValueError(f"mast3r.zoom must be >= 1 (1 = whole image) or 'auto', got {value!r}")
+        return value
+
     neighbor_window: int = Field(default=2, ge=1)
     desc_conf_thr: float = Field(default=0.1, ge=0.0)
     dense_conf_thr: float = Field(default=12.0, ge=0.0)

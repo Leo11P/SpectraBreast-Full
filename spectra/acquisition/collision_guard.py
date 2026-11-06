@@ -103,8 +103,9 @@ class CollisionGuard:
         self.native_strategy = int(c.get("native_strategy", 2))  # 2=report+stop
         self.floor_per_link_mm = c.get("floor_per_link_mm", {}) or {}
         self.repo_dir = os.path.normpath(c.get("repo_dir", DEFAULT_VIZ_REPO))
-        # camera box: SINGLE source = default.yaml[acquisition] -> camera_box: (fallback to
-        # the rerun-viz project config.yaml only for backward compatibility).
+        # camera box: SINGLE source = default.yaml acquisition.camera.<type>.camera_box,
+        # lifted to cfg['camera_box'] by acquire.load_config (fallback to the rerun-viz
+        # project config.yaml only for backward compatibility).
         self.camera_box_cfg = cfg.get("camera_box") if isinstance(cfg, dict) else None
         self.T_c2g = None if T_c2g is None else np.asarray(T_c2g, float)
         self.euler_order = str(euler_order or "ZYX")
@@ -184,9 +185,9 @@ class CollisionGuard:
         cfg_path = os.path.join(self.repo_dir, "config.yaml")
         with open(cfg_path, encoding="utf-8") as f:
             vc = yaml.safe_load(f) or {}
-        print("[collision] warning: 'camera_box:' missing in default.yaml[acquisition], using "
-              f"{cfg_path} (add 'camera_box:' to default.yaml[acquisition] to remove "
-              "this dependency)")
+        print("[collision] warning: 'camera_box:' missing in default.yaml "
+              f"(acquisition.camera.<type>.camera_box), using {cfg_path} (add it to "
+              "remove this dependency)")
         return dict(vc.get("camera_box", {}))
 
     def set_target(self, centroid_mm):

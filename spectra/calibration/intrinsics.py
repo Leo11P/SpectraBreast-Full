@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""OpenCV intrinsic calibration of the RealSense from the chessboard images in
+"""OpenCV intrinsic calibration of the robot camera from the chessboard images in
 input/calibration. Writes ONLY output/intrinsics/intrinsics_opencv.json (no
 input file is touched). Used when calibration.intrinsics.source is `opencv`.
 """

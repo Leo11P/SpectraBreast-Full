@@ -13,9 +13,13 @@ import glob
 import json
 import math
 import os
+import sys
 
 import cv2 as cv
 import numpy as np
+
+_ACQ_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "acquisition")
 
 CB_FLAGS = (cv.CALIB_CB_ADAPTIVE_THRESH + cv.CALIB_CB_NORMALIZE_IMAGE +
             cv.CALIB_CB_FILTER_QUADS)
@@ -23,25 +27,37 @@ SUBPIX = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
 
 # -------------------------------------------------------------- settings ---
+def cameras_module():
+    """spectra/acquisition/cameras.py, imported flat as acquire.py does (that
+    folder is not a package: robot SDK and collision models live there)."""
+    if _ACQ_DIR not in sys.path:
+        sys.path.insert(0, _ACQ_DIR)
+    import cameras
+    return cameras
+
+
 def settings(ucfg) -> dict:
     """Plain dict used by the calibration modules, from a UnifiedConfig.
 
-    Robot (ip, tool, euler_order) and camera stream (width, height, fps,
-    n_avg_frames) come from `acquisition.robot` / `acquisition.camera`; the
-    rest from `calibration:`. Paths are fixed under
-    <data_root>/camera_calibration/{input,output}/{calibration,validation,intrinsics}.
+    Robot (ip, tool, euler_order) and camera (type, width, height, fps,
+    n_avg_frames, ...) come from `acquisition.robot` / `acquisition.camera`; the
+    rest from `calibration:`. Each camera has its own folder (realsense:
+    camera_calibration/, gc1020c: camera_calibration_gc1020c/), with a fixed layout
+    <data_root>/<folder>/{input,output}/{calibration,validation,intrinsics}.
     """
     if ucfg.calibration is None:
         raise SystemExit("[calibration] `calibration:` section missing in the config")
     cal = ucfg.calibration.model_dump()
     acq = ucfg.acquisition or {}
-    robot, cam = acq.get("robot") or {}, acq.get("camera") or {}
+    cameras = cameras_module()
+    robot, cam = acq.get("robot") or {}, cameras.resolve_camera_cfg(acq.get("camera"))
     euler = str(robot.get("euler_order", "ZYX")).upper()
     if euler not in ("ZYX", "XYZ"):
         raise SystemExit(f"[calibration] acquisition.robot.euler_order is {euler!r}: the "
                          "calibration needs the explicit convention, ZYX or XYZ.")
 
-    root = os.path.abspath(os.path.join(str(ucfg.data_root), "camera_calibration"))
+    root = os.path.abspath(os.path.join(str(ucfg.data_root),
+                                        cameras.calibration_dir_name(cam["type"])))
     paths = {
         "root": root,
         "cal_in": os.path.join(root, "input", "calibration"),
@@ -61,9 +77,12 @@ def settings(ucfg) -> dict:
     cal["hand_eye"]["euler_order"] = euler
     cal["acquisition"].update(robot_ip=robot.get("ip", "192.168.58.2"),
                               expected_tool=int(robot.get("tool", 0)))
-    cal["camera"].update(width=int(cam.get("width", 1280)), height=int(cam.get("height", 800)),
+    cal["camera"].update(type=cam["type"],
+                         width=int(cam.get("width", 1280)), height=int(cam.get("height", 800)),
                          fps=int(cam.get("fps", 15)),
                          n_avg_frames=int(cam.get("n_avg_frames", 5)))
+    # what cameras.open_camera needs (the GC1020C block: id, exposure, ...)
+    cal["camera_cfg"] = dict(cam, frame_timeout_ms=cal["camera"]["frame_timeout_ms"])
     cal["_paths"] = paths
     return cal
 
@@ -184,6 +203,10 @@ def load_intrinsics(cfg):
     are used for calibration AND validation."""
     P = cfg["_paths"]
     source = cfg["intrinsics"]["source"]
+    if source == "realsense" and cfg["camera"]["type"] != "realsense":
+        raise SystemExit(f"calibration.intrinsics.source is realsense but the camera is "
+                         f"{cfg['camera']['type']}: use opencv (`spectra calibrate --modality "
+                         "intrinsics`) or file.")
     if source == "realsense":
         path = P["intr_realsense"]
         if not os.path.exists(path):

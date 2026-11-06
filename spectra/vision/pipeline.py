@@ -235,6 +235,83 @@ def _write_aruco_markers_3d(
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _network_zoom(mcfg, detections_per_view, image_paths) -> Dict[str, Any] | None:
+    """The central window of every image that MASt3R sees (vision.mast3r.zoom),
+    or None for the whole image (zoom 1, the default).
+
+    One window for every image: the servo centres the markers, and the sfm
+    shared intrinsics need a single camera. 'auto': the largest zoom
+    (<= zoom_max) whose window holds every detected marker corner with
+    zoom_margin around it. Extents are fractions of the half image from its
+    centre (1 = touches the border)."""
+    if mcfg.zoom != "auto" and float(mcfg.zoom) <= 1.0:
+        return None
+    from PIL import Image
+
+    sizes = set()
+    for p in image_paths:
+        with Image.open(p) as im:
+            sizes.add(im.size)
+    if len(sizes) != 1:
+        print(f"[yellow]vision.mast3r.zoom ignored: the images do not all have the same size "
+              f"({sorted(sizes)}).[/yellow]")
+        return None
+    W, H = sizes.pop()
+    ext: List[float | None] = []
+    for dets in detections_per_view:
+        if not dets:
+            ext.append(None)
+            continue
+        c = np.concatenate([np.asarray(d.corners_xy, dtype=np.float64).reshape(-1, 2) for d in dets])
+        ext.append(float(max(np.abs(c[:, 0] - W / 2).max() / (W / 2),
+                             np.abs(c[:, 1] - H / 2).max() / (H / 2))))
+    seen = [e for e in ext if e is not None]
+    need = [None if e is None else e * (1.0 + float(mcfg.zoom_margin)) for e in ext]
+    if mcfg.zoom == "auto":
+        if not seen:
+            print("[yellow]vision.mast3r.zoom auto: no ArUco marker detected, MASt3R gets the "
+                  "whole images.[/yellow]")
+            return None
+        zoom = min(float(mcfg.zoom_max), 1.0 / max(n for n in need if n is not None))
+        if zoom < 1.05:
+            print(f"[dim]vision.mast3r.zoom auto: the markers reach {max(seen):.2f} of the half "
+                  "image: no zoom.[/dim]")
+            return None
+    else:
+        zoom = float(mcfg.zoom)
+    # even sizes, rounded up so that the window holds what 'auto' asked for
+    w, h = (min(n, int(np.ceil(n / zoom / 2 - 1e-9)) * 2) for n in (W, H))
+    x0, y0 = (W - w) // 2, (H - h) // 2
+    half = min(w / W, h / H)                 # window half-size, fraction of the half image
+    return {
+        "mode": "auto" if mcfg.zoom == "auto" else "fixed",
+        "zoom_config": mcfg.zoom,
+        "zoom": float(W / w),
+        "crop_px": [int(x0), int(y0), int(w), int(h)],
+        "image_wh": [int(W), int(H)],
+        "margin": float(mcfg.zoom_margin),
+        "marker_extent_max": max(seen) if seen else None,
+        "limiting_view": int(np.argmax([-1.0 if e is None else e for e in ext])) if seen else None,
+        "views_at_risk": [i for i, n in enumerate(need) if n is not None and n > half + 1e-9],
+        "upsampled": bool(max(w, h) < int(mcfg.image_size)),
+    }
+
+
+def _write_network_crops(image_paths, crop, out_dir: Path) -> List[Path]:
+    """The zoom window of every image, as PNG (lossless) in ``out_dir``."""
+    from PIL import Image
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    x0, y0, w, h = (int(c) for c in crop)
+    out = []
+    for p in image_paths:
+        q = out_dir / (Path(p).stem + ".png")
+        with Image.open(p) as im:
+            im.convert("RGB").crop((x0, y0, x0 + w, y0 + h)).save(q)
+        out.append(q)
+    return out
+
+
 def _run_mast3r_backend(cfg: ReconstructionConfig, inputs) -> RawReconstruction:
     from .backends.mast3r_backend import run_mast3r
 
@@ -388,6 +465,14 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
     )
     print(f"Run directory: [green]{run_dir}[/green]")
 
+    # Scale from the marker centres: the table is read now, not after the
+    # (long) backend, so that a missing or wrong table stops the run at once.
+    table_centers_m = None
+    if cfg.aruco.align_to_aruco and cfg.aruco.scale_from == "centers":
+        table_centers_m = _table_marker_centers_m(cfg.aruco.centers_table)
+        print(f"Scale from the marker centres: table [green]{cfg.aruco.centers_table}[/green] "
+              f"(markers {sorted(table_centers_m)})")
+
     backend_inputs = build_backend_inputs(
         rgb_dir=cfg.input.rgb_dir,
         pose_dir=cfg.input.pose_dir,
@@ -450,9 +535,40 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
     num_detections = sum(len(d) for d in detections_per_view)
     print(f"Detected [green]{num_detections}[/green] markers across {num_views} views.")
 
+    # MASt3R input zoom (vision.mast3r.zoom): the same central window of every
+    # image, saved to inputs_mast3r_zoom/ and read by MASt3R instead of the
+    # whole images. Off (whole image) by default.
+    zoom_info = _network_zoom(cfg.mast3r, detections_per_view, backend_inputs.image_paths)
+    if zoom_info is not None:
+        x0, y0, w, h = zoom_info["crop_px"]
+        backend_inputs.network_crop = (x0, y0, w, h)
+        backend_inputs.network_image_paths = _write_network_crops(
+            backend_inputs.image_paths, zoom_info["crop_px"], run_dir / "inputs_mast3r_zoom")
+        ext = zoom_info["marker_extent_max"]
+        print(
+            f"MASt3R input zoom [green]{zoom_info['zoom']:.2f}x[/green] ({zoom_info['mode']}): "
+            f"central {w}x{h} px of the {zoom_info['image_wh'][0]}x{zoom_info['image_wh'][1]} images "
+            f"(inputs_mast3r_zoom/)"
+            + ("" if ext is None else f"; the detected markers reach {ext:.2f} of the half image "
+               f"(view {zoom_info['limiting_view']})")
+        )
+        if zoom_info["views_at_risk"]:
+            print(
+                f"[yellow]Zoom {zoom_info['zoom']:.2f}x: in views {zoom_info['views_at_risk']} the "
+                f"detected markers x (1 + zoom_margin) go beyond the window: the sample may be cut. "
+                "Lower vision.mast3r.zoom or use 'auto'.[/yellow]"
+            )
+        if zoom_info["upsampled"]:
+            print(
+                f"[yellow]Zoom {zoom_info['zoom']:.2f}x: the window is smaller than image_size "
+                f"({cfg.mast3r.image_size} px): MASt3R gets an upsampled image, no detail is gained.[/yellow]"
+            )
+
     _log_step("Step 3/6 - Running MASt3R-SfM")
     _timer.begin("Step 3/6 - MASt3R-SfM backend")
     raw = _run_mast3r_backend(cfg, backend_inputs)
+    raw.alignment_info = {**(raw.alignment_info or {}),
+                          "network_zoom": zoom_info or {"zoom": 1.0, "mode": "off"}}
     print(
         f"Backend produced [green]{raw.fused_points.shape[0]:,}[/green] fused points; "
         f"frame = [green]{raw.frame_description}[/green]"
@@ -501,6 +617,8 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
             min_views_per_marker=cfg.aruco.min_views_per_marker,
             frame_marker_ids=cfg.aruco.frame_marker_ids,
             x_axis_marker_ids=cfg.aruco.x_axis_marker_ids,
+            scale_from=cfg.aruco.scale_from,
+            table_centers_m=table_centers_m,
             enforce_metric_scale=not poses_known,
             use_bundle_adjustment=use_ba,
             ba_options={
@@ -526,6 +644,20 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
                 "scale is NOT applied. Check vision.aruco.marker_edge_length_mm, the "
                 "hand-eye calibration and the pose units.[/yellow]"
             )
+        si = aruco_alignment.scale_info
+        if si.get("scale_from") == "centers":
+            print(
+                f"[green]Scale from the marker centres[/green]: {si['scale']:.6f} "
+                f"({len(si['marker_ids'])} markers; centre residual RMS "
+                f"{1000 * si['residual_rms_m']:.2f} mm, max {1000 * si['residual_max_m']:.2f} mm; "
+                f"leave-one-marker-out spread {100 * si['leave_one_out_spread']:.2f}%). "
+                f"The marker edge ({cfg.aruco.marker_edge_length_mm:g} mm) would give a scale "
+                f"{si['edge_vs_centers_pct']:+.2f}% different"
+                + ("" if si["applied"] else " — NOT applied: the backend frame is metric (robot poses)")
+            )
+            if si["residual_max_m"] > 0.001:
+                print("[yellow]A marker centre is more than 1 mm from the table after the fit: "
+                      "check the table (vision.aruco.centers_table) and the marker IDs.[/yellow]")
 
         if aruco_alignment.plane_frame is not None:
             ba = aruco_alignment.bundle_adjustment  # type: BundleAdjustmentResult | None
@@ -626,13 +758,18 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
                 f"corners reprojected with output cameras → RMSE [cyan]{reproj_qc['rmse_px']:.3f} px[/cyan] "
                 f"(max {reproj_qc['max_px']:.3f}, p95 {reproj_qc['p95_px']:.3f}, n={reproj_qc['num_observations']})"
             )
-            # >2% off means the output frame is not at the configured metric scale.
+            # >2% off means the output frame is not at the configured metric scale
+            # (scale from the edge), or that the configured edge is off (scale
+            # from the marker centres).
             edge_ok = abs(edge_mm / edge_cfg_mm - 1.0) <= 0.02
+            from_centers = aruco_alignment.scale_info.get("scale_from") == "centers"
             print(
                 f"[{'dim' if edge_ok else 'yellow'}]Marker edge in the output frame: median "
                 f"{edge_mm:.3f} mm (configured {edge_cfg_mm:g} mm)"
-                f"{'' if edge_ok else ' -> MISMATCH, the output is not at the configured scale'}"
-                f"[/{'dim' if edge_ok else 'yellow'}]"
+                + ("" if edge_ok else
+                   " -> the configured edge looks off (the scale comes from the marker centres)"
+                   if from_centers else " -> MISMATCH, the output is not at the configured scale")
+                + f"[/{'dim' if edge_ok else 'yellow'}]"
             )
             if plane_rms_m > 0.015:
                 print(
@@ -1025,6 +1162,8 @@ def _write_outputs(
             "scale_input_to_meters": float(aruco_alignment.scale),
             "scale_mad": float(aruco_alignment.scale_mad),
             "sim3_scale_applied": float(aruco_alignment.sim3_scale),
+            "scale_from": aruco_alignment.scale_info.get("scale_from", "markers"),
+            "scale_info": aruco_alignment.scale_info,
             "warnings": aruco_alignment.warnings,
         }
         ba: BundleAdjustmentResult | None = aruco_alignment.bundle_adjustment
@@ -1045,6 +1184,20 @@ def _write_outputs(
     if view_rejection_meta is not None:
         metadata["view_rejection"] = view_rejection_meta
     (run_dir / "reconstruction_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def _table_marker_centers_m(path) -> Dict[int, np.ndarray]:
+    """{marker id: centre} of the cassette table, metres (CAD frame), for
+    vision.aruco.scale_from 'centers'. The centre does not depend on the edge."""
+    if path is None or not Path(path).is_file():
+        raise RuntimeError(
+            f"vision.aruco.scale_from is 'centers' but the marker table was not found ({path}): "
+            "set vision.aruco.centers_table, or put it in DATA/validation/")
+    from ..validation.fixture import read_fixture
+
+    fixture = read_fixture(Path(path))
+    return {int(i): np.asarray(c, dtype=np.float64).reshape(4, 3).mean(axis=0) / 1000.0
+            for i, c in fixture.corners_mm.items()}
 
 
 def _write_ba_diagnostics(alignment: ArucoAlignment, path: Path) -> None:

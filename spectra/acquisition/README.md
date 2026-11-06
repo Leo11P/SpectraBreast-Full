@@ -2,7 +2,7 @@
 
 ## Overview
 
-`acquire.py` acquires multi-view images of an ArUco-marked object using a Fairino FR5 robot equipped with a wrist-mounted Intel RealSense camera. The resulting dataset is intended for downstream 3D reconstruction pipelines such as MASt3R-SfM or VGGT.
+`acquire.py` acquires multi-view images of an ArUco-marked object using a Fairino FR5 robot equipped with a wrist-mounted camera: an Intel RealSense D456 or a Prosilica GC1020C (`acquisition.camera.type`, see `cameras.py`). The resulting dataset is intended for downstream 3D reconstruction pipelines such as MASt3R-SfM or VGGT.
 The acquisition strategy combines **offline viewpoint planning** with **online visual servoing**. Planned viewpoints provide complete geometric coverage of the object, while visual servoing compensates for calibration inaccuracies, robot repeatability errors and small perception errors before each image is captured.
 
 ## Design Principle
@@ -175,13 +175,16 @@ depth/  manifest.json  SHA256SUMS  _discarded/     (not read by Vision)
 ```
 
   Vision composes `T_world_cam = T_world_flange @ camera2ee`, so the hand-eye is applied once.
-- **Intrinsics**: by default the RealSense factory intrinsics of the running color
-  stream (always matching `camera.width/height`). Set `acquisition.camera.intrinsics`
+- **Intrinsics**: RealSense: by default the factory intrinsics of the running color
+  stream (always matching its width/height). Set `acquisition.camera.realsense.intrinsics`
   to override them with a calibration JSON (K, D), e.g.
   `DATA/camera_calibration/output/intrinsics/intrinsics_opencv.json` from
   `spectra calibrate --modality intrinsics`. The override
   is rejected if it is more than 5% off the factory values (calibrated at another
-  resolution). The source is recorded in `camera_parameters/intrinsics_source.json`.
+  resolution). GC1020C: no factory intrinsics, so its own calibration
+  (`DATA/camera_calibration_gc1020c/output/intrinsics/intrinsics_opencv.json`, or
+  `acquisition.camera.gc1020c.intrinsics`) is required and must match its resolution.
+  The source is recorded in `camera_parameters/intrinsics_source.json`.
 - **Image/pose pairing**: each shot is saved as a pair (image + pose) or not at all. At the end
   (also after Ctrl-C) every `img_NNNN` is checked against `pose_NNNN` and vice versa; orphans and
   unreadable poses are moved to `_discarded/`, then the counts/indices are verified and SHA-256

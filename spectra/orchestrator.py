@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -198,6 +199,11 @@ def batch_summary_dir(results_root: Path, date: Optional[str] = None) -> Path:
 
 def vision_mesh_path(results_root: Path, sample: str, date: Optional[str] = None) -> Path:
     return vision_output_dir(results_root, sample, date) / "surface_mesh.ply"
+
+
+def registration_surface_name(source: str) -> str:
+    """File of the vision run registration works on (``registration.source``)."""
+    return "cloud.ply" if source == "cloud" else "surface_mesh.ply"
 
 
 def vision_aruco_path(results_root: Path, sample: str, date: Optional[str] = None) -> Path:
@@ -341,6 +347,13 @@ def resolve_unified_paths(
         candidate = vision_camera_params_dir(cfg.data_root, sample)
         if candidate.is_dir():
             overrides["vision.input.camera_params_dir"] = str(candidate)
+    # marker table for vision.aruco.scale_from 'centers' (the validation one)
+    if _is_unset(cfg.vision.aruco.centers_table):
+        table = Path(cfg.data_root) / "validation" / (
+            cfg.validation.fixture_table if cfg.validation is not None
+            else "Tabella_marker_cassetta.xlsx")
+        if table.is_file():
+            overrides["vision.aruco.centers_table"] = str(table)
 
     # ------- vision.output ------------------------------------------------
     if _is_unset(cfg.vision.output.root):
@@ -366,7 +379,8 @@ def resolve_unified_paths(
             vision_dir, _ = find_vision_dir(cfg.results_root, sample, date)
         vision_dir = Path(vision_dir)
         if _is_unset(r_paths.mesh):
-            overrides["registration.paths.mesh"] = str(vision_dir / "surface_mesh.ply")
+            overrides["registration.paths.mesh"] = str(
+                vision_dir / registration_surface_name(cfg.registration.source))
         if _is_unset(r_paths.aruco_json):
             overrides["registration.paths.aruco_json"] = str(
                 vision_dir / "aruco_markers_3d.json"
@@ -470,6 +484,29 @@ def run_registration_stage(
     return result
 
 
+def _vision_subphases(run_dir) -> list[dict]:
+    """The steps of vision's timings.json, as timing sub-phases."""
+    try:
+        t = json.loads((Path(run_dir) / "timings.json").read_text(encoding="utf-8"))
+        return [{"name": p["label"], "seconds": p["seconds"]} for p in t.get("phases", [])]
+    except Exception:
+        return []
+
+
+def _registration_subphases(result: dict) -> list[dict]:
+    """single / roi: render + registration and export; sweep: renders + every pair."""
+    if result.get("_subphases"):
+        return list(result["_subphases"])
+    t = result.get("_timings") or {}
+    out = []
+    if t.get("render_total_s") is not None:
+        out.append({"name": "renders (GPU)", "seconds": t["render_total_s"]})
+    if t.get("pipeline_s") is not None:
+        out.append({"name": "registration + export (point cloud, Excel, Rerun)",
+                    "seconds": t["pipeline_s"]})
+    return out
+
+
 # =============================================================================
 # Full pipeline
 # =============================================================================
@@ -525,6 +562,16 @@ def run_full(
 
     out: dict[str, Any] = {"sample": sample, "date": date, "skipped_vision": False}
 
+    # Timing of the stages (spectra/timing.py): timing_job.json, merged with
+    # this PC's part (acquisition, Mufasa) in validation/timing/timing.xlsx.
+    from . import timing
+
+    tdir = timing.timing_dir(cfg.results_root, date, sample)
+    tfile = None if dry_run else tdir / timing.JOB
+    where = "Mufasa" if os.environ.get("SLURM_JOB_ID") else "this PC"
+    if tfile is not None:
+        timing.reset(tfile, sample=sample, stages=list(cfg.stages))
+
     if do_vision:
         if not force_vision and vision_outputs_present(cfg.results_root, sample, cfg.results_date):
             print(f"\n[orchestrator] Vision outputs already exist at "
@@ -541,7 +588,9 @@ def run_full(
                 print("[orchestrator][dry-run] Would run vision stage.")
                 out["vision"] = {"skipped": False, "dry_run": True}
             else:
-                out["vision"] = run_vision_stage(cfg, sample_name=sample)
+                with timing.phase(tfile, "vision (3D reconstruction)", where) as subs:
+                    out["vision"] = run_vision_stage(cfg, sample_name=sample)
+                    subs += _vision_subphases(out["vision"].get("run_dir"))
     else:
         print("[orchestrator] Vision stage disabled (not in cfg.stages).")
 
@@ -555,9 +604,11 @@ def run_full(
                 "run_dir", vision_output_dir(cfg.results_root, sample, cfg.results_date)))
             needs_handoff = (_is_unset(cfg.registration.paths.mesh)
                              or _is_unset(cfg.registration.paths.aruco_json))
-            if needs_handoff and not dry_run and not vision_dir_complete(vision_dir):
+            surface = registration_surface_name(cfg.registration.source)
+            if needs_handoff and not dry_run and not (
+                    vision_dir_complete(vision_dir) and (vision_dir / surface).is_file()):
                 raise FileNotFoundError(
-                    f"Vision run {vision_dir} has no surface_mesh.ply + aruco_markers_3d.json; "
+                    f"Vision run {vision_dir} has no {surface} + aruco_markers_3d.json; "
                     "refusing to register against an older vision run."
                 )
             cfg = resolve_unified_paths(cfg, vision_dir=vision_dir)
@@ -568,9 +619,11 @@ def run_full(
             print("[orchestrator][dry-run] Would run registration stage.")
             out["registration"] = {"dry_run": True}
         else:
-            out["registration"] = run_registration_stage(
-                cfg, sample_name=sample, force_cpu=force_cpu, dry_run=False,
-            )
+            with timing.phase(tfile, f"registration ({cfg.registration.mode})", where) as subs:
+                out["registration"] = run_registration_stage(
+                    cfg, sample_name=sample, force_cpu=force_cpu, dry_run=False,
+                )
+                subs += _registration_subphases(out["registration"])
     else:
         print("[orchestrator] Registration stage disabled (not in cfg.stages).")
 
@@ -586,7 +639,20 @@ def run_full(
             print("[orchestrator][dry-run] Would run validation stage.")
             out["validation"] = {"dry_run": True}
         else:
-            out["validation"] = run_validation_stage(cfg, vision_dir=vision_dir)
+            with timing.phase(tfile, "validation", where) as subs:
+                out["validation"] = run_validation_stage(cfg, vision_dir=vision_dir)
+                for m, res in (out["validation"] or {}).items():
+                    if isinstance(res, dict) and res.get("elapsed_s") is not None:
+                        subs.append({"name": f"{m} (phase {'1' if m == 'vision' else '2'})",
+                                     "seconds": res["elapsed_s"]})
+                    elif isinstance(res, dict) and "skipped" in res:
+                        subs.append({"name": f"{m}: skipped", "seconds": 0.0})
+
+    if tfile is not None:
+        try:
+            timing.write_xlsx(tdir, sample=sample, date=date)
+        except Exception as exc:
+            print(f"[timing] timing.xlsx not written: {exc}")
 
     print("\n" + "=" * 68)
     print("SPECTRA FULL COMPLETED")
@@ -600,7 +666,7 @@ def run_full(
         print(f"  Reg. output   : {cfg.registration.paths.output_dir}")
     if "validation" in out and not dry_run:
         from .validation import output_dir as _validation_dir
-        print(f"  Validation    : {_validation_dir(cfg)}")
+        print(f"  Validation    : {_validation_dir(cfg).parent}")
     print("=" * 68)
 
     return out
@@ -629,6 +695,7 @@ __all__ = [
     "vision_dir_complete",
     "vision_input_dir",
     "vision_mesh_path",
+    "registration_surface_name",
     "vision_output_dir",
     "vision_pose_dir",
     "vision_outputs_present",

@@ -22,8 +22,8 @@
    (centre of the hole mouth + axis), looked for in the photos of the vision
    run and hit on the reconstructed mesh (fiducials.py); error per bersaglio
    and per alignment: norm, along the normal, in the surface plane.
-6. Outputs in RESULTS/<date>/<sample>/validation/vision/: metrics.json,
-   error_map.ply (+ .npy: phantom region of the mesh coloured by |error|, mm),
+6. Outputs in RESULTS/<date>/<sample>/validation/vision/: metrics.json
+   (+ the same numbers in metrics.xlsx), error_map.ply (+ .npy: phantom region of the mesh coloured by |error|, mm),
    fiducials.png (photo crops around each bersaglio) and validation.rrd (STL +
    reconstruction + fiducials for Rerun).
 """
@@ -358,8 +358,15 @@ def validate_vision(cfg, vision_dir: Path, out_dir: Path) -> Dict[str, Any]:
             warnings.append(f"validation.rrd not written: {exc}")
 
     meta = run["meta"]
+    al_meta = meta.get("aruco_alignment") or {}
+    scale_from = al_meta.get("scale_from", "markers")
+    nz = (meta.get("alignment_info") or {}).get("network_zoom") or {}
+    zoomed = float(nz.get("zoom") or 1.0) > 1.0
     model = vcfg.model_label or "-".join(str(x) for x in (
-        meta.get("backend"), (meta.get("alignment_info") or {}).get("pipeline_variant")) if x)
+        meta.get("backend"), (meta.get("alignment_info") or {}).get("pipeline_variant"),
+        "centers" if scale_from == "centers" else None,
+        None if not zoomed else "zoomauto" if nz.get("mode") == "auto"
+        else f"zoom{float(nz.get('zoom_config') or nz['zoom']):g}") if x)
     result = {
         "sample": sample, **case, "model": model,
         "date": Path(out_dir).parents[2].name if len(Path(out_dir).parents) > 2 else None,
@@ -369,13 +376,25 @@ def validate_vision(cfg, vision_dir: Path, out_dir: Path) -> Dict[str, Any]:
         "marker_edge_mm": {"vision": run["edge_mm"], "table": fixture.edge_mm,
                            "table_source": fixture.edge_source},
         "vision_frame": run["frame"], "timings": run["timings"],
-        "scale": "kept: the ArUco scale set by vision; every alignment is rigid (no rescaling)",
+        "scale_from": scale_from,
+        "scale": ("kept: set by vision from the marker centres fitted on the table (so the "
+                  "marker alignment errors are not an independent check); every alignment is rigid"
+                  if scale_from == "centers" else
+                  "kept: the ArUco scale set by vision; every alignment is rigid (no rescaling)"),
+        "scale_info": al_meta.get("scale_info"),
+        "network_zoom": nz or None,
         "views": views,
         "fiducials": _fiducials(holes, transforms[primary], primary, fids, fid_err, fid_note,
                                 F.search_radius(holes, opt.fiducials) if fids else None),
         "alignment": align, "metrics": metrics, "files": files, "warnings": warnings,
         "elapsed_s": round(time.time() - t0, 2),
     }
+    try:
+        from .report import write_sample_xlsx
+
+        files["excel"] = write_sample_xlsx(out_dir / "metrics.xlsx", result)
+    except Exception as exc:              # the json is what matters
+        warnings.append(f"metrics.xlsx not written: {exc}")
     (out_dir / "metrics.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
 
     p = metrics[primary]

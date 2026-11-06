@@ -37,11 +37,12 @@ ROOT = os.path.dirname(os.path.abspath(__file__))              # spectra/acquisi
 REPO_ROOT = os.path.dirname(os.path.dirname(ROOT))             # SpectraBreast-Full
 # SINGLE pipeline config (`acquisition:` section + `vision.aruco`).
 DEFAULT_CONFIG = os.path.join(REPO_ROOT, "configs", "default.yaml")
-# Sibling modules (collision_guard, pipeline_viz, rerun_viz, collision_fr5,
+# Sibling modules (cameras, collision_guard, pipeline_viz, rerun_viz, collision_fr5,
 # fairino/) are imported "flat": the script runs on the robot PC WITHOUT importing
 # the `spectra` package (which would pull in torch/open3d/MASt3R).
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+from cameras import calibration_dir_name, open_camera, resolve_camera_cfg  # noqa: E402
 
 
 # ----------------------------------------------------------------------------- 
@@ -283,7 +284,7 @@ def detect_euler_convention(robot):
 
 
 # -----------------------------------------------------------------------------
-#  Camera intrinsics, ArUco, RealSense
+#  Camera intrinsics, ArUco (the cameras themselves are in cameras.py)
 # -----------------------------------------------------------------------------
 def load_intrinsics(path):
     """Loads K (3x3) and D (dist coeffs) from JSON, tolerant to several schemas
@@ -352,62 +353,93 @@ def load_intrinsics_override(path):
     return load_intrinsics(p)
 
 
-def resolve_intrinsics(cfg, rs_cam):
+def _intrinsics_img_size(path):
+    """img_size [w, h] saved with the intrinsics (spectra calibrate writes it), or None."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            size = json.load(f).get("img_size")
+        return [int(v) for v in size] if size else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def resolve_intrinsics(cfg, cam):
     """Camera intrinsics used for solvePnP and saved into the dataset.
-      default  : RealSense factory intrinsics read from the running color
-                 stream (always consistent with camera.width/height);
-      override : `acquisition.camera.intrinsics` set to a calibration file
-                 (see load_intrinsics_override).
-    The override is checked against the factory values: a focal length or
-    principal point off by more than 5% almost always means a calibration made
-    at a different resolution -> abort instead of acquiring with a wrong K.
+      default  : the camera's factory intrinsics (RealSense: read from the
+                 running color stream, always consistent with width/height).
+                 A camera without them (GC1020C) uses its OpenCV calibration,
+                 <calibration dir>/output/intrinsics/intrinsics_opencv.json;
+      override : `acquisition.camera.<type>.intrinsics` set to a calibration
+                 file (see load_intrinsics_override).
+    A calibration file is checked against the factory values when they exist:
+    a focal length or principal point off by more than 5% almost always means a
+    calibration made at a different resolution -> abort instead of acquiring
+    with a wrong K. Without factory values, the img_size saved with the
+    calibration must match the stream.
     Sets cfg['_intrinsics_source'] (saved as camera_parameters/intrinsics_source.json)."""
-    K_f, D_f, model = rs_cam.factory_intrinsics()
-    src = {"source": "realsense_factory", "model": model,
-           "width": rs_cam.w, "height": rs_cam.h}
+    kind = cfg["camera"]["type"]
+    factory = cam.factory_intrinsics()
     override = cfg["camera"].get("intrinsics")
+    if factory is None and not override:
+        override = os.path.join(cfg["_calib_dir"], "output", "intrinsics", "intrinsics_opencv.json")
+        if not os.path.isfile(override):
+            raise SystemExit(f"[intrinsics] the {kind} camera has no factory intrinsics and "
+                             f"{override} does not exist: run `spectra calibrate --modality "
+                             f"intrinsics` (or set acquisition.camera.{kind}.intrinsics).")
     if not override:
-        K, D = K_f, D_f
+        K, D, model = factory
+        src = {"source": f"{kind}_factory", "model": model}
     else:
         K, D = load_intrinsics_override(override)
-        d_f = max(abs(K[0, 0] / K_f[0, 0] - 1.0), abs(K[1, 1] / K_f[1, 1] - 1.0))
-        d_c = max(abs(K[0, 2] - K_f[0, 2]) / rs_cam.w, abs(K[1, 2] - K_f[1, 2]) / rs_cam.h)
-        if d_f > 0.05 or d_c > 0.05:
-            raise SystemExit(
-                f"[intrinsics] override {override} is inconsistent with the "
-                f"{rs_cam.w}x{rs_cam.h} stream (focal off by {100 * d_f:.1f}%, principal "
-                f"point off by {100 * d_c:.1f}% of the image): probably calibrated at a "
-                "different resolution. Fix camera.width/height or the calibration.")
-        src = {"source": "override", "path": os.path.abspath(str(override)),
-               "width": rs_cam.w, "height": rs_cam.h}
+        if factory is not None:
+            K_f = factory[0]
+            d_f = max(abs(K[0, 0] / K_f[0, 0] - 1.0), abs(K[1, 1] / K_f[1, 1] - 1.0))
+            d_c = max(abs(K[0, 2] - K_f[0, 2]) / cam.w, abs(K[1, 2] - K_f[1, 2]) / cam.h)
+            if d_f > 0.05 or d_c > 0.05:
+                raise SystemExit(
+                    f"[intrinsics] override {override} is inconsistent with the "
+                    f"{cam.w}x{cam.h} stream (focal off by {100 * d_f:.1f}%, principal "
+                    f"point off by {100 * d_c:.1f}% of the image): probably calibrated at a "
+                    "different resolution. Fix camera width/height or the calibration.")
+        else:
+            size = _intrinsics_img_size(override)
+            if size is not None and size != [cam.w, cam.h]:
+                raise SystemExit(
+                    f"[intrinsics] {override} was computed at {size[0]}x{size[1]} but the "
+                    f"{kind} streams {cam.w}x{cam.h}: redo the intrinsics or fix width/height.")
+        src = {"source": "override" if cfg["camera"].get("intrinsics") else "calibration",
+               "path": os.path.abspath(str(override))}
+    src.update(camera=kind, width=cam.w, height=cam.h)
     src["K"] = np.asarray(K, float).tolist()
     src["D"] = np.asarray(D, float).ravel().tolist()
     cfg["_intrinsics_source"] = src
     print(f"[intrinsics] {src['source']}"
-          + (f" ({src['path']})" if "path" in src else f" ({model})")
+          + (f" ({src['path']})" if "path" in src else f" ({src['model']})")
           + f": fx={K[0,0]:.2f} fy={K[1,1]:.2f} cx={K[0,2]:.2f} cy={K[1,2]:.2f}")
     return K, D
 
 
 def load_T_cam2gripper(cfg):
-    """T_cam2gripper 4x4 (mm). It links the camera to the FLANGE (controller
-    flange, tool 0), like the hand-eye calibration. `hand_eye.T_cam2gripper`:
-    null -> output of `spectra calibrate` (camera_calibration/output/
-    calibration/cam2gripper.txt under data_root); a 4x4 list -> used as is."""
-    T = (cfg.get("hand_eye") or {}).get("T_cam2gripper")
+    """T_cam2gripper 4x4 (mm) of the camera in use. It links the camera to the
+    FLANGE (controller flange, tool 0), like the hand-eye calibration.
+    `acquisition.camera.<type>.T_cam2gripper`: null -> output of `spectra
+    calibrate` for that camera (<calibration dir>/output/calibration/
+    cam2gripper.txt under data_root); a 4x4 list -> used as is."""
+    kind = cfg["camera"]["type"]
+    T = cfg["camera"].get("T_cam2gripper")
     if T is None:
         path = os.path.join(cfg["_calib_dir"], "output", "calibration", "cam2gripper.txt")
         if not os.path.isfile(path):
-            raise SystemExit(f"[hand-eye] {path} not found: run `spectra calibrate` (or "
-                             "--modality calibration calibrate), or set "
-                             "acquisition.hand_eye.T_cam2gripper to a 4x4 matrix.")
+            raise SystemExit(f"[hand-eye] {path} not found: run `spectra calibrate` with "
+                             f"acquisition.camera.type: {kind}, or set "
+                             f"acquisition.camera.{kind}.T_cam2gripper to a 4x4 matrix.")
         T, src = np.loadtxt(path), path
     else:
-        src = "acquisition.hand_eye.T_cam2gripper"
+        src = f"acquisition.camera.{kind}.T_cam2gripper"
     T = np.array(T, float)
     if T.shape != (4, 4):
         raise SystemExit(f"[hand-eye] T_cam2gripper must be 4x4 ({src}).")
-    print(f"[hand-eye] {src}: t(mm) = {np.round(T[:3,3],2).tolist()}")
+    print(f"[hand-eye] {kind}: {src}: t(mm) = {np.round(T[:3,3],2).tolist()}")
     return T
 
 
@@ -436,112 +468,6 @@ def estimate_marker_pose(corner, K, D, L):
         return None
     R, _ = cv.Rodrigues(rvec)
     return R, tvec.reshape(3)
-
-
-class RS:
-    """Minimal RealSense wrapper (color stream + average of N frames). If the device
-    supports it, depth is ALSO enabled, aligned to color (same intrinsics as
-    color -> consistent with intrinsics.npy): grab_depth() returns the depth map."""
-
-    def __init__(self, cfg):
-        import pyrealsense2 as rs
-        self.rs = rs
-        self.w = int(cfg["camera"]["width"]); self.h = int(cfg["camera"]["height"])
-        fps = int(cfg["camera"].get("fps", 15))
-        # optional depth (default ON): it must NEVER prevent color acquisition.
-        self.depth_enabled = bool(cfg["camera"].get("depth", True))
-        self.depth_scale = 1.0
-        self.align = None
-
-        def _start(with_depth):
-            pipe = rs.pipeline()
-            conf = rs.config()
-            conf.enable_stream(rs.stream.color, self.w, self.h, rs.format.bgr8, fps)
-            if with_depth:
-                # no forced depth resolution: many cameras (e.g. D45x) do NOT
-                # support depth at the color resolution (e.g. 1280x800). Let the
-                # SDK pick a valid depth mode; alignment to color brings the
-                # map back to the color resolution/intrinsics anyway.
-                conf.enable_stream(rs.stream.depth)
-            prof = pipe.start(conf)
-            return pipe, prof
-
-        self.pipe = None
-        if self.depth_enabled:
-            try:
-                self.pipe, self.profile = _start(True)
-                self.depth_scale = float(self.profile.get_device()
-                                         .first_depth_sensor().get_depth_scale())
-                self.align = rs.align(rs.stream.color)
-                print(f"[realsense] depth ON (scale {self.depth_scale:.6f} m/unit, "
-                      "aligned to color)")
-            except Exception as e:
-                print(f"[realsense] warning: depth unavailable ({e}); color only")
-                self.depth_enabled = False
-                if self.pipe is not None:
-                    try: self.pipe.stop()
-                    except Exception: pass
-                self.pipe = None
-        if self.pipe is None:
-            self.pipe, self.profile = _start(False)
-        # warm-up
-        for _ in range(30):
-            self.pipe.wait_for_frames(10000)
-
-    def grab(self, n_avg=5):
-        acc = None; got = 0
-        for _ in range(max(1, n_avg)):
-            try:
-                frames = self.pipe.wait_for_frames(10000)
-            except RuntimeError:
-                continue
-            c = frames.get_color_frame()
-            if not c:
-                continue
-            img = np.asanyarray(c.get_data()).astype(np.float32)
-            acc = img if acc is None else acc + img
-            got += 1
-        if got == 0:
-            return None
-        return (acc / got).astype(np.uint8)
-
-    def grab_depth(self):
-        """Depth map co-registered with color (same resolution/intrinsics).
-        Returns a uint16 in MILLIMETRES (0 = no measurement/hole) or None if
-        depth is unavailable. Single frameset: at shot time the robot is
-        still, so no averaging (averaging depth with the zeros of the holes
-        would corrupt it)."""
-        if not self.depth_enabled or self.align is None:
-            return None
-        try:
-            frames = self.pipe.wait_for_frames(10000)
-        except RuntimeError:
-            return None
-        try:
-            aligned = self.align.process(frames)
-            d = aligned.get_depth_frame()
-        except Exception:
-            return None
-        if not d:
-            return None
-        raw = np.asanyarray(d.get_data())                 # uint16, native units
-        depth_mm = raw.astype(np.float32) * self.depth_scale * 1000.0
-        return np.clip(depth_mm, 0, 65535).astype(np.uint16)
-
-    def factory_intrinsics(self):
-        """Factory intrinsics of the COLOR stream actually running (same
-        resolution as the images). Returns (K 3x3, D (5,), model name)."""
-        vsp = self.profile.get_stream(self.rs.stream.color).as_video_stream_profile()
-        i = vsp.get_intrinsics()
-        K = np.array([[i.fx, 0.0, i.ppx], [0.0, i.fy, i.ppy], [0.0, 0.0, 1.0]], float)
-        D = np.asarray(list(i.coeffs)[:5], float)
-        return K, D, str(i.model)
-
-    def stop(self):
-        try:
-            self.pipe.stop()
-        except Exception:
-            pass
 
 
 # -----------------------------------------------------------------------------
@@ -585,7 +511,7 @@ def gripper_pose_from_camera_T(T_cam2base, T_cam2gripper):
 #  CHAIN CHECK (--verify): does not move the robot. Proves the chain is
 #  correct BEFORE generating trajectories.
 # -----------------------------------------------------------------------------
-def run_verify(cfg, robot, T_c2g, K, D, rs):
+def run_verify(cfg, robot, T_c2g, K, D, cam):
     print("\n" + "=" * 64)
     print("  TRANSFORMATION CHAIN CHECK (no motion)")
     print("=" * 64)
@@ -614,9 +540,9 @@ def run_verify(cfg, robot, T_c2g, K, D, rs):
     L = float(cfg["aruco"]["marker_length_mm"])
     cx, cy = K[0, 2], K[1, 2]
     detector = make_detector(cfg["aruco"]["dictionary"])
-    img = rs.grab(int(cfg["camera"].get("n_avg_frames", 5)))
+    img = cam.grab(int(cfg["camera"].get("n_avg_frames", 5)))
     if img is None:
-        print("[verify] no RealSense frame."); return
+        print("[verify] no camera frame."); return
     gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
     corners, ids = detect_markers(detector, gray)
     if ids is None or len(corners) == 0:
@@ -676,7 +602,7 @@ def run_verify(cfg, robot, T_c2g, K, D, rs):
 # -----------------------------------------------------------------------------
 #  Bootstrap: sample centroid + normal estimate (median over several frames)
 # -----------------------------------------------------------------------------
-def bootstrap(robot, rs, cfg, T_c2g, K, D):
+def bootstrap(robot, cam, cfg, T_c2g, K, D):
     L = float(cfg["aruco"]["marker_length_mm"])
     n_frames = int(cfg["target"].get("n_bootstrap_frames", 8))
     detector = make_detector(cfg["aruco"]["dictionary"])
@@ -692,7 +618,7 @@ def bootstrap(robot, rs, cfg, T_c2g, K, D):
     per_id_c, per_id_n, per_id_corn = {}, {}, {}
     seen = 0
     for _ in range(n_frames):
-        img = rs.grab(2)
+        img = cam.grab(2)
         if img is None:
             continue
         gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
@@ -984,7 +910,7 @@ def _rot_towards(a, b, frac=1.0):
     return np.eye(3) + math.sin(ang) * Kx + (1 - math.cos(ang)) * (Kx @ Kx)
 
 
-def recenter(robot, rs, cfg, T_c2g, K, D, target, guard=None):
+def recenter(robot, cam, cfg, T_c2g, K, D, target, guard=None):
     """Brings the FIXED target point of the bootstrap (target['centroid'], base
     frame) to the image centre. Where that point really is in the image is
     predicted with the native FK and corrected by the bootstrap markers in view
@@ -1022,7 +948,7 @@ def recenter(robot, rs, cfg, T_c2g, K, D, target, guard=None):
         Returns (corners, ids, img|None)."""
         last = None
         for _ in range(max(1, detect_retries)):
-            img = rs.grab(max(2, n_avg))
+            img = cam.grab(max(2, n_avg))
             if img is None:
                 continue
             last = img
@@ -1033,10 +959,7 @@ def recenter(robot, rs, cfg, T_c2g, K, D, target, guard=None):
 
     # one-off settling before the first detection (post-MoveJ)
     if settle_s > 0:
-        t0 = time.time()
-        while time.time() - t0 < settle_s:
-            try: rs.pipe.wait_for_frames(10000)
-            except Exception: pass
+        cam.settle(settle_s)
 
     for it in range(max_iters):
         corners, ids, img = _grab_detect()
@@ -1319,7 +1242,7 @@ def plan_sequence(poses, q_start, target, cfg, robot, T_c2g, K, D, guard):
     return out
 
 
-def run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir, use_viz=True):
+def run_acquire(cfg, robot, T_c2g, K, D, cam, out_dir, use_viz=True):
     tool = int(cfg["robot"]["tool"]); user = int(cfg["robot"]["user"])
     vel = float(cfg["robot"].get("vel", 20))
     # 'dwell': wait BEFORE THE SHOT, applied ONLY after the servo has
@@ -1329,7 +1252,20 @@ def run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir, use_viz=True):
     dwell = float(cfg["robot"].get("dwell_s", 2.5))
     pt_gate = float(cfg["robot"].get("pointing_gate_deg", 15.0))
 
-    target = bootstrap(robot, rs, cfg, T_c2g, K, D)
+    # timing of the sub-phases -> <out_dir>/acquisition_timing.json (spectra/timing.py)
+    t_start = time.time()
+    tsub = [{"name": "init (robot, camera, intrinsics)",
+             "seconds": t_start - cfg.get("_t_main0", t_start)}]
+    t_mark = t_start
+
+    def _lap(name):
+        nonlocal t_mark
+        now = time.time()
+        tsub.append({"name": name, "seconds": now - t_mark})
+        t_mark = now
+
+    target = bootstrap(robot, cam, cfg, T_c2g, K, D)
+    _lap("bootstrap (markers, target)")
     poses = generate_poses(target, cfg, robot, T_c2g, K, D)
 
     # start pose (bootstrap): entry point for the order optimisation
@@ -1466,11 +1402,24 @@ def run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir, use_viz=True):
         guard.enable_native_backstop()
 
     manifest = []
+    _lap("pose planning + setup (collision, viz, camera parameters)")
     print("\n" + "=" * 60 + "\n  EXECUTION\n" + "=" * 60)
     MAXFAIL = 3; fails = 0; n_saved = 0
     q_prev = q_home
+    exec_t, exec_n, prev_layer = {}, {}, None     # execution time per layer
+
+    def _close_layer():
+        if prev_layer is not None:
+            now = time.time()
+            exec_t[prev_layer] = exec_t.get(prev_layer, 0.0) + now - t_mark
+            return now
+        return time.time()
+
     try:
       for i, wp in enumerate(poses, 1):
+        t_mark = _close_layer()
+        prev_layer = wp["layer"]
+        exec_n[prev_layer] = exec_n.get(prev_layer, 0) + 1
         # collision-checked MOTION PLANNING: checks the arrival pose
         # (vs cube/floor/self/camera-link) AND the joint PATH q_prev->target
         # (camera-vs-link during the motion). If the direct path collides, try a
@@ -1551,16 +1500,13 @@ def run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir, use_viz=True):
         # immediately (no wait before); only once the pose is CONFIRMED
         # centred do we wait 'dwell' seconds and shoot. This way no time is
         # wasted waiting before knowing whether another move is needed.
-        seen = recenter(robot, rs, cfg, T_c2g, K, D, target, guard=guard)
+        seen = recenter(robot, cam, cfg, T_c2g, K, D, target, guard=guard)
         if not seen:
             print("  sample not in view -> shot SKIPPED"); continue
 
-        t0 = time.time()
-        while time.time() - t0 < dwell:
-            try: rs.pipe.wait_for_frames(10000)
-            except Exception: pass
+        cam.settle(dwell)
 
-        img = rs.grab(int(cfg["camera"].get("n_avg_frames", 5)))
+        img = cam.grab(int(cfg["camera"].get("n_avg_frames", 5)))
         if img is None:
             print("  no frame -> skipping"); continue
 
@@ -1590,7 +1536,7 @@ def run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir, use_viz=True):
         depth_rel = None
         want_depth = bool(wp.get("depth", True))
         if want_depth:
-            depth = rs.grab_depth()
+            depth = cam.grab_depth()
             if depth is not None:
                 depth_name = f"depth{tag}.png"
                 cv.imwrite(os.path.join(depth_dir, depth_name), depth)
@@ -1615,6 +1561,11 @@ def run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir, use_viz=True):
         if viz is not None and T_shot is not None:
             viz.log_photo_pose(T_shot, tag)
 
+      t_mark = _close_layer()
+      prev_layer = None
+      for lay, sec in exec_t.items():
+          tsub.append({"name": f"execution: {lay} ({exec_n[lay]} poses, servo included)",
+                       "seconds": sec})
       # ---- end of acquisition: return to the start pose (bootstrap) ----
       if q_home is not None:
           safe, reasons = True, []
@@ -1642,9 +1593,22 @@ def run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir, use_viz=True):
         # Image<->pose consistency check + checksum: ALWAYS runs, even if
         # the acquisition was interrupted (Ctrl-C / robot error), so the
         # folder stays readable by Vision.
+        if prev_layer is not None:          # interrupted during the execution
+            t_mark = _close_layer()
+            for lay, sec in exec_t.items():
+                tsub.append({"name": f"execution: {lay} ({exec_n[lay]} poses, servo included)",
+                             "seconds": sec})
+        _lap("return to the start pose")
         manifest = finalize_dataset(out_dir, manifest)
         with open(os.path.join(out_dir, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=2)
+        _lap("dataset check + checksums")
+        try:      # not an image / pose: not in SHA256SUMS, not read by vision
+            with open(os.path.join(out_dir, "acquisition_timing.json"), "w") as f:
+                json.dump({"start": cfg.get("_t_main0", t_start), "end": time.time(),
+                           "subphases": tsub}, f, indent=2)
+        except Exception as exc:
+            print(f"[timing] acquisition_timing.json not written: {exc}")
 
     n_saved = len(manifest)
     print(f"\nDone. {n_saved} image/pose pairs in {out_dir}")
@@ -1788,6 +1752,8 @@ def load_config(path, sample=None):
     """Reads the SINGLE pipeline config and returns the acquisition dict
     (`acquisition:` section), plus:
       - cfg['aruco']   <- vision.aruco (dictionary + marker edge: SINGLE value)
+      - cfg['camera']  <- the camera on the flange (acquisition.camera.type), flat:
+                          shared keys + its own block (cameras.resolve_camera_cfg)
       - cfg['_out_dir']<- <data_root>/input_vision/<sample_name>, i.e.
                           exactly the folder Vision reads."""
     with open(path, "r", encoding="utf-8") as f:
@@ -1831,8 +1797,16 @@ def load_config(path, sample=None):
     cfg["_sample"] = str(sample)
     # relative to the cwd, like Vision: always launch from the repo root
     cfg["_out_dir"] = os.path.abspath(os.path.join(data_root, "input_vision", str(sample)))
-    cfg["_calib_dir"] = os.path.abspath(os.path.join(data_root, "camera_calibration"))
-    print(f"[config] {path} | sample={sample} | aruco={dict_name} "
+    # camera on the flange, with its own hand-eye, intrinsics, collision box and
+    # calibration folder (cameras.py)
+    cam = resolve_camera_cfg(acq.get("camera"))
+    if cam["type"] == "realsense":   # older layout: hand_eye / camera_box next to camera
+        cam.setdefault("T_cam2gripper", (cfg.get("hand_eye") or {}).get("T_cam2gripper"))
+        cam.setdefault("camera_box", cfg.get("camera_box"))
+    cfg["camera"] = cam
+    cfg["camera_box"] = cam.get("camera_box")      # read by collision_guard / pipeline_viz
+    cfg["_calib_dir"] = os.path.abspath(os.path.join(data_root, calibration_dir_name(cam["type"])))
+    print(f"[config] {path} | sample={sample} | camera={cam['type']} | aruco={dict_name} "
           f"L={cfg['aruco']['marker_length_mm']}mm | out={cfg['_out_dir']}")
     return cfg
 
@@ -1874,13 +1848,20 @@ def main():
     ap.add_argument("--no-viz", action="store_true",
                     help="disable the Rerun visualisation (poses/cube/live robot)")
     args = ap.parse_args()
+    t_main0 = time.time()
 
     cfg = load_config(args.config, sample=args.sample)
+    cfg["_t_main0"] = t_main0
     if not (args.verify or args.dry_run or args.reset):
         prepare_out_dir(cfg["_out_dir"], overwrite=args.overwrite)   # fail-fast, before touching the robot
     ip = args.ip or cfg["robot"].get("ip", "192.168.58.2")
     cfg.setdefault("robot", {})["ip"] = ip   # consistent for the second viz connection
 
+    if cfg["camera"]["type"] != "realsense" and not cfg.get("camera_box") \
+            and not (args.verify or args.reset):
+        raise SystemExit(f"[config] acquisition.camera.{cfg['camera']['type']}.camera_box is "
+                         "missing: measure the camera + lens + bracket envelope (collision "
+                         "checks and viewer) before moving the robot.")
     T_c2g = load_T_cam2gripper(cfg)
     robot = RobotIO(ip)
 
@@ -1896,18 +1877,18 @@ def main():
         else:
             detect_euler_convention(robot)
 
-        rs = RS(cfg)
+        cam = open_camera(cfg["camera"])
         try:
-            K, D = resolve_intrinsics(cfg, rs)
+            K, D = resolve_intrinsics(cfg, cam)
             if args.verify:
-                run_verify(cfg, robot, T_c2g, K, D, rs)
+                run_verify(cfg, robot, T_c2g, K, D, cam)
                 return
             cfg["_dry_run"] = args.dry_run
             out_dir = cfg["_out_dir"]
-            _, n_saved = run_acquire(cfg, robot, T_c2g, K, D, rs, out_dir,
+            _, n_saved = run_acquire(cfg, robot, T_c2g, K, D, cam, out_dir,
                                      use_viz=not args.no_viz)
         finally:
-            rs.stop()
+            cam.stop()
     finally:
         robot.close()
 

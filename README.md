@@ -17,6 +17,10 @@ Vision and read by Registration:
 | `surface_mesh.ply` | reconstructed surface, metres, in the ArUco-aligned output frame |
 | `aruco_markers_3d.json` | 3D marker corners in the same frame |
 
+Registration can use the fused point cloud `cloud.ply` instead of the mesh
+(`registration.source: cloud`): same homography, but each render pixel takes
+the median Z of the cloud points falling in it, with no hole filling.
+
 Everything is driven by one YAML config and one CLI (`spectra`). On the robot
 PC the same CLI also calibrates the camera (`spectra calibrate`, §8) and
 acquires the RGB views (`spectra acquire`); `spectra validate` (§9) checks the
@@ -167,11 +171,11 @@ environment with these packages is enough:
 python -m venv .venv-acq
 .venv-acq\Scripts\activate            # Windows  (Linux: source .venv-acq/bin/activate)
 pip install "numpy>=1.24" "opencv-python>=4.8" "PyYAML>=6.0" "pyrealsense2>=2.54" \
-            "trimesh>=4.0" "python-fcl>=0.7" "rerun-sdk>=0.20" "paramiko>=3.0"
+            "vmbpy>=1.2" "trimesh>=4.0" "python-fcl>=0.7" "rerun-sdk>=0.20" "paramiko>=3.0"
 ```
 
-`pyrealsense2` drives the RealSense, `trimesh` + `python-fcl` the collision
-checks, `rerun-sdk` the live viewer, `paramiko` the hand-off to Mufasa. The Fairino SDK is not on PyPI: it is the
+`pyrealsense2` drives the RealSense, `vmbpy` the Prosilica GC1020C (below),
+`trimesh` + `python-fcl` the collision checks, `rerun-sdk` the live viewer, `paramiko` the hand-off to Mufasa. The Fairino SDK is not on PyPI: it is the
 `Robot.py` copied below (pure Python, standard library only).
 
 For the `spectra` commands the robot PC uses the repo's `uv` environment, and
@@ -226,6 +230,31 @@ its own folder, and collision checks + Rerun viz look for
 `fairino_description/` there. To keep URDF + meshes elsewhere, set
 `acquisition.collision.repo_dir` and `acquisition.viz.repo_dir` to the folder
 that **contains** `fairino_description/`.
+
+#### Camera: RealSense or Prosilica GC1020C
+
+The flange holds one camera at a time, chosen by `acquisition.camera.type`
+(`realsense` | `gc1020c`). Each camera has its own block under
+`acquisition.camera` (resolution, intrinsics, `T_cam2gripper`, `camera_box`)
+and its own calibration folder (§3.4); the code is in
+`spectra/acquisition/cameras.py`. The GC1020C is a GigE Vision camera driven
+through Allied Vision **Vimba X**:
+
+1. Install Vimba X on the robot PC: it provides the GigE transport layer (and
+   the Visual C++ runtime `vmbpy` needs). Vimba X Viewer must see the camera
+   before the pipeline can.
+2. `uv sync --extra acquisition` installs `vmbpy` (the first sync after this
+   change also adds it to `uv.lock`; commit the updated lock).
+3. Give the network adapter the camera is plugged into an address on the
+   camera's subnet, e.g. camera `192.168.1.121` → PC `192.168.1.50` /
+   `255.255.255.0`. If frames arrive incomplete (e.g. USB-Ethernet adapter,
+   MTU 1500), set `acquisition.camera.gc1020c.packet_size: 1500`.
+4. Only one program at a time can stream from the camera: close Vimba X Viewer
+   / arv-viewer before `spectra acquire` / `spectra calibrate`.
+5. Calibrate it with `type: gc1020c` (§8). It has no factory intrinsics, so the
+   acquisition refuses to start without its `intrinsics_opencv.json` and
+   `cam2gripper.txt`; it also refuses while `acquisition.camera.gc1020c.camera_box`
+   (camera + lens + bracket envelope for the collision checks) is not measured.
 
 ---
 
@@ -362,11 +391,13 @@ prints the median marker edge in the output frame next to the configured value.
 
 ### 3.4 Camera calibration layout
 
-Fixed, under `data_root`; written and read by `spectra calibrate` (§8):
+Fixed, under `data_root`, one folder per camera (`acquisition.camera.type`):
+`camera_calibration/` for the RealSense, `camera_calibration_gc1020c/` for the
+Prosilica GC1020C, same layout. Written and read by `spectra calibrate` (§8):
 
 ```
 DATA/
-└── camera_calibration/
+└── camera_calibration/                 (camera_calibration_gc1020c/)
     ├── input/
     │   ├── calibration/     imgXXXX.png + posaXXXX.txt (+ intrinsics_realsense.json)
     │   └── validation/      imgXXXX.png + posaXXXX.txt
@@ -513,10 +544,11 @@ install.
 
 ### `spectra acquire`
 
-Fairino FR5 + RealSense acquisition with visual servoing, through the `spectra`
-console script. Acquisition only: it never submits anything, `spectra full`
-chains vision + registration after it. Same behaviour as `acquire.py` below;
-it needs `uv sync --extra acquisition` (RealSense, collision checks), not the
+Fairino FR5 + RealSense or Prosilica GC1020C (`acquisition.camera.type`)
+acquisition with visual servoing, through the `spectra` console script.
+Acquisition only: it never submits anything, `spectra full` chains vision +
+registration after it. Same behaviour as `acquire.py` below; it needs
+`uv sync --extra acquisition` (camera SDKs, collision checks), not the
 `processing` extra (§1.7).
 
 ```bash
@@ -592,7 +624,12 @@ re-runs: `RESULTS/` on Mufasa is shared between jobs), waits for the job and
 downloads only `mufasa.pull_patterns` of the stages that ran — by default the
 registration Excel reports and the spectral Rerun recording
 (`registration/*.xlsx`, `*.rrd`, `*.rbl`) — into the local
-`RESULTS/<dd-mm-yyyy>/<sample>/`. In `spectra full`, without the HSI cube
+`RESULTS/<dd-mm-yyyy>/<sample>/` (plus `validation/registration/*` and
+`validation/timing/*`, §9.6). The download is done by a process detached from
+the terminal (`mufasa.detach_pull: true`, needs `ssh_key_path`): closing the
+terminal, or Ctrl-C, stops only the waiting, not the download. Its log is
+`RESULTS/<dd-mm-yyyy>/<sample>/_job/pull_<jobid>.log`; it retries for an hour
+if the connection drops. In `spectra full`, without the HSI cube
 (here or on Mufasa) only Vision runs. CLI overrides (`--sample`, `--date`,
 `--mode`, `--set`) travel with the job. Paths set by hand in the YAML
 (`vision.input.*`, `registration.paths.*`) are refused: on Mufasa every path is
@@ -789,6 +826,44 @@ Runs made before this frame was introduced were mirrored (Z negated by the old
 `z_axis_points_down` option): their coordinates are not comparable with new
 runs.
 
+### 7.2 Metric scale
+
+With `pipeline_variant: sfm` MASt3R reconstructs at an arbitrary scale; the
+metric scale comes from the ArUco markers (`vision.aruco.scale_from`):
+
+| `scale_from` | Scale from | Notes |
+| --- | --- | --- |
+| `markers` (default) | the edge of each marker, `marker_edge_length_mm` (~10 mm) | measure the black square, not the paper |
+| `centers` | the distances between the marker centres, fitted (similarity) on the cassette table `centers_table` (default `DATA/validation/<validation.fixture_table>`) | ~50 mm baselines, independent of the edge; needs at least 4 markers of the table |
+
+With `centers` the log and `reconstruction_metadata.json` → `aruco_alignment.scale_info`
+report the residual of each centre after the fit, the scale with each marker
+left out and how different the edge-based scale would be. On Mufasa the table
+is synced with `DATA/validation/`. With the robot poses (`dense`) the frame is
+already metric: the scale is only computed and checked.
+
+### 7.3 MASt3R input zoom
+
+MASt3R works on images of `image_size` (512) px: a 1280x800 photo is reduced
+to 512x320 and the sample gets few pixels. With `vision.mast3r.zoom` MASt3R
+gets the central 1/zoom of every image instead (the same window for all,
+resized to 512): zoom x more pixels on the sample, same time, less background.
+
+| `zoom` | MASt3R gets |
+| --- | --- |
+| `1` (default) | the whole image (off) |
+| a number, e.g. `2` | the central 640x400 px of a 1280x800 image |
+| `auto` | the largest zoom (<= `zoom_max`, 2.5) whose window keeps every detected ArUco corner with `zoom_margin` (0.9) around it |
+
+Everything else uses the whole images: ArUco detection, colours, validation.
+Intrinsics, camera poses and outputs are in the original pixels as usual. The
+log gives the zoom, the view that limits it and the views where a fixed zoom
+may cut the sample; `reconstruction_metadata.json` → `alignment_info.network_zoom`
+records it; the crops MASt3R saw are in `<run>/inputs_mast3r_zoom/`. Above 2.5
+(1280-px images) the window is only upsampled. Note that `mast3r.voxel_size`
+is in the units of the cloud it is applied to: metres after bundle adjustment
+or with `dense` (1.2 mm with 0.0012), which can throw away the detail gained.
+
 ---
 
 ## 8. Camera calibration (robot PC)
@@ -798,16 +873,20 @@ views taken in **drag mode** (you move the robot by hand), and optionally the
 camera intrinsics, then validates the result on new views. No starting
 `cam2gripper` is needed. Code in `spectra/calibration/`, settings in the
 `calibration:` section of `configs/default.yaml`; robot (`ip`, `tool`,
-`euler_order`) and camera stream (`width`, `height`, `fps`, `n_avg_frames`)
-come from `acquisition.robot` / `acquisition.camera`. Data in
-`DATA/camera_calibration/` (§3.4).
+`euler_order`) and camera (`type`, `width`, `height`, ...) come from
+`acquisition.robot` / `acquisition.camera`. It calibrates the camera of
+`acquisition.camera.type`, with its data in `DATA/camera_calibration/`
+(RealSense) or `DATA/camera_calibration_gc1020c/` (§3.4).
 
 The result feeds the acquisition directly: with
-`acquisition.hand_eye.T_cam2gripper: null` (default) `spectra acquire` reads
-`DATA/camera_calibration/output/calibration/cam2gripper.txt`; a 4x4 matrix
-there pins a specific calibration instead. To acquire with the OpenCV
-intrinsics, set `acquisition.camera.intrinsics` to
-`DATA/camera_calibration/output/intrinsics/intrinsics_opencv.json`.
+`acquisition.camera.<type>.T_cam2gripper: null` (default) `spectra acquire`
+reads `output/calibration/cam2gripper.txt` in that camera's folder; a 4x4
+matrix there pins a specific calibration instead. The RealSense acquires with
+its factory intrinsics unless `acquisition.camera.realsense.intrinsics` is set
+to `DATA/camera_calibration/output/intrinsics/intrinsics_opencv.json`; the
+GC1020C has no factory intrinsics and uses its own
+`output/intrinsics/intrinsics_opencv.json` (or the JSON in
+`acquisition.camera.gc1020c.intrinsics`).
 
 ### 8.1 Procedure
 
@@ -821,10 +900,13 @@ calibration view to the last validation view.
    chessboard, keep still, **ENTER** saves, **q/ESC** quits. Views without the
    chessboard are not saved; re-running continues the numbering. Vary the
    orientation a lot (tilt in all directions + roll around the optical axis).
-   The factory intrinsics are saved once in `input/calibration/intrinsics_realsense.json`.
+   With the RealSense the factory intrinsics are saved once in
+   `input/calibration/intrinsics_realsense.json`. The exposure settings of
+   `calibration.camera` apply to the RealSense only; the GC1020C keeps those of
+   `acquisition.camera.gc1020c`.
 2. **Intrinsics** — `calibration.intrinsics.source`, used by both hand-eye and
    validation:
-   - `realsense`: factory values, nothing to do;
+   - `realsense`: factory values, nothing to do (RealSense only);
    - `opencv`: `--modality intrinsics` (target: mean reprojection < ~0.3 px);
    - `file`: a JSON `{"K": [[fx,0,cx],[0,fy,cy],[0,0,1]], "D": [[k1,k2,p1,p2,k3]]}`
      in `calibration.intrinsics.file`. From MATLAB: `K = cameraParams.Intrinsics.K`
@@ -852,7 +934,7 @@ calibration view to the last validation view.
 - **X** (self-consistency): board pose in base estimated from the validation images.
 - **Y** (out-of-sample, stricter): board pose in base estimated from the calibration images.
 
-Intrinsics are tied to the resolution (`acquisition.camera.width/height`):
+Intrinsics are tied to the resolution (`acquisition.camera.<type>.width/height`):
 images at another resolution are rejected.
 
 ---
@@ -860,8 +942,10 @@ images at another resolution are rejected.
 ## 9. Validation
 
 `spectra validate` checks the pipeline against 3D-printed phantoms of known
-geometry (protocol: `Protocollo_sperimentale_HSI.docx`). Only phase 1
-(`--modality vision`, the reconstruction) exists so far.
+geometry (protocol: `Protocollo_sperimentale_HSI.docx`): phase 1
+(`--modality vision`, the reconstruction, §9.3) and phase 2
+(`--modality registration`, HSI → 3D, §9.5). Without `--modality` both run;
+a sample with no HSI cube only skips phase 2.
 
 ### 9.1 Setup
 
@@ -925,7 +1009,11 @@ plane + `roi_margin_mm`):
 Marker checks: Kabsch corner residual and leave-one-marker-out error; ICP correction (rotation, shift).
 
 Scale is **kept**: the reconstruction keeps the scale vision set from the ArUco
-edge, every alignment is rigid, so a scale error shows up in the metrics.
+markers (§7.2), every alignment is rigid, so a scale error shows up in the
+metrics. With `scale_from: centers` the markers are the scale reference: their
+residuals are no longer an independent check (phantom and bersagli are), and
+the model is labelled `<backend>-<variant>-centers` in the summary (and gets
+`-zoom<z>` / `-zoomauto` with the MASt3R input zoom, §7.3).
 
 Fiducials (`fiducials` in `metrics.json`, `<alignment>.fiducials.*` in the
 summary): the bersagli, found in the STL as blind round holes on flat faces (up
@@ -958,6 +1046,8 @@ distance and elevation (mean / min / max), azimuth coverage.
 ```
 RESULTS/<dd-mm-yyyy>/<sample>/validation/vision/
 ├── metrics.json      every number above + the vision run used
+├── metrics.xlsx      the same, readable: Summary (case + metrics per alignment + checks),
+│                     Bersagli, Error vs height, Views, Markers, Warnings
 ├── error_map.ply     phantom region of the mesh coloured by |error| (mm, + error_map.npy)
 ├── fiducials.png     photo crops around each bersaglio (expected / found)
 └── validation.rrd    STL + reconstruction coloured by error, markers, fiducials (Rerun)
@@ -968,3 +1058,65 @@ RESULTS/_validation/vision_summary.xlsx (+ .json)
 
 The vision mesh is a height field: vertical walls become slanted strips one
 grid step wide, so expect errors of about half the grid step at the walls.
+
+### 9.5 Registration (phase 2)
+
+```bash
+spectra validate -m registration --sample T1_P1_R1
+spectra validate summary -m registration
+```
+
+Inputs and settings are those of the registration stage (`registration:`:
+`source`, `mode`, `render`, `detection`; HSI cube in
+`DATA/input_registration/<sample>/`, or the LiveView PNG in roi mode). Kept
+apart from phase 1: the reference is the marker corners **reconstructed by
+vision** (`aruco_markers_3d.json`), not the CAD.
+
+- **TRE, leave-one-marker-out:** for each marker seen in both, the homography
+  HSI → render is fitted on the other markers (at least `min_fit_markers`) and
+  evaluated on the 4 corners of the one left out;
+- **2D reprojection:** in HSI px (render corners mapped back by H⁻¹) and in mm
+  (the render is metric);
+- **3D:** HSI corner → H → render → (X, Y, Z) on the surface (`lookup`) vs
+  the JSON corner: norm, in plane (xy), depth (z);
+- **FRE:** the same with the homography fitted on all markers (what the
+  registration stage reports);
+- **checks** against `thresholds` (protocol: < 2 px, TRE < 1.5 mm).
+
+The markers lie at z = 0: the error above the marker plane (parallax of the
+HSI camera) is not measured here.
+
+```
+RESULTS/<dd-mm-yyyy>/<sample>/validation/registration/
+├── metrics.json      TRE / FRE summaries, per marker, per corner, checks
+└── overlay.png       detected corners (green) vs hold-out predictions (red)
+RESULTS/_validation/registration_summary.xlsx (+ .json)
+```
+
+`validation/registration/` also gets a copy of the registration stage's Excel
+reports (`<sample>_registration_errors.xlsx`,
+`<sample>_sweep_resolution_summary.xlsx`); the originals stay in
+`registration/`.
+
+### 9.6 Timing
+
+Every `spectra full` (and every job sent to Mufasa) records how long each phase
+and sub-phase took, in `RESULTS/<dd-mm-yyyy>/<sample>/validation/timing/`:
+
+| Phase | Sub-phases | Where |
+| --- | --- | --- |
+| check Mufasa | | this PC |
+| acquisition | init, bootstrap, planning + setup, execution per layer, return, dataset check | this PC |
+| upload to Mufasa + submit | connect, every sync, checksum, sbatch | this PC |
+| SLURM queue, SLURM job | stages vs job overhead (environment, model loading) | Mufasa (sacct) |
+| vision | the steps of `vision/timings.json` | Mufasa / this PC |
+| registration | renders, every sweep pair, best-pair re-run (single/roi: render, registration + export) | Mufasa / this PC |
+| validation | per modality | Mufasa / this PC |
+| download to this PC | | this PC |
+
+`timing_local.json` (this PC) + `timing_job.json` (where the stages ran) are
+merged into `timing.xlsx`: *Summary* (total wall clock, every phase with start,
+end, duration, % of the total) and *Sub-phases*. Phases overlap (the SLURM job
+contains vision, registration and validation); the total is the wall clock
+from the first start to the last end. The SLURM times come from `sacct`, in
+Mufasa's clock.

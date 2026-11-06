@@ -87,7 +87,7 @@ class RegistrationPaths(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     hsi_hdr:      Optional[Path] = None
-    mesh:         Optional[Path] = None
+    mesh:         Optional[Path] = None     # the 3D surface: mesh or point cloud (see `source`)
     aruco_json:   Optional[Path] = None
     liveview_png: Optional[Path] = None
     output_dir:   Optional[Path] = None
@@ -241,6 +241,10 @@ class RegistrationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: Literal["single", "roi", "batch", "sweep"] = "single"
+    # What the HSI is registered on: surface_mesh.ply (mesh) | cloud.ply (cloud).
+    # Picks the file `paths.mesh` is derived from when it is null; the loader
+    # tells the two apart by content (faces or not).
+    source: Literal["mesh", "cloud"] = "mesh"
     paths:       RegistrationPaths       = Field(default_factory=RegistrationPaths)
     detection:   RegistrationDetection   = Field(default_factory=RegistrationDetection)
     roi:         RegistrationRoiAlign    = Field(default_factory=RegistrationRoiAlign)
@@ -274,7 +278,8 @@ class RegistrationConfig(BaseModel):
 # =============================================================================
 # Calibration — hand-eye + intrinsics of the robot camera (spectra calibrate).
 # Robot / camera stream are NOT repeated: they come from acquisition.robot and
-# acquisition.camera. Data layout is fixed: <data_root>/camera_calibration/.
+# acquisition.camera. Data layout is fixed: <data_root>/camera_calibration/
+# (RealSense) or <data_root>/camera_calibration_<type>/ (acquisition.camera.type).
 # =============================================================================
 
 class CalibrationBoard(BaseModel):
@@ -359,7 +364,8 @@ class CalibrationConfig(BaseModel):
 # =============================================================================
 
 # =============================================================================
-# Validation (spectra validate) — ground-truth phantoms, protocol phase 1 (vision).
+# Validation (spectra validate) — ground-truth phantoms, protocol phase 1 (vision)
+# and phase 2 (registration).
 # Data layout is fixed: <data_root>/validation/ (marker table + STL assemblies).
 # =============================================================================
 
@@ -432,6 +438,29 @@ class ValidationVision(BaseModel):
     fiducials: ValidationFiducials = Field(default_factory=ValidationFiducials)
 
 
+class ValidationRegistrationThresholds(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reproj_px: float = Field(default=2.0, gt=0.0)    # protocol phase 2: < 2 px
+    tre_mm: float = Field(default=1.5, gt=0.0)       # protocol phase 2: TRE < 1.5 mm
+
+
+class ValidationRegistration(BaseModel):
+    """Phase 2: the HSI -> 3D registration, leave-one-marker-out against the
+    marker corners reconstructed by vision (validation/registration.py). The
+    inputs and render / detection settings are those of `registration:`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Markers the homography is fitted on, at least (hold-out needs one more).
+    min_fit_markers: int = Field(default=3, ge=1)
+    #: 3D lookup on the render: bicubic (bilinear where the 4x4 is incomplete) | bilinear.
+    lookup: Literal["bicubic", "bilinear"] = "bicubic"
+    thresholds: ValidationRegistrationThresholds = Field(
+        default_factory=ValidationRegistrationThresholds)
+    save_overlay: bool = True                       # overlay.png
+
+
 class ValidationConfig(BaseModel):
     """``validation:`` section (spectra validate, stage ``validation``)."""
 
@@ -446,6 +475,7 @@ class ValidationConfig(BaseModel):
     #: Name of the reconstruction model in the summary; null = backend + pipeline variant.
     model_label: Optional[str] = None
     vision: ValidationVision = Field(default_factory=ValidationVision)
+    registration: ValidationRegistration = Field(default_factory=ValidationRegistration)
 
     @field_validator("sample_pattern")
     @classmethod
@@ -487,11 +517,14 @@ class MufasaConfig(BaseModel):
     wait: bool = True
     poll_s: int = Field(default=20, ge=1)
     pull_results: bool = True
+    #: The download runs in a process detached from the terminal: closing it
+    #: does not stop it (needs ssh_key_path). false: downloaded by this terminal.
+    detach_pull: bool = True
     #: Downloaded after the job, relative to RESULTS/<date>/<sample>/ on Mufasa
-    #: ("dir/glob"); everything else stays on Mufasa.
+    #: ("dir/glob"); everything else stays on Mufasa. validation/timing/* always.
     pull_patterns: List[str] = Field(default_factory=lambda: [
         "registration/*.xlsx", "registration/*.rrd", "registration/*.rbl",
-        "validation/vision/*"])
+        "validation/vision/*", "validation/registration/*", "validation/timing/*"])
 
     @model_validator(mode="after")
     def _required_when_enabled(self) -> "MufasaConfig":

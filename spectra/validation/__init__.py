@@ -3,17 +3,21 @@
 phantoms in a cassette with ArUco markers at known positions).
 CLI: ``spectra validate``. Protocol: Protocollo_sperimentale_HSI.docx.
 
-Modalities (one per protocol phase; only ``vision`` exists so far):
+Modalities (one per protocol phase):
 
-    vision   Phase 1: the reconstruction (surface_mesh.ply) against the
-             phantom STL — accuracy, completeness, Hausdorff, error vs height.
+    vision        Phase 1: the reconstruction (surface_mesh.ply) against the
+                  phantom STL — accuracy, completeness, Hausdorff, error vs height.
+    registration  Phase 2: HSI -> 3D, leave-one-marker-out against the marker
+                  corners reconstructed by vision — reprojection (px, mm), TRE
+                  3D, in plane and in depth. Needs the sample's HSI cube
+                  (DATA/input_registration/); skipped without it unless asked for.
 
 Steps:
 
-    run      validate one sample (its vision run) -> RESULTS/<date>/<sample>/validation/vision/
+    run      validate one sample (its vision run) -> RESULTS/<date>/<sample>/validation/<modality>/
              with --all: every sample with a vision run whose name says its
              phantom (validation.sample_pattern / cases), then the summary
-    summary  every validated sample under RESULTS -> RESULTS/_validation/vision_summary.xlsx
+    summary  every validated sample under RESULTS -> RESULTS/_validation/<modality>_summary.xlsx
 
 Settings: ``validation:`` in the unified config. Data, fixed layout:
 
@@ -28,7 +32,7 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-MODALITIES = ("vision",)
+MODALITIES = ("vision", "registration")
 STEPS = ("run", "summary")
 
 
@@ -59,15 +63,27 @@ def run_validation_stage(cfg, vision_dir: Optional[Path] = None,
     if cfg.validation is None:
         raise SystemExit("[validation] `validation:` section missing in the config")
     out: dict[str, Any] = {}
-    if "vision" in modalities:
+    if vision_dir is None:
         from ..orchestrator import find_vision_dir
+
+        vision_dir, fallback = find_vision_dir(cfg.results_root, cfg.sample_name, cfg.results_date)
+        if fallback:
+            print(f"[validation] no vision run for this date: using {vision_dir}")
+    if "vision" in modalities:
         from .vision import validate_vision
 
-        if vision_dir is None:
-            vision_dir, fallback = find_vision_dir(cfg.results_root, cfg.sample_name, cfg.results_date)
-            if fallback:
-                print(f"[validation] no vision run for this date: using {vision_dir}")
         out["vision"] = validate_vision(cfg, Path(vision_dir), output_dir(cfg, "vision"))
+    if "registration" in modalities:
+        from .registration import missing_inputs, validate_registration
+
+        missing = missing_inputs(cfg, Path(vision_dir))
+        if missing and list(modalities) != ["registration"]:
+            # Every modality by default: a sample with no HSI cube only skips phase 2.
+            print(f"[validation] registration skipped for {cfg.sample_name}: missing {missing}")
+            out["registration"] = {"skipped": missing}
+        else:
+            out["registration"] = validate_registration(cfg, Path(vision_dir),
+                                                        output_dir(cfg, "registration"))
     return out
 
 
@@ -130,6 +146,15 @@ def run_all(cfg, modalities=MODALITIES) -> dict[str, Any]:
 
 
 def run_summary(cfg, modalities=MODALITIES) -> dict[str, Any]:
+    from .registration import summarize as summarize_registration
     from .report import summarize
 
-    return {m: summarize(cfg, m) for m in modalities}
+    out: dict[str, Any] = {}
+    for m in modalities:
+        try:
+            out[m] = summarize_registration(cfg) if m == "registration" else summarize(cfg, m)
+        except SystemExit as exc:           # no validation of this modality yet
+            if list(modalities) == [m]:
+                raise
+            print(f"{exc}")
+    return out

@@ -8,7 +8,7 @@ Top-level commands::
                           # (the stages listed in `stages:`)
     spectra detect        # standalone 2D ArUco detection (unchanged)
     spectra viewer        # local 3D viewer (unchanged)
-    spectra acquire       # robotic acquisition only (Fairino FR5 + RealSense)
+    spectra acquire       # robotic acquisition only (Fairino FR5 + RealSense / GC1020C)
     spectra calibrate     # hand-eye + intrinsics of the robot camera (+ validation)
     spectra validate      # validation against ground-truth phantoms (README §9)
 
@@ -174,9 +174,11 @@ def _run_on_mufasa(
     dry_run: bool = False,
     force_cpu: bool = False,
     validate_all: bool = False,
+    new_timing: bool = True,
 ) -> None:
     """Submit `stages` to Mufasa (mufasa.enabled is true) and wait for them.
-    ``validate_all``: one job running `spectra validate --all` on every case there."""
+    ``validate_all``: one job running `spectra validate --all` on every case there.
+    ``new_timing``: start a new timing record (False: `spectra full` did it)."""
     remote, _ = _load_script("remote")
     print(f"[bold]{'validate --all' if validate_all else ' + '.join(stages)} → Mufasa[/bold] "
           "(mufasa.enabled: true)")
@@ -184,6 +186,7 @@ def _run_on_mufasa(
         jobid, state = remote.submit(
             str(config), stages=stages, overrides=overrides, dry_run=dry_run,
             extra_args=["--cpu"] if force_cpu else [], validate_all=validate_all,
+            new_timing=new_timing,
         )
     except SystemExit as exc:          # remote.py reports errors as SystemExit(msg)
         print(f"[red]{escape(str(exc))}[/red]")
@@ -232,11 +235,20 @@ def _require_local_processing(stages: List[str]) -> None:
             raise typer.Exit(code=1)
 
 
-def _require_acquisition_packages() -> None:
-    missing = _missing(("pyrealsense2", "fcl", "trimesh"))
+def _camera_sdk(acquisition: Optional[dict]) -> tuple[str, str]:
+    """(camera type, Python module it needs) of `acquisition.camera` (cameras.py)."""
+    cameras, _ = _load_script("cameras")
+    kind = cameras.resolve_camera_cfg((acquisition or {}).get("camera"))["type"]
+    return kind, cameras.SDK_MODULE[kind]
+
+
+def _require_acquisition_packages(acquisition: Optional[dict]) -> None:
+    kind, sdk = _camera_sdk(acquisition)
+    missing = _missing((sdk, "fcl", "trimesh"))
     if missing:
-        print(f"[red]The acquisition needs {missing}.[/red] "
-              "Install them on the robot PC:  uv sync --extra acquisition")
+        print(f"[red]The acquisition with the {kind} camera needs {missing}.[/red] "
+              "Install them on the robot PC:  uv sync --extra acquisition"
+              + ("  (+ Vimba X for the GigE camera, README §1.7)" if kind == "gc1020c" else ""))
         raise typer.Exit(code=1)
 
 
@@ -380,7 +392,7 @@ def full_cmd(
     where = "Mufasa (SLURM)" if on_mufasa else "this PC"
     print(f"[bold]spectra full[/bold] — sample {cfg.sample_name!r}")
     if acquire:
-        print("  acquisition  : this PC (robot + RealSense)")
+        print(f"  acquisition  : this PC (robot + {_camera_sdk(cfg.acquisition)[0]})")
     for s in compute:
         print(f"  {s:<13}: {where}")
 
@@ -405,6 +417,18 @@ def full_cmd(
             run_full(cfg, force_cpu=force_cpu, force_vision=force_vision, dry_run=True)
         return
 
+    # Timing of the whole run (spectra/timing.py): this PC's part here, the
+    # stages where they run, all merged in validation/timing/timing.xlsx.
+    import time as _time
+
+    from . import timing
+    from .orchestrator import today_folder
+
+    t_full0 = _time.time()
+    tdir = timing.timing_dir(cfg.results_root, cfg.results_date or today_folder(),
+                             cfg.sample_name)
+    timing.reset(tdir / timing.LOCAL, sample=cfg.sample_name, stages=list(cfg.stages))
+
     # Everything that can fail is checked BEFORE the robot moves.
     if compute and on_mufasa:
         remote, _ = _load_script("remote")
@@ -413,24 +437,44 @@ def full_cmd(
         except SystemExit as exc:
             print(f"[red]{escape(str(exc))}[/red]")
             raise typer.Exit(code=1) from None
+        timing.add(tdir / timing.LOCAL, "check Mufasa (before the robot moves)", t_full0,
+                   _time.time(), where="this PC")
     elif compute:
         _require_local_processing(compute)
 
     if acquire:
+        t_acq0 = _time.time()
         n_saved = _run_acquire(config, [], sample=cfg.sample_name,
                                overwrite=overwrite, no_viz=no_viz)
+        _record_acquisition(tdir / timing.LOCAL, cfg, t_acq0, _time.time())
         if not n_saved:
             print("[red]Nothing acquired: vision / registration not started.[/red]")
             raise typer.Exit(code=1)
 
     if not compute:
+        timing.write_xlsx(tdir, sample=cfg.sample_name, date=tdir.parent.parent.name)
         return
     if on_mufasa:
-        _run_on_mufasa(config, ovr, compute, force_cpu=force_cpu)
+        # the download (and timing.xlsx) is finished by a background process
+        _run_on_mufasa(config, ovr, compute, force_cpu=force_cpu, new_timing=False)
     else:
         from .orchestrator import run_full
         # A fresh acquisition makes today's vision outputs (if any) stale.
         run_full(cfg, force_cpu=force_cpu, force_vision=force_vision or acquire)
+
+
+def _record_acquisition(tfile: Path, cfg, t0: float, t1: float) -> None:
+    """Acquisition phase of the timing, with the sub-phases acquire.py wrote in
+    DATA/input_vision/<sample>/acquisition_timing.json."""
+    from . import timing
+
+    subs = []
+    try:
+        p = Path(cfg.data_root) / "input_vision" / cfg.sample_name / "acquisition_timing.json"
+        subs = json.loads(p.read_text(encoding="utf-8")).get("subphases", [])
+    except Exception:
+        pass
+    timing.add(tfile, "acquisition (robot + camera)", t0, t1, where="this PC", subphases=subs)
 
 
 # =============================================================================
@@ -488,7 +532,8 @@ def _run_acquire(
         argv.append("--no-viz")
     if overwrite:
         argv.append("--overwrite")
-    _require_acquisition_packages()
+    with open(config, encoding="utf-8") as f:
+        _require_acquisition_packages((yaml.safe_load(f) or {}).get("acquisition"))
     module, script = _load_script("acquire")
     old_argv = sys.argv
     sys.argv = [str(script), *argv]
@@ -565,8 +610,9 @@ def calibrate_cmd(
                                 readable=True, help="Unified YAML (needs a `calibration:` section)."),
 ) -> None:
     """Camera calibration on the robot PC. Without --modality: calibration
-    acquisition → intrinsics → hand-eye → validation acquisition → validation.
-    Data in DATA/camera_calibration/."""
+    acquisition → intrinsics → hand-eye → validation acquisition → validation,
+    for the camera of acquisition.camera.type. Data in DATA/camera_calibration/
+    (RealSense) or DATA/camera_calibration_<type>/ (other cameras)."""
     from . import calibration
     from .calibration import common
 
@@ -579,7 +625,8 @@ def calibrate_cmd(
         raise typer.BadParameter(f"{config} has no `calibration:` section.")
     if any(s == "acquire" for _, s in steps):
         sdk = Path(__file__).resolve().parent / "acquisition" / "fairino" / "Robot.py"
-        need = _missing(("pyrealsense2",)) + ([] if sdk.is_file() else [str(sdk)])
+        need = _missing((_camera_sdk(cfg.acquisition)[1],))
+        need += [] if sdk.is_file() else [str(sdk)]
         if need:
             print(f"[red]The calibration acquisition needs {need}.[/red] Install "
                   "`uv sync --extra acquisition` and copy the Fairino SDK (README §1.7).")
@@ -608,7 +655,8 @@ def validate_cmd(
         None, help="run (default): validate --sample against its vision run | "
                    "summary: every validated sample under results_root."),
     modality: Optional[str] = typer.Option(
-        None, "--modality", "-m", help="vision (protocol phase 1). Omitted: every modality."),
+        None, "--modality", "-m", help="vision (protocol phase 1) | registration (phase 2). "
+                                     "Omitted: every modality."),
     config: Path = typer.Option(Path("configs/default.yaml"), "--config", "-c", exists=True,
                                 readable=True, help="Unified YAML (needs a `validation:` section)."),
     sample: Optional[str] = typer.Option(None, "--sample", help="Sample to validate, e.g. T1_P1_R1."),

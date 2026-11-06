@@ -336,15 +336,43 @@ def load_aruco_3d_json(json_path, scale_m_to_mm=True):
 # 2 — Load mesh
 # =============================================================================
 
+class PointCloudSurface:
+    """The reconstruction as a point cloud (vision's ``cloud.ply``): no faces,
+    so it is rendered by binning the points on the pixel grid
+    (``render_orthographic_topview_cloud``) instead of by ray casting.
+    Same interface the render code reads from a mesh: ``bounds``, ``apply_scale``."""
+
+    def __init__(self, points):
+        self.points = np.asarray(points, dtype=np.float64)
+
+    @property
+    def bounds(self):
+        return np.array([self.points.min(axis=0), self.points.max(axis=0)])
+
+    def apply_scale(self, factor):
+        self.points *= factor
+
+
 def load_mesh(mesh_path, scale_m_to_mm=True):
     """
-    Load a 3D mesh and optionally scale from metres to millimetres.
+    Load the 3D surface registration works on and optionally scale from metres
+    to millimetres: a mesh (``surface_mesh.ply``), or a point cloud
+    (``cloud.ply``, a PLY without faces — see ``registration.source``).
 
     Returns
     -------
-    mesh : trimesh.Trimesh
+    mesh : trimesh.Trimesh, or PointCloudSurface for a point cloud
     """
-    mesh = trimesh.load(mesh_path, force='mesh')
+    mesh = trimesh.load(mesh_path)
+    if isinstance(mesh, trimesh.PointCloud):
+        cloud = PointCloudSurface(mesh.vertices)
+        print(f"[Cloud] Loaded : {mesh_path}")
+        print(f"        Points : {len(cloud.points)}")
+        print(f"        Bounds : {cloud.bounds}")
+        if scale_m_to_mm:
+            cloud.apply_scale(1000.0)
+            print(f"[Cloud] Scaled x1000 (m -> mm). New bounds: {cloud.bounds}")
+        return cloud
     if not isinstance(mesh, trimesh.Trimesh):
         mesh = trimesh.util.concatenate(
             list(mesh.geometry.values()) if hasattr(mesh, 'geometry') else [mesh]
@@ -391,6 +419,12 @@ def render_orthographic_topview(mesh, resolution_mm_per_px=2.0, margin_mm=10.0,
     origin_xy   : (xmin, ymin) top-left corner in mesh mm coordinates
     res         : resolution_mm_per_px (echoed)
     """
+    if isinstance(mesh, PointCloudSurface):
+        return render_orthographic_topview_cloud(
+            mesh, resolution_mm_per_px, margin_mm,
+            xmin_override=xmin_override, xmax_override=xmax_override,
+            ymin_override=ymin_override, ymax_override=ymax_override)
+
     bounds = mesh.bounds
     xmin = xmin_override if xmin_override is not None else bounds[0, 0] - margin_mm
     xmax = xmax_override if xmax_override is not None else bounds[1, 0] + margin_mm
@@ -443,6 +477,14 @@ def render_orthographic_topview(mesh, resolution_mm_per_px=2.0, margin_mm=10.0,
     del ray_ori_all
     print(f"\n[Render] Hits: {total_hits:,} / {n_rays:,}")
 
+    render_rgb = _depth_to_bgr(depth_map)
+    origin_xy  = (xmin, ymin)
+    print(f"[Render] Done. origin_xy = ({xmin:.2f}, {ymin:.2f}) mm")
+    return render_rgb, depth_map, xyz_map, origin_xy, resolution_mm_per_px
+
+
+def _depth_to_bgr(depth_map):
+    """Depth-shaded grayscale (BGR) of a depth map, black where NaN."""
     z_valid = depth_map[~np.isnan(depth_map)]
     if z_valid.size > 0:
         z_min, z_max = z_valid.min(), z_valid.max()
@@ -450,11 +492,61 @@ def render_orthographic_topview(mesh, resolution_mm_per_px=2.0, margin_mm=10.0,
         gray  = np.where(np.isnan(depth_map), 0,
                          (depth_map - z_min) / denom * 255).astype(np.uint8)
     else:
-        gray = np.zeros((H, W), dtype=np.uint8)
+        gray = np.zeros(depth_map.shape, dtype=np.uint8)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-    render_rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+def render_orthographic_topview_cloud(cloud, resolution_mm_per_px=2.0, margin_mm=10.0,
+                                      xmin_override=None, xmax_override=None,
+                                      ymin_override=None, ymax_override=None):
+    """
+    Orthographic top view of a point cloud on the SAME pixel grid as
+    ``render_orthographic_topview`` (pixel (r, c) at X = xmin + c*res,
+    Y = ymin + r*res, where the mesh render casts its ray), same outputs.
+
+    Each point goes to its nearest pixel; a pixel takes the MEDIAN Z of its
+    points, with X, Y = the pixel centre (as a ray hit on the mesh). Pixels
+    with no point stay NaN: no hole filling or smoothing, unlike
+    surface_mesh.ply — the 3D lookup's bilinear / bicubic fallbacks handle them.
+    """
+    bounds = cloud.bounds
+    xmin = xmin_override if xmin_override is not None else bounds[0, 0] - margin_mm
+    xmax = xmax_override if xmax_override is not None else bounds[1, 0] + margin_mm
+    ymin = ymin_override if ymin_override is not None else bounds[0, 1] - margin_mm
+    ymax = ymax_override if ymax_override is not None else bounds[1, 1] + margin_mm
+
+    xs = np.arange(xmin, xmax, resolution_mm_per_px)
+    ys = np.arange(ymin, ymax, resolution_mm_per_px)
+    W, H = len(xs), len(ys)
+    print(f"[Render cloud] Grid   : {W} x {H} px  ({resolution_mm_per_px} mm/px)")
+    print(f"               X: [{xmin:.1f}, {xmax:.1f}] mm   Y: [{ymin:.1f}, {ymax:.1f}] mm")
+
+    P = cloud.points
+    c = np.rint((P[:, 0] - xmin) / resolution_mm_per_px).astype(np.int64)
+    r = np.rint((P[:, 1] - ymin) / resolution_mm_per_px).astype(np.int64)
+    inside = (c >= 0) & (c < W) & (r >= 0) & (r < H)
+    pix = r[inside] * W + c[inside]
+    z = P[inside, 2]
+
+    # Median Z per pixel: sort by (pixel, z), then middle element(s) of each run.
+    order = np.lexsort((z, pix))
+    pix, z = pix[order], z[order]
+    uniq, start, count = np.unique(pix, return_index=True, return_counts=True)
+    z_med = 0.5 * (z[start + (count - 1) // 2] + z[start + count // 2])
+
+    depth_map = np.full((H, W), np.nan, dtype=np.float32)
+    xyz_map   = np.full((H, W, 3), np.nan, dtype=np.float32)
+    rr, cc = uniq // W, uniq % W
+    depth_map[rr, cc]  = z_med
+    xyz_map[rr, cc, 0] = xs[cc]
+    xyz_map[rr, cc, 1] = ys[rr]
+    xyz_map[rr, cc, 2] = z_med
+    print(f"[Render cloud] {int(inside.sum()):,} points -> {len(uniq):,} / {W * H:,} px "
+          f"(median {int(np.median(count)) if len(count) else 0} points/px)")
+
+    render_rgb = _depth_to_bgr(depth_map)
     origin_xy  = (xmin, ymin)
-    print(f"[Render] Done. origin_xy = ({xmin:.2f}, {ymin:.2f}) mm")
+    print(f"[Render cloud] Done. origin_xy = ({xmin:.2f}, {ymin:.2f}) mm")
     return render_rgb, depth_map, xyz_map, origin_xy, resolution_mm_per_px
 
 
