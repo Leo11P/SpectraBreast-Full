@@ -7,6 +7,14 @@ Copiare accanto ad acquire.py. Dalla RADICE della repository:
   python spectra/acquisition/step2_goto_joints.py
 
 L'ultimo comando abilita ed esegue il moto dopo i controlli e 5 secondi.
+
+Camera: quella scelta in acquisition.camera.type del YAML (realsense | gc1020c),
+aperta con cameras.py come fa acquire.py. Con la GC1020C servono Vimba X + vmbpy,
+le intrinseche (spectra calibrate --modality intrinsics), l'hand-eye in
+DATA/camera_calibration_gc1020c/ e acquisition.camera.gc1020c.camera_box.
+acquire.py di questa repo gestisce solo la RealSense: la scelta della camera,
+l'hand-eye e le intrinseche della GC1020C sono risolte qui (setup_camera_cfg,
+resolve_intrinsics), senza modificare acquire.py.
 Foto PNG: una per tappa verificata, incluso il ritorno iniziale.
 Ogni esecuzione crea una sottocartella distinta in foto_waypoints/.
 Q richiede interruzione; non sostituisce l'arresto fisico.
@@ -17,6 +25,7 @@ import argparse
 import copy
 import json
 import math
+import os
 from pathlib import Path
 import queue
 import threading
@@ -26,15 +35,17 @@ import yaml
 import numpy as np
 import cv2 as cv
 import acquire as ac                     # [ORIGINALE] funzioni del vostro file
+from cameras import (calibration_dir_name, open_camera,  # [NUOVO] RealSense o GC1020C
+                     resolve_camera_cfg)                  # (cameras.py)
 
 # Configurazioni assolute [J1, J2, J3, J4, J5, J6], in gradi.
 # Provengono da goto_joints; non sono certificate per questa installazione.
 POSES = [
-    [66.546,  -74.044, 117.687, -172.105,  -88.877, -82.596],
-    [67.327,  -90.308, 127.099,  -88.724,  -33.249, 124.739],
-    [73.675, -109.578, 138.704,  -79.536,  -61.214,  95.196],
-    [41.587,  -74.039, 123.442, -172.105,  -88.926, -74.788],
-    [76.424,  -77.979, 143.171, -181.996, -121.568, -41.438],
+    [63.705, -104.631, 110.318, -92.256, -70.281, 161.089],
+    [103.643, -83.706, 91.872, -78.088, -107.794, 161.09],
+    [123.588, -83.711, 92.754, -78.026, -107.793, 161.09],
+    [101.521, -52.832, 60.617, -45.995, -107.386, 161.089],
+    [57.359, -51.818, 66.911, -45.993, -70.47, 161.089],
 ]
 RITORNO_INIZIALE = True  # anche P5 -> iniziale viene controllato
 PAUSA_TAPPA = 1.0
@@ -56,6 +67,61 @@ TIMEOUT_INQUADRATURA = 8.0
 # .png: la fotografia.
 # .json accanto alla foto: nome della tappa e angoli dei giunti.
 # sessione.json: parametri della camera e del controllo ArUco.
+
+def setup_camera_cfg(cfg):
+    """[NUOVO] Come load_config dell'acquire.py nuovo: cfg['camera'] diventa la
+    camera scelta (acquisition.camera.type), piatta: chiavi comuni + il suo
+    blocco. Hand-eye, ingombro e cartella di calibrazione seguono la camera:
+      realsense -> acquisition.hand_eye / acquisition.camera_box / DATA/camera_calibration/
+      gc1020c   -> acquisition.camera.gc1020c.*            / DATA/camera_calibration_gc1020c/
+    """
+    cam = resolve_camera_cfg(cfg.get("camera"))
+    if cam["type"] == "realsense":      # layout di questa repo: hand_eye / camera_box a parte
+        cam.setdefault("T_cam2gripper", (cfg.get("hand_eye") or {}).get("T_cam2gripper"))
+        cam.setdefault("camera_box", cfg.get("camera_box"))
+    data_root = os.path.dirname(cfg["_calib_dir"])     # load_config: <data_root>/camera_calibration
+    cfg["camera"] = cam
+    cfg["camera_box"] = cam.get("camera_box")          # letto da collision_guard
+    cfg["hand_eye"] = {"T_cam2gripper": cam.get("T_cam2gripper")}   # letto da ac.load_T_cam2gripper
+    cfg["_calib_dir"] = os.path.join(data_root, calibration_dir_name(cam["type"]))
+    return cam["type"]
+
+
+def resolve_intrinsics(cfg, camera):
+    """[NUOVO] RealSense: ac.resolve_intrinsics (fabbrica o override), invariato.
+    GC1020C: nessuna intrinseca di fabbrica -> calibrazione OpenCV della camera,
+    <calib dir>/output/intrinsics/intrinsics_opencv.json, o il JSON indicato in
+    acquisition.camera.gc1020c.intrinsics. La risoluzione salvata con la
+    calibrazione (img_size) deve coincidere con quella dello stream."""
+    if camera.factory_intrinsics() is not None:
+        return ac.resolve_intrinsics(cfg, camera)
+    kind = cfg["camera"]["type"]
+    path = cfg["camera"].get("intrinsics") or os.path.join(
+        cfg["_calib_dir"], "output", "intrinsics", "intrinsics_opencv.json")
+    path = os.path.abspath(str(path))
+    if not os.path.isfile(path):
+        raise SystemExit(f"[intrinsics] la camera {kind} non ha intrinseche di fabbrica e "
+                         f"{path} non esiste: eseguire `spectra calibrate --modality "
+                         f"intrinsics` (o impostare acquisition.camera.{kind}.intrinsics)")
+    K, D = ac.load_intrinsics_override(path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            size = json.load(f).get("img_size")
+        size = [int(v) for v in size] if size else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        size = None
+    if size is not None and size != [camera.w, camera.h]:
+        raise SystemExit(f"[intrinsics] {path} calcolate a {size[0]}x{size[1]} ma la {kind} "
+                         f"trasmette {camera.w}x{camera.h}: rifare le intrinseche o "
+                         "correggere width/height")
+    src = {"source": "override" if cfg["camera"].get("intrinsics") else "calibration",
+           "path": path, "camera": kind, "width": camera.w, "height": camera.h,
+           "K": np.asarray(K, float).tolist(), "D": np.asarray(D, float).ravel().tolist()}
+    cfg["_intrinsics_source"] = src
+    print(f"[intrinsics] {kind}: {path}: fx={K[0,0]:.2f} fy={K[1,1]:.2f} "
+          f"cx={K[0,2]:.2f} cy={K[1,2]:.2f}")
+    return K, D
+
 
 def check(code, name):
     """Un codice diverso da zero interrompe la procedura."""
@@ -131,7 +197,7 @@ class RobotIO(ac.RobotIO):
 class VideoFrames:
     """[NUOVO] Passa copie delle immagini al bootstrap senza aprire due camere.
 
-    La finestra e la RealSense sono gestite solo dal programma principale.
+    La finestra e la camera (RealSense o GC1020C) sono gestite solo dal programma principale.
     Il calcolo del percorso e il robot lavorano separatamente: il video continua.
     """
     def __init__(self, stop):
@@ -390,6 +456,25 @@ class WaypointPhotos:
         )
         self._write_manifest()
 
+def poll_frame(camera, last):
+    """[NUOVO] Fotogramma colore BGR nuovo SENZA attendere: (img, indice) o (None, last).
+
+    RealSense: poll_for_frames della pipeline. GC1020C (Vimba X): il callback
+    dello stream conserva l'ultimo frame completo; si legge solo se piu nuovo
+    di `last` (timeout 0, quindi non blocca la finestra).
+    """
+    if camera.kind == "realsense":
+        frames = camera.pipe.poll_for_frames()
+        if not frames:
+            return None, last
+        color = frames.get_color_frame()
+        if not color:
+            return None, last
+        return np.asanyarray(color.get_data()).copy(), last + 1
+    img, idx = camera._next(last, 0.0)
+    return (None, last) if img is None else (img.copy(), idx)
+
+
 def require_guard(guard):
     if not (guard.enable and guard.available and guard.validated):
         raise RuntimeError("Controllo collisioni assente o modello non validato: niente moto")
@@ -442,7 +527,7 @@ def plan_joints(robot, cfg, target, T_c2g, K, D, stop): # prepara e controlla l'
             raise RuntimeError(f"{name}: distanza del bersaglio non valida")
         point = ac.base_points_to_cam(center, T)[0]
         if point[2] <= 1:
-            raise RuntimeError("Bersaglio dietro la camera")
+            raise RuntimeError(f"{name}: bersaglio dietro la camera (z camera = {point[2]:.0f} mm)")
         uv, _ = cv.projectPoints(point.reshape(1, 3), np.zeros(3), np.zeros(3), K, D)
         u, v = uv.reshape(2)
         vis = cfg["visibility"]
@@ -452,14 +537,14 @@ def plan_joints(robot, cfg, target, T_c2g, K, D, stop): # prepara e controlla l'
             margin = float(np.clip(margin, vis.get("margin_px_min", 25), vis.get("margin_px_max", 180)))
         if not (margin <= u <= cfg["camera"]["width"]-margin and
                 margin <= v <= cfg["camera"]["height"]-margin):
-            raise RuntimeError("Centro del bersaglio fuori dal margine immagine")
+            raise RuntimeError(f"{name}: centro del bersaglio fuori dal margine immagine (u={u:.0f}, v={v:.0f} px)")
         if abs(abs(flange[4])-90) < float(cfg["visibility"]["gimbal_lock_margin_deg"]):
-            raise RuntimeError("Orientamento troppo vicino alla zona Euler esclusa")
+            raise RuntimeError(f"{name}: orientamento troppo vicino alla zona Euler esclusa")
         coverage = ac._surface_coverage(target["corners_base"], T, K, D,
             int(cfg["camera"]["width"]), int(cfg["camera"]["height"]),
             float(cfg["visibility"].get("margin_px", 40)))
         if coverage < float(cfg["visibility"].get("min_marker_coverage", 0)):
-            raise RuntimeError("Marker fuori dall'inquadratura prevista")
+            raise RuntimeError(f"{name}: marker fuori dall'inquadratura prevista")
         poses.append({"name": name, "joints": q, "flange": flange,
                       "cam_T_base": T})
 
@@ -629,7 +714,13 @@ def main():
         cfg["waypoint_check"] = waypoint_options(
             full_config, cfg)
         print("[waypoint]", cfg["waypoint_check"], flush=True)
+    kind = setup_camera_cfg(cfg)          # [NUOVO] realsense | gc1020c (acquisition.camera.type)
     cfg["camera"]["depth"] = False        # [MODIFICATO] solo video colore, niente depth
+    print(f"[camera] {kind}", flush=True)
+    if kind != "realsense" and not cfg.get("camera_box") and not args.preview_only:
+        # Come acquire.py: senza ingombro camera il controllo collisioni non e affidabile.
+        raise SystemExit(f"acquisition.camera.{kind}.camera_box mancante: misurare "
+                         "camera + ottica + staffa prima di muovere il robot")
     cfg["robot"]["vel"] = VELOCITA
     if not args.preview_only and not args.plan_only:
         ac.prepare_out_dir(cfg["_out_dir"], overwrite=False)  # [ORIGINALE] prepara la cartella di output
@@ -641,20 +732,20 @@ def main():
     status = "Apro la telecamera"
     finished = False
     try:
-        camera = ac.RS(cfg)              # [ORIGINALE] risoluzione e fps del YAML
-        K, D = ac.resolve_intrinsics(cfg, camera)  # [ORIGINALE] parametri ottici della camera
+        camera = open_camera(cfg["camera"], depth=False)  # [MODIFICATO] camera del YAML (cameras.py)
+        K, D = resolve_intrinsics(cfg, camera)  # [NUOVO] fabbrica (RealSense) o calibrazione (GC1020C)
         cv.namedWindow(window, cv.WINDOW_NORMAL)    # crea della finestra video
-        cv.resizeWindow(window, 960, 600)   # grandezza della finestra video e non è la risoluzione delle immagini.
+        # grandezza della finestra video (non la risoluzione delle immagini), col rapporto della camera
+        cv.resizeWindow(window, 960, int(round(960 * camera.h / camera.w)))
         last_frame = time.monotonic()
         frame = None
+        frame_idx = 0
         while not finished:
-            frames = camera.pipe.poll_for_frames()  # [NUOVO] non attende un frame
-            if frames:
-                color = frames.get_color_frame()
-                if color:
-                    frame = np.asanyarray(color.get_data()).copy()
-                    last_frame = time.monotonic()
-                    bridge.publish(frame)
+            new, frame_idx = poll_frame(camera, frame_idx)  # [NUOVO] non attende un frame
+            if new is not None:
+                frame = new
+                last_frame = time.monotonic()
+                bridge.publish(frame)
             if time.monotonic()-last_frame > 3:
                 raise RuntimeError("Video assente per oltre 3 secondi")
             if frame is not None:

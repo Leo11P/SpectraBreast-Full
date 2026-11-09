@@ -151,6 +151,10 @@ acquisition:
     euler_order: ZYX
 
   camera:
+    # Camera on the flange: realsense (D456) | gc1020c (Prosilica GC1020C, Vimba X).
+    # NB: in this repo only step2_traiettoria_per_punti.py reads `type` and the
+    # gc1020c block below; acquire.py keeps using the RealSense keys at this level.
+    type: realsense
     width: 1280
     height: 800
     fps: 10
@@ -167,6 +171,36 @@ acquisition:
     # MASTER depth: abilita lo STREAM depth della RealSense (allineato al color).
     # Ogni layer decide col proprio 'depth:' se salvare la mappa depth.
     depth: true
+
+    gc1020c:
+      # Prosilica GC1020C (GigE Vision). Needs Vimba X on the robot PC and the PC's
+      # network adapter on the camera's subnet (README §1.7). Only one program at a
+      # time can stream from it: close Vimba X Viewer / arv-viewer first.
+      id: null               # IP (e.g. "192.168.1.121") or Vimba X camera ID; null = the only camera
+      width: 1024
+      height: 768
+      exposure_us: null      # null = auto exposure; a number = manual, in microseconds
+      gain_db: null          # null = auto gain; a number = manual, in dB
+      white_balance_auto: true
+      packet_size: null      # bytes; null = negotiated by Vimba X, 1500 on a USB-Ethernet adapter
+      pixel_format: null     # null = BGR8/RGB8 from the camera, else Bayer debayered on the PC
+      # No factory intrinsics. null = the OpenCV calibration of this camera,
+      # DATA/camera_calibration_gc1020c/output/intrinsics/intrinsics_opencv.json
+      # (`spectra calibrate --modality intrinsics`); or a JSON path with K and D.
+      intrinsics: null
+      # null = DATA/camera_calibration_gc1020c/output/calibration/cam2gripper.txt
+      T_cam2gripper: null
+      # Camera + lens + bracket envelope, in the camera frame (collisions + viz):
+      # length_mm along the image x axis, width_mm along y, height_mm along the
+      # optical axis centred on the camera origin, support_extension_mm behind it
+      # towards the flange, collision_margin_mm added on every side. TO MEASURE:
+      # acquisition and dry-run refuse to start while it is null.
+      camera_box: 
+        length_mm: 94.00
+        width_mm: 33.00
+        height_mm: 47.00
+        support_extension_mm: 35
+        collision_margin_mm: 5.0
 
   hand_eye:
     # T_cam2gripper 4x4 (rotation + translation in mm).
