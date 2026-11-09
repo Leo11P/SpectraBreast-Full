@@ -44,3 +44,5 @@ fairino_description/
 *.STL
 *.dae
 *.pyd
+
+step1_piano.json
