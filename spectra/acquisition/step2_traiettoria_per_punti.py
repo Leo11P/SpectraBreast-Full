@@ -2,9 +2,9 @@
 """STEP 2: sequenza articolare MoveJ + video + foto ai waypoint, riutilizzando acquire.py.
 
 Copiare accanto ad acquire.py. Dalla RADICE della repository:
-  python spectra/acquisition/step2_goto_joints.py --preview-only
-  python spectra/acquisition/step2_goto_joints.py --plan-only
-  python spectra/acquisition/step2_goto_joints.py
+  python spectra/acquisition/step2_traiettoria_per_punti.py --preview-only
+  python spectra/acquisition/step2_traiettoria_per_punti.py --plan-only
+  python spectra/acquisition/step2_traiettoria_per_punti.py
 
 L'ultimo comando abilita ed esegue il moto dopo i controlli e 5 secondi.
 
@@ -19,7 +19,7 @@ Foto PNG: una per tappa verificata, incluso il ritorno iniziale.
 Ogni esecuzione crea una sottocartella distinta in foto_waypoints/.
 Q richiede interruzione; non sostituisce l'arresto fisico.
 """
-# NOI VOGLIAMO UN PROVINO CON SOLI 4 ARUCO!
+# NOI VOGLIAMO UN PROVINO CON 6 ARUCO!
 
 import argparse
 import copy
@@ -39,7 +39,7 @@ from cameras import (calibration_dir_name, open_camera,  # [NUOVO] RealSense o G
                      resolve_camera_cfg)                  # (cameras.py)
 
 # Configurazioni assolute [J1, J2, J3, J4, J5, J6], in gradi.
-# Provengono da goto_joints; non sono certificate per questa installazione.
+# Prese noi con la nuova camera.
 POSES = [
     [63.705, -104.631, 110.318, -92.256, -70.281, 161.089],
     [103.643, -83.706, 91.872, -78.088, -107.794, 161.09],
