@@ -7,6 +7,7 @@ orchestrator. Missing files are handled gracefully so the pipeline can run in
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import List
 
@@ -183,9 +184,160 @@ def build_backend_inputs(
     )
 
 
+# ---------------------------------------------------------------------------
+# Lens undistortion of the input images
+# ---------------------------------------------------------------------------
+# Every stage after this one (MASt3R, ArUco triangulation, validation) uses a
+# PINHOLE camera with K = camera_parameters/intrinsics.npy. The images are
+# therefore remapped to an ideal pinhole camera with the SAME K, so
+# intrinsics.npy stays valid for them. The distortion model depends on where
+# the intrinsics came from (camera_parameters/intrinsics_source.json, written
+# by the acquisition):
+#   source calibration / override (OpenCV calibration, e.g. the GC1020C):
+#       OpenCV (k1, k2, p1, p2, k3): pixel = distort(ideal)  -> cv2 maps
+#   source realsense_factory, model *inverse_brown_conrady* (RealSense colour):
+#       librealsense applies the polynomial to the DISTORTED coordinates to get
+#       the ideal ones (rs2_deproject_pixel_to_point), so the map is its inverse,
+#       solved by fixed-point iteration
+#   *brown_conrady* / *modified_brown_conrady*: treated as OpenCV
+#   *none*: nothing to do.  Other models (kannala_brandt, ftheta): not supported.
+_UNDISTORT_ITERS = 30
+
+
+def _distortion_model(camera_params_dir: Path | None) -> tuple[str | None, dict]:
+    """('opencv' | 'inverse_brown_conrady' | 'none' | None if unknown, intrinsics_source)."""
+    src = {}
+    if camera_params_dir is not None:
+        p = Path(camera_params_dir) / "intrinsics_source.json"
+        if p.is_file():
+            src = json.loads(p.read_text(encoding="utf-8"))
+    source = str(src.get("source") or "")
+    model = str(src.get("model") or "").lower()
+    if source in ("calibration", "override"):
+        return "opencv", src
+    if source.endswith("_factory"):
+        if "inverse_brown_conrady" in model:
+            return "inverse_brown_conrady", src
+        if "brown_conrady" in model:
+            return "opencv", src
+        if model.endswith("none"):
+            return "none", src
+        raise ValueError(f"intrinsics_source.json: distortion model {src.get('model')!r} is not "
+                         "supported by the undistortion (vision.input.undistort)")
+    return None, src
+
+
+def _undistort_maps(K: np.ndarray, dist: np.ndarray, model: str, width: int, height: int):
+    """(map_x, map_y) float32: for each pixel of the ideal pinhole image (same K),
+    where to read it in the original image."""
+    import cv2
+
+    K = np.asarray(K, dtype=np.float64)
+    d = np.zeros(5)
+    d[: min(5, len(dist))] = np.asarray(dist, dtype=np.float64).ravel()[:5]
+    if model == "opencv":
+        mx, my = cv2.initUndistortRectifyMap(K, d, None, K, (width, height), cv2.CV_32FC1)
+        return mx, my
+    if model != "inverse_brown_conrady":
+        raise ValueError(model)
+    k1, k2, p1, p2, k3 = d
+    u, v = np.meshgrid(np.arange(width, dtype=np.float64), np.arange(height, dtype=np.float64))
+    xu = (u - K[0, 2]) / K[0, 0]
+    yu = (v - K[1, 2]) / K[1, 1]
+
+    def ideal_from_distorted(x, y):          # librealsense rs2_deproject_pixel_to_point
+        r2 = x * x + y * y
+        f = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
+        return (x * f + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x),
+                y * f + 2.0 * p2 * x * y + p1 * (r2 + 2.0 * y * y))
+
+    xd, yd = xu.copy(), yu.copy()
+    for _ in range(_UNDISTORT_ITERS):
+        gx, gy = ideal_from_distorted(xd, yd)
+        xd, yd = xd - (gx - xu), yd - (gy - yu)
+    gx, gy = ideal_from_distorted(xd, yd)
+    res_px = float(np.max(np.hypot((gx - xu) * K[0, 0], (gy - yu) * K[1, 1])))
+    if res_px > 0.01:
+        raise RuntimeError(f"inverse Brown-Conrady undistortion did not converge ({res_px:.3f} px)")
+    return ((xd * K[0, 0] + K[0, 2]).astype(np.float32),
+            (yd * K[1, 1] + K[1, 2]).astype(np.float32))
+
+
+def undistort_images_inplace(
+    image_paths: List[Path],
+    K: np.ndarray | None,
+    dist: np.ndarray | None,
+    camera_params_dir: Path | None,
+    report_path: Path | None = None,
+) -> dict:
+    """Remaps the (EXIF-canonical, already copied) images in place to an ideal
+    pinhole camera with the same K. Returns a report dict ('applied' False with
+    the reason when nothing is done); written to ``report_path`` if given."""
+    import cv2
+
+    report: dict = {"applied": False}
+
+    def _done(reason):
+        report["reason"] = reason
+        print(f"[undistort] skipped: {reason}")
+        if report_path is not None:
+            Path(report_path).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        return report
+
+    if K is None or dist is None:
+        return _done("no camera_parameters/intrinsics.npy + distortions.npy")
+    model, src = _distortion_model(camera_params_dir)
+    report.update(model=model, coeffs=np.asarray(dist, dtype=float).ravel().tolist(),
+                  intrinsics_source=src.get("source"), intrinsics_model=src.get("model"))
+    if model == "none" or not np.any(np.abs(np.asarray(dist)) > 1e-9):
+        return _done("zero distortion")
+    if model is None:
+        return _done("distortions.npy is not zero but camera_parameters/intrinsics_source.json "
+                     "does not say its model (OpenCV or RealSense inverse Brown-Conrady): NOT "
+                     "undistorted, applying the wrong model would double the error")
+
+    with Image.open(image_paths[0]) as im0:
+        width, height = im0.size
+    want = (src.get("width"), src.get("height"))
+    if None not in want and tuple(int(x) for x in want) != (width, height):
+        raise ValueError(f"[undistort] the intrinsics are for {want[0]}x{want[1]} images, the "
+                         f"input images are {width}x{height}")
+    mx, my = _undistort_maps(K, dist, model, width, height)
+    gu, gv = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+    shift = np.hypot(mx - gu, my - gv)
+    outside = (mx < 0) | (my < 0) | (mx > width - 1) | (my > height - 1)
+
+    for p in image_paths:
+        img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise FileNotFoundError(p)
+        if img.shape[1] != width or img.shape[0] != height:
+            raise ValueError(f"[undistort] {p.name} is {img.shape[1]}x{img.shape[0]}, "
+                             f"expected {width}x{height} like the other images")
+        out = cv2.remap(img, mx, my, interpolation=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        if not cv2.imwrite(str(p), out):
+            raise OSError(f"cannot write {p}")
+
+    report.update(applied=True, width=width, height=height, n_images=len(image_paths),
+                  max_shift_px=float(shift.max()), centre_shift_px=float(shift[height // 2, width // 2]),
+                  black_border_pct=float(100.0 * outside.mean()))
+    print(f"[undistort] {len(image_paths)} images remapped to a pinhole camera with the same K "
+          f"({model}): shift max {report['max_shift_px']:.1f} px, centre "
+          f"{report['centre_shift_px']:.2f} px, black border {report['black_border_pct']:.2f}% of the image")
+    if report["max_shift_px"] > 0.05 * max(width, height):
+        print(f"[undistort] WARNING: shift up to {report['max_shift_px']:.0f} px: check the "
+              "distortion coefficients (a calibration that did not cover the image corners "
+              "extrapolates badly there).")
+    if report_path is not None:
+        Path(report_path).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
 __all__ = [
     "build_backend_inputs",
     "canonicalize_images_with_exif",
+    "undistort_images_inplace",
     "list_rgb_images",
     "load_gt_cameras",
 ]

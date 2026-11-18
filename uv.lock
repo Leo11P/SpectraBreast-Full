@@ -3510,6 +3510,7 @@ acquisition = [
     { name = "pyrealsense2" },
     { name = "python-fcl" },
     { name = "trimesh" },
+    { name = "vmbpy", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 gpu-raycast = [
     { name = "cupy-cuda12x" },
@@ -3564,6 +3565,7 @@ requires-dist = [
     { name = "trimesh", marker = "extra == 'acquisition'", specifier = ">=4.0" },
     { name = "trimesh", marker = "extra == 'processing'", specifier = ">=4.0" },
     { name = "typer", specifier = ">=0.12" },
+    { name = "vmbpy", marker = "(sys_platform == 'linux' and extra == 'acquisition') or (sys_platform == 'win32' and extra == 'acquisition')", specifier = ">=1.2" },
 ]
 provides-extras = ["acquisition", "processing", "gpu-raycast"]
 
@@ -3811,6 +3813,16 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/1f/93/041fca8274050e40e6791f267d82e0e2e27dd165627bd640d3e0e378d877/uvicorn-0.46.0.tar.gz", hash = "sha256:fb9da0926999cc6cb22dc7cd71a94a632f078e6ae47ff683c5c420750fb7413d", size = 88758, upload-time = "2026-04-23T07:16:00.151Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/31/a3/5b1562db76a5a488274b2332a97199b32d0442aca0ed193697fd47786316/uvicorn-0.46.0-py3-none-any.whl", hash = "sha256:bbebbcbed972d162afca128605223022bedd345b7bc7855ce66deb31487a9048", size = 70926, upload-time = "2026-04-23T07:15:58.355Z" },
+]
+
+[[package]]
+name = "vmbpy"
+version = "1.2.3"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/26/05/ee48717fd7b2a4d85a63487189c9bb0a5292a53230838d16904150c5126d/vmbpy-1.2.3-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:240c4a15d59526aebadaf9c42e3f0e5ff6f43cbba4caea21a3927454aefce928", size = 2707442, upload-time = "2026-10-06T09:09:32.753Z" },
+    { url = "https://files.pythonhosted.org/packages/55/dd/b851dd88549c82122afc679c16541b085221968bc3cdadc5cce4b4912435/vmbpy-1.2.3-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:d532a6a67f0c65e10db312622f6e05a23ce14fcedabcda00cbf85d2e3252576a", size = 2803906, upload-time = "2026-10-06T09:09:35.299Z" },
+    { url = "https://files.pythonhosted.org/packages/b2/47/39f672c1f0c4f56bfb99179293cb8ac46788c95d0469f030968153d0d5a8/vmbpy-1.2.3-py3-none-win_amd64.whl", hash = "sha256:64f55912e15d5e1a8fc01b1814dc1de907b7921820fb40633e2ea24a19a19c2c", size = 1606004, upload-time = "2026-10-06T09:09:37.164Z" },
 ]
 
 [[package]]

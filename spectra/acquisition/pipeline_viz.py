@@ -66,6 +66,7 @@ COLOR_PHOTO = [40, 200, 90]                  # final acquired poses (phase 2/3)
 COLOR_CUBE = [255, 60, 60, 60]               # target cube (semi-transparent)
 COLOR_CUBE_EDGE = [255, 60, 60]
 COLOR_CENTROID = [255, 60, 60]
+COLOR_PHANTOM = [235, 200, 60, 170]          # validation phantom (STL, semi-transparent)
 
 FRUSTUM_RADIUS_M = 0.0015
 POINT_RADIUS_M = 0.004
@@ -340,6 +341,30 @@ class PipelineViz:
             )
         except Exception as exc:
             print(f"[viz] warning: target cube not logged ({exc})")
+
+    def show_phantom(self, phantom):
+        """Validation phantom (cassette + target STL) where the bootstrap markers
+        place it, in the base frame (mm -> m). From
+        acquire.validation_phantom_in_base."""
+        if not self.ready:
+            return
+        try:
+            v = np.asarray(phantom["vertices_mm"], float) / 1000.0
+            self.rr.log(
+                f"{self.viz.WORLD_ROOT}/phantom/{phantom['name']}",
+                self._base_frame(),
+                self.rr.Mesh3D(vertex_positions=v,
+                               triangle_indices=np.asarray(phantom["faces"]),
+                               albedo_factor=COLOR_PHANTOM),
+                static=True,
+            )
+            # the phantom replaces the red target cube + centroid
+            self.rr.log(f"{self.viz.WORLD_ROOT}/target", self.rr.Clear(recursive=True),
+                        static=True)
+            print(f"[viz] phantom {phantom['name']} shown ({phantom['file']}, "
+                  f"corner RMS {phantom['rms_mm']:.1f} mm)")
+        except Exception as exc:
+            print(f"[viz] warning: phantom not logged ({exc})")
 
     def _log_frustum(self, entity, T_cam2base_mm, color, static=False, label=None):
         try:

@@ -373,6 +373,12 @@ def full_cmd(
     dry_run: bool = typer.Option(False, "--dry-run",
                                   help="Print the plan (and the Mufasa run config), "
                                        "no robot, no upload, no execution."),
+    preview: bool = typer.Option(False, "--preview",
+                                  help="Acquisition preview: the camera and the robot are read, but the "
+                                       "robot does NOT move. Shows the bootstrap and ALL the planned poses "
+                                       "in Rerun (same as `spectra acquire --mode dry-run`), saves nothing "
+                                       "and starts no vision / registration. Then run `spectra full` "
+                                       "without it."),
 ) -> None:
     """Run the `stages:` of the YAML on one sample: acquisition (this PC) →
     vision → registration (this PC, or Mufasa when mufasa.enabled is true)."""
@@ -396,6 +402,15 @@ def full_cmd(
     for s in compute:
         print(f"  {s:<13}: {where}")
 
+    if preview:
+        if not acquire:
+            raise typer.BadParameter("--preview needs 'acquisition' in `stages:` (and a PC with "
+                                     "the robot, not a SLURM job).")
+        print("\\[preview] bootstrap + planned poses, robot NOT moved; nothing is saved.")
+        _run_acquire(config, _ACQUIRE_MODES["preview"], sample=cfg.sample_name, no_viz=no_viz)
+        print("\\[preview] done. `spectra full` without --preview runs the real acquisition.")
+        return
+
     if dry_run:
         if acquire:
             print("\\[dry-run] the acquisition would run here (robot not moved).")
@@ -409,7 +424,7 @@ def full_cmd(
                 print(f"[red]{escape(str(exc))}[/red]")
                 raise typer.Exit(code=1) from None
             print(f"\\[dry-run] then {' + '.join(compute)} on Mufasa with the photos of the "
-                  "acquisition. To see the planned poses: spectra acquire --mode dry-run")
+                  "acquisition. To see the planned poses: spectra full --preview")
         elif compute and on_mufasa:
             _run_on_mufasa(config, ovr, compute, dry_run=True, force_cpu=force_cpu)
         elif compute:
@@ -485,6 +500,8 @@ _ACQUIRE_MODES = {
     "run": [],                 # full acquisition (robot moves)
     "verify": ["--verify"],    # check the transformation chain, robot does not move
     "dry-run": ["--dry-run"],  # bootstrap + pose generation, robot does not move
+    "live": ["--live"],        # live view of the camera only (focus check), no robot
+    "preview": ["--dry-run"],  # same as dry-run: all planned poses in Rerun, robot does not move
     "reset": ["--reset"],      # reset robot errors and exit
 }
 
@@ -494,7 +511,7 @@ def acquire_cmd(
     config: Path = typer.Option(Path("configs/default.yaml"), "--config", "-c", exists=True,
                                 readable=True, help="Unified YAML (needs an `acquisition:` section)."),
     mode: str = typer.Option("run", "--mode", "-m",
-                             help="run | verify | dry-run | reset"),
+                             help="run | verify | dry-run (= preview) | live | reset"),
     sample: Optional[str] = typer.Option(None, "--sample",
                                           help="Override sample_name: output in DATA/input_vision/<sample>/."),
     ip: Optional[str] = typer.Option(None, "--ip", help="Robot controller IP (default: acquisition.robot.ip)."),

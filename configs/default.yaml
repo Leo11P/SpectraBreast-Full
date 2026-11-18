@@ -52,7 +52,7 @@
 
 # Sample being processed. Drives every auto-derived path — spell it exactly as
 # the folder names under DATA/.
-sample_name: "T2_P2_R1"
+sample_name: "T3_P1_R2"
 
 # Roots that drive default path resolution. Relative (from cwd) or absolute.
 data_root:    "DATA"
@@ -64,13 +64,16 @@ results_root: "RESULTS"
 results_date: null
 
 # Which stage(s) `spectra full` runs, in this order:
-#   acquisition  : robot + RealSense, always on THIS PC (`acquisition:` section)
+#   acquisition  : robot + RealSensse, always on THIS PC (`acquisition:` section)
 #   vision       : MASt3R-SfM + ArUco ─┐ on this PC, or on Mufasa when
 #   registration : HSI → mesh          ─┘ mufasa.enabled is true (see below)
 # Drop "acquisition" to re-run vision/registration on a sample already acquired
 # (or: --set stages=[vision,registration]). The standalone sub-commands
 # `spectra vision` and `spectra registration` ignore this list.
-stages: ["acquisition", "vision", "validation"]
+stages: #["acquisition", "vision"] 
+        #["validation"] 
+        #["acquisition", "vision", "validation"]
+        ["vision","validation"]
 
 
 
@@ -148,7 +151,7 @@ acquisition:
     tool: 0            # 0 = flangia nuda (la hand-eye e' riferita alla flangia)
     user: 0
     vel: 10           # velocita' movimenti di raggiungimento (%) — TIENILA BASSA
-    dwell_s: 2.5       # sosta PRIMA DELLO SCATTO, solo DOPO che il servo ha
+    dwell_s: 5       # sosta PRIMA DELLO SCATTO, solo DOPO che il servo ha
                        # confermato la posa centrata (riduce il motion blur)
     pointing_gate_deg: 15   # se alla 1a posa l'asse ottico e' oltre X deg dal
                             # centroide -> ABORT (catena non corretta)
@@ -163,8 +166,8 @@ acquisition:
     #   realsense -> DATA/camera_calibration/
     #   gc1020c   -> DATA/camera_calibration_gc1020c/
     # Keys at this level are shared; the same key in the selected block wins.
-    type: realsense
-    n_avg_frames: 5
+    type: gc1020c
+    n_avg_frames: 1
 
     realsense:
       width: 1280
@@ -207,6 +210,13 @@ acquisition:
       white_balance_auto: true
       packet_size: null      # bytes; null = negotiated by Vimba X, 1500 on a USB-Ethernet adapter
       pixel_format: null     # null = BGR8/RGB8 from the camera, else Bayer debayered on the PC
+      # If the camera disconnects (cable pulled, power lost) the acquisition waits
+      # up to this many seconds for it to come back and then resumes at the same
+      # pose; 0 = do not wait. Loss is detected after `frame_timeout_ms` (10 s) without frames.
+      reconnect_timeout_s: 600
+      # Live camera window DURING the acquisition (pose, phase, images saved, focus).
+      # Closing it does not stop the acquisition.
+      live_view: true
       # No factory intrinsics. null = the OpenCV calibration of this camera,
       # DATA/camera_calibration_gc1020c/output/intrinsics/intrinsics_opencv.json
       # (`spectra calibrate --modality intrinsics`); or a JSON path with K and D.
@@ -218,7 +228,12 @@ acquisition:
       # optical axis centred on the camera origin, support_extension_mm behind it
       # towards the flange, collision_margin_mm added on every side. TO MEASURE:
       # acquisition and dry-run refuse to start while it is null.
-      camera_box: null
+      camera_box: 
+        length_mm: 94.00
+        width_mm: 33.00
+        height_mm: 47.00
+        support_extension_mm: 35
+        collision_margin_mm: 5.0
 
   target:
     n_bootstrap_frames: 8      # frame aggregati (mediana per-marker) nel bootstrap
@@ -255,12 +270,12 @@ acquisition:
 
   servo:                       # ricentraggio closed-loop a ogni posa
     enable: true
-    pixel_tol: 40
-    max_iters: 5
-    vel: 40
-    min_markers: 2
+    pixel_tol: 30
+    max_iters: 10
+    vel: 10
+    min_markers: 3
     damping: 0.6               # fraction of the re-pointing rotation applied per iteration
-    max_joint_step_deg: 20     # a correction needing more on a joint (posture flip) is not done
+    max_joint_step_deg: 30     # a correction needing more on a joint (posture flip) is not done
     settle_before_detect_s: 0.4
     detect_retries: 4
 
@@ -294,17 +309,17 @@ acquisition:
   # tilt_deg: 0 = top-down, 90 = laterale. depth: salva o meno la depth per il layer.
   layers:
     - name: top_down
-      distance_mm: 150
-      tilt_deg: 20
-      n_poses: 4
+      distance_mm: 180
+      tilt_deg: 15
+      n_poses: 2
       azimuth_span_deg: 360
       azimuth_start_deg: 0
       roll_deg: 0
       depth: false
 
     - name: mid_oblique
-      distance_mm: 130
-      tilt_deg: 35
+      distance_mm: 180
+      tilt_deg: 30
       n_poses: 8
       azimuth_span_deg: 360
       azimuth_start_deg: 0
@@ -312,9 +327,9 @@ acquisition:
       depth: false
 
     - name: close_frontal
-      distance_mm: 120
+      distance_mm: 180
       tilt_deg: 50
-      n_poses: 15
+      n_poses: 16
       azimuth_span_deg: 360
       azimuth_start_deg: 0
       roll_deg: 0
@@ -350,7 +365,7 @@ calibration:
   hand_eye:
     method:            PARK      # PARK | TSAI | HORAUD | ANDREFF | DANIILIDIS
     outlier_sigma:     0.5       # outlier threshold: median + sigma*std (lower = stricter)
-    max_reproj_err_px: 0.4       # views with mean PnP reprojection error above it are EXCLUDED
+    max_reproj_err_px: 0.5       # views with mean PnP reprojection error above it are EXCLUDED
     only_images: []              # optional subset, e.g. ["img0001.png"]; empty = all
 
   acquisition:
@@ -387,6 +402,11 @@ vision:
     rgb_dir:           null
     pose_dir:          null
     camera_params_dir: null
+    # Lens undistortion of the images before vision, with the camera's K and
+    # distortions.npy (OpenCV calibration, e.g. GC1020C, or RealSense factory
+    # inverse Brown-Conrady, from intrinsics_source.json). K is unchanged.
+    # Report: <run>/undistortion.json. false = images used as acquired.
+    undistort:         true
 
   output:
     # null → RESULTS/<dd-mm-yyyy>/<sample>, with run_name "vision", i.e.
@@ -433,10 +453,10 @@ vision:
     ba_huber_delta_px:      2.0
     ba_cam_prior_sigma_m:   0.10
     ba_cam_prior_sigma_deg: 5.0
-    reject_views_by_alignment_error: false
+    reject_views_by_alignment_error: true
     max_view_alignment_reproj_rmse_px: 15.0
     min_kept_views: 2
-    reject_views_with_no_markers: false
+    reject_views_with_no_markers: true
 
   surface:
     grid_step: 0.0
@@ -448,7 +468,7 @@ vision:
   mast3r:
     # Hugging Face repo id (downloaded on first run) or a local .pth path.
     model_name: naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric
-    pipeline_variant: sfm
+    pipeline_variant: sfm #dense
     scene_graph: auto
     # Only needed when scene_graph contains "retrieval".
     retrieval_model: null
@@ -653,11 +673,11 @@ registration:
 validation:
   fixture_table: "Tabella_marker_cassetta.xlsx"
   phantoms:                         # name -> STL (+ optional roi_mm: [xmin, xmax, ymin, ymax], CAD)
-    T1: {stl: "Target1+Cassetta (3mm).stl"}
-    T2: {stl: "Target2+Cassetta (3mm).stl"}
-    T3: {stl: "Target3+Cassetta (3mm).stl"}
-    T4: {stl: "Target4+Cassetta (3mm).stl"}
-    T5: {stl: "Target5+Cassetta (3mm).stl"}
+    T1: {stl: "Target1+Cassetta (3mm)_90.stl"}
+    T2: {stl: "Target2+Cassetta (3mm)_90.stl"}
+    T3: {stl: "Target3+Cassetta (3mm)_90.stl"}
+    T4: {stl: "Target4+Cassetta (3mm)_90.stl"}
+    T5: {stl: "Target5+Cassetta (3mm)_90.stl"}
   cases: {}                         # sample -> phantom, for samples not named as sample_pattern
   sample_pattern: '^(?P<phantom>[^_]+)_(?P<pose>[^_]+)_(?P<rep>[^_]+)$'
   model_label: null                 # name in the summary; null = backend + variant (mast3r-sfm)

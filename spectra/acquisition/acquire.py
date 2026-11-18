@@ -37,12 +37,13 @@ ROOT = os.path.dirname(os.path.abspath(__file__))              # spectra/acquisi
 REPO_ROOT = os.path.dirname(os.path.dirname(ROOT))             # SpectraBreast-Full
 # SINGLE pipeline config (`acquisition:` section + `vision.aruco`).
 DEFAULT_CONFIG = os.path.join(REPO_ROOT, "configs", "default.yaml")
-# Sibling modules (cameras, collision_guard, pipeline_viz, rerun_viz, collision_fr5,
+# Sibling modules (cameras, live_view, collision_guard, pipeline_viz, rerun_viz, collision_fr5,
 # fairino/) are imported "flat": the script runs on the robot PC WITHOUT importing
 # the `spectra` package (which would pull in torch/open3d/MASt3R).
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from cameras import calibration_dir_name, open_camera, resolve_camera_cfg  # noqa: E402
+from live_view import LiveView, focus_score  # noqa: E402
 
 
 # ----------------------------------------------------------------------------- 
@@ -670,8 +671,59 @@ def bootstrap(robot, cam, cfg, T_c2g, K, D):
     # base position of every marker seen here: the recentring aims at the FIXED
     # centroid and uses these to measure the chain error at each pose.
     centers_by_id = {int(mid): centers_base[k] for k, mid in enumerate(sorted(per_id_c))}
+    corners_by_id = {int(mid): cam_points_to_base(corners_cam[k], T_c2b)
+                     for k, mid in enumerate(sorted(per_id_c))}
     return {"centroid": centroid, "up": up, "corners_base": corners_base,
-            "cam_pos": cam_pos, "centers_by_id": centers_by_id}
+            "cam_pos": cam_pos, "centers_by_id": centers_by_id,
+            "corners_by_id": corners_by_id}
+
+
+def validation_phantom_in_base(cfg, target):
+    """The validation phantom of this sample (STL of `validation.phantoms`, picked
+    by sample name as in `spectra validate`: validation.cases, else
+    validation.sample_pattern), placed in the robot base frame: Kabsch of the
+    marker corners of the table (validation.fixture_table, CAD frame) onto the
+    ones seen in the bootstrap. Only for the Rerun viewer. Returns None (with a
+    message) when the sample has no phantom or something is missing."""
+    vcfg = cfg.get("_validation")
+    if not isinstance(vcfg, dict) or not vcfg.get("phantoms"):
+        return None
+    sample = cfg["_sample"]
+    phantom = (vcfg.get("cases") or {}).get(sample)
+    if phantom is None:
+        pattern = vcfg.get("sample_pattern") or r"^(?P<phantom>[^_]+)_(?P<pose>[^_]+)_(?P<rep>[^_]+)$"
+        m = re.match(pattern, sample)
+        phantom = m.groupdict().get("phantom") if m else None
+    if phantom not in vcfg["phantoms"]:
+        print(f"[phantom] sample {sample!r}: no validation phantom (validation.phantoms / "
+              "cases), nothing shown")
+        return None
+    val_dir = os.path.join(cfg["_data_root"], "validation")
+    stl = os.path.join(val_dir, str((vcfg["phantoms"][phantom] or {}).get("stl", "")))
+    table = os.path.join(val_dir, str(vcfg.get("fixture_table") or "Tabella_marker_cassetta.xlsx"))
+    try:
+        if REPO_ROOT not in sys.path:
+            sys.path.insert(0, REPO_ROOT)
+        from spectra.validation.fixture import load_mesh, read_fixture
+        from spectra.validation.geometry import apply, kabsch
+        fixture = read_fixture(table)
+        ids = sorted(set(fixture.corners_mm) & set(target.get("corners_by_id") or {}))
+        if len(ids) < 2:
+            print(f"[phantom] {phantom}: {len(ids)} markers of the table seen in the bootstrap "
+                  "(need >= 2), not shown")
+            return None
+        src = np.vstack([fixture.corners_mm[i] for i in ids])
+        dst = np.vstack([target["corners_by_id"][i] for i in ids])
+        T = kabsch(src, dst)
+        rms = float(np.sqrt(np.mean(np.sum((apply(T, src) - dst) ** 2, axis=1))))
+        v, f = load_mesh(stl)
+    except (SystemExit, Exception) as e:
+        print(f"[phantom] {phantom}: not shown ({e})")
+        return None
+    print(f"[phantom] {phantom} ({os.path.basename(stl)}) placed on {len(ids)} markers "
+          f"{ids}: corner RMS {rms:.1f} mm")
+    return {"name": phantom, "file": os.path.basename(stl), "vertices_mm": apply(T, v),
+            "faces": f, "rms_mm": rms, "marker_ids": ids}
 
 
 def _orthonormal_basis(up):
@@ -1335,6 +1387,9 @@ def run_acquire(cfg, robot, T_c2g, K, D, cam, out_dir, use_viz=True):
             if viz.ready:
                 safe_mask = [ok for ok, _ in pose_checks] if pose_checks is not None else None
                 viz.show_pose_preview(poses, safe_mask=safe_mask)
+                phantom = validation_phantom_in_base(cfg, target)
+                if phantom is not None:
+                    viz.show_phantom(phantom)
             else:
                 viz = None
         except Exception as e:
@@ -1401,6 +1456,14 @@ def run_acquire(cfg, robot, T_c2g, K, D, cam, out_dir, use_viz=True):
     if guard is not None:
         guard.enable_native_backstop()
 
+    # live camera window (acquisition.camera.gc1020c.live_view): runs in its own
+    # thread, never blocks or stops the acquisition.
+    live = LiveView.create(cam) if cfg["camera"].get("live_view") else None
+
+    def _live(**state):
+        if live is not None:
+            live.set(**state)
+
     manifest = []
     _lap("pose planning + setup (collision, viz, camera parameters)")
     print("\n" + "=" * 60 + "\n  EXECUTION\n" + "=" * 60)
@@ -1418,6 +1481,7 @@ def run_acquire(cfg, robot, T_c2g, K, D, cam, out_dir, use_viz=True):
     try:
       for i, wp in enumerate(poses, 1):
         t_mark = _close_layer()
+        _live(pose=i, total=len(poses), layer=wp["layer"], azim=wp["azim_deg"], phase="moving")
         prev_layer = wp["layer"]
         exec_n[prev_layer] = exec_n.get(prev_layer, 0) + 1
         # collision-checked MOTION PLANNING: checks the arrival pose
@@ -1500,12 +1564,15 @@ def run_acquire(cfg, robot, T_c2g, K, D, cam, out_dir, use_viz=True):
         # immediately (no wait before); only once the pose is CONFIRMED
         # centred do we wait 'dwell' seconds and shoot. This way no time is
         # wasted waiting before knowing whether another move is needed.
+        _live(phase="centring (servo)")
         seen = recenter(robot, cam, cfg, T_c2g, K, D, target, guard=guard)
         if not seen:
             print("  sample not in view -> shot SKIPPED"); continue
 
+        _live(phase="settling")
         cam.settle(dwell)
 
+        _live(phase="shot")
         img = cam.grab(int(cfg["camera"].get("n_avg_frames", 5)))
         if img is None:
             print("  no frame -> skipping"); continue
@@ -1528,6 +1595,7 @@ def run_acquire(cfg, robot, T_c2g, K, D, cam, out_dir, use_viz=True):
             print(f"  saving pair {img_name}/{txt_name} failed -> shot DISCARDED")
             continue
         n_saved += 1
+        _live(saved=n_saved, phase="saved")
 
         # depth channel co-registered with color (same resolution/intrinsics),
         # 16-bit PNG in MILLIMETRES (0 = no measurement). Same instant, robot
@@ -1587,6 +1655,8 @@ def run_acquire(cfg, robot, T_c2g, K, D, cam, out_dir, use_viz=True):
                         f"({'; '.join(reasons)}), not even through a pose above the "
                         "sample; leaving the robot where it is.")
     finally:
+        if live is not None:
+            live.stop()
         # Phase 3: robot hidden, all acquired poses + target cube remain.
         if viz is not None:
             viz.finalize()
@@ -1795,6 +1865,8 @@ def load_config(path, sample=None):
         raise SystemExit("[config] sample_name missing (config or --sample)")
     data_root = str(full.get("data_root", "DATA"))
     cfg["_sample"] = str(sample)
+    cfg["_data_root"] = os.path.abspath(data_root)
+    cfg["_validation"] = full.get("validation")       # phantom shown in Rerun
     # relative to the cwd, like Vision: always launch from the repo root
     cfg["_out_dir"] = os.path.abspath(os.path.join(data_root, "input_vision", str(sample)))
     # camera on the flange, with its own hand-eye, intrinsics, collision box and
@@ -1829,6 +1901,51 @@ def prepare_out_dir(out_dir, overwrite=False):
     print(f"[out] --overwrite: removed {existing} from {out_dir}")
 
 
+def run_live(cfg):
+    """Live view of the camera ONLY (no robot, no hand-eye, no intrinsics, nothing
+    saved) to set the focus: turn the lens focus ring until the `focus` value is
+    at its maximum. Green box = area measured. Keys: q / Esc = quit, r = reset max."""
+    cam = open_camera(cfg["camera"])
+    win = f"{cam.kind} live (q / Esc = quit, r = reset max)"
+    shown, best, fps, t_prev, warned = [], 0.0, 0.0, time.time(), False
+    try:
+        cv.namedWindow(win, cv.WINDOW_NORMAL)
+        cv.resizeWindow(win, min(cam.w, 1280), min(cam.h, 800))
+        print(f"[live] {cam.kind} {cam.w}x{cam.h}: turn the focus ring to maximise `focus` "
+              "(compare values on the same scene, light and exposure).")
+        while True:
+            img = cam.latest()
+            key = cv.waitKey(1) & 0xFF
+            if key in (27, ord("q")) or cv.getWindowProperty(win, cv.WND_PROP_VISIBLE) < 1:
+                break
+            if key == ord("r"):
+                best, shown = 0.0, []
+            if img is None:
+                if not warned:
+                    print("[live] no frame from the camera")
+                    warned = True
+                continue
+            warned = False
+            now = time.time()
+            fps = 0.9 * fps + 0.1 / max(now - t_prev, 1e-3) if fps else 1.0 / max(now - t_prev, 1e-3)
+            t_prev = now
+            shown = (shown + [focus_score(img)])[-8:]       # smoothed: the raw value jitters
+            score = sum(shown) / len(shown)
+            best = max(best, score)
+            h, w = img.shape[:2]
+            vis = img.copy()
+            cv.rectangle(vis, (w // 4, h // 4), (3 * w // 4, 3 * h // 4), (0, 255, 0), 1)
+            for k, txt in enumerate((f"focus {score:8.1f}   max {best:8.1f}",
+                                     f"{fps:4.1f} fps   {w}x{h}")):
+                org = (12, 28 + 28 * k)
+                cv.putText(vis, txt, org, cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv.LINE_AA)
+                cv.putText(vis, txt, org, cv.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv.LINE_AA)
+            cv.imshow(win, vis)
+    finally:
+        cam.stop()
+        cv.destroyAllWindows()
+
+
 def main():
     """Returns the number of saved image/pose pairs (None for --verify / --reset)."""
     global _EULER
@@ -1845,6 +1962,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="bootstrap + pose generation, but does NOT move the robot")
     ap.add_argument("--reset", action="store_true", help="ResetAllError and exit")
+    ap.add_argument("--live", action="store_true",
+                    help="live view of the camera only (focus check): no robot, saves nothing")
     ap.add_argument("--no-viz", action="store_true",
                     help="disable the Rerun visualisation (poses/cube/live robot)")
     args = ap.parse_args()
@@ -1852,6 +1971,8 @@ def main():
 
     cfg = load_config(args.config, sample=args.sample)
     cfg["_t_main0"] = t_main0
+    if args.live:
+        return run_live(cfg)
     if not (args.verify or args.dry_run or args.reset):
         prepare_out_dir(cfg["_out_dir"], overwrite=args.overwrite)   # fail-fast, before touching the robot
     ip = args.ip or cfg["robot"].get("ip", "192.168.58.2")

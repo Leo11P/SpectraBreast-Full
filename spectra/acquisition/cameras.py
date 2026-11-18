@@ -15,6 +15,8 @@
 #    grab_depth()          depth aligned to colour, uint16 mm (None = no depth)
 #    factory_intrinsics()  (K, D, model), or None if the camera has none
 #    stop()
+#  The GC1020C also reconnects by itself if the stream is lost (cable pulled,
+#  camera power-cycled): see VimbaCamera._recover.
 #  Imported "flat" like the other modules of this folder (no `spectra`
 #  package); each camera SDK is imported only when that camera is opened.
 # =============================================================================
@@ -237,7 +239,16 @@ class VimbaCamera:
     `spectra calibrate --modality intrinsics`.
     Needs Vimba X on the PC (GigE transport layer) and `vmbpy` in the venv.
     Only one program at a time can stream from the camera: close Vimba X
-    Viewer / arv-viewer / gc1020c_capture.py first."""
+    Viewer / arv-viewer / gc1020c_capture.py first.
+
+    RECONNECTION: if no frame arrives for `frame_timeout_ms` (cable pulled,
+    camera power-cycled, adapter reset), grab() / latest() close the camera and
+    keep trying to reopen it, every 2 s, for up to `reconnect_timeout_s`
+    (default 600; 0 = do not reconnect, grab() returns None as before). When it
+    streams again the same call is repeated, so the acquisition resumes at the
+    pose where it stopped. The robot is still while a frame is grabbed, so
+    waiting there is safe. After the timeout the run stops (the images already
+    saved are checked and kept)."""
 
     kind = "gc1020c"
     depth_enabled = False
@@ -249,10 +260,23 @@ class VimbaCamera:
             raise SystemExit(f"[gc1020c] cannot load vmbpy ({e}). On the robot PC: install "
                              "Vimba X (GigE transport layer) and `uv sync --extra acquisition`.") from e
         self._v = vmbpy
+        self._cfg = dict(cfg)
         self.timeout_s = float(cfg.get("frame_timeout_ms") or 10000) / 1000.0
+        rt = cfg.get("reconnect_timeout_s")
+        self.reconnect_s = 600.0 if rt is None else float(rt)
         self._cond = threading.Condition()
         self._idx, self._img, self._err, self._n_bad = 0, None, None, 0
+        self._t_img = 0.0
         self._cam = None
+        self._vmb = None
+        self._open()
+
+    def _open(self):
+        """Starts Vimba X, opens and configures the camera, starts streaming and
+        waits for the first frame. On failure it cleans up and raises (SystemExit
+        with a message for the user)."""
+        vmbpy, cfg = self._v, self._cfg
+        self._err, self._n_bad = None, 0
         self._vmb = vmbpy.VmbSystem.get_instance()
         try:
             self._vmb.__enter__()
@@ -392,6 +416,7 @@ class VimbaCamera:
                 with self._cond:
                     self._idx += 1
                     self._img = img
+                    self._t_img = time.time()
                     self._cond.notify_all()
             else:
                 self._n_bad += 1
@@ -416,6 +441,12 @@ class VimbaCamera:
             return self._img, self._idx
 
     def grab(self, n_avg=5):
+        while True:
+            img = self._grab_once(n_avg)
+            if img is not None or not self._recover("no frames"):
+                return img
+
+    def _grab_once(self, n_avg):
         with self._cond:
             last = self._idx
         img, last = self._next(last)        # skipped: exposed (partly) before the call
@@ -432,10 +463,55 @@ class VimbaCamera:
             return None
         return (acc / got).round().astype(np.uint8)
 
-    def latest(self):
+    def peek(self):
+        """(newest frame, its age in s) WITHOUT waiting and without consuming it:
+        what the live viewer thread (live_view.py) reads while the acquisition
+        goes on. (None, None) until the first frame."""
         with self._cond:
-            last = self._idx
-        return self._next(last)[0]
+            img, t = self._img, self._t_img
+        return (None, None) if img is None else (img, time.time() - t)
+
+    def latest(self):
+        while True:
+            with self._cond:
+                last = self._idx
+            img = self._next(last)[0]
+            if img is not None or not self._recover("no frames"):
+                return img
+
+    def _recover(self, why):
+        """The stream stopped: closes the camera and reopens it until it streams
+        again. True = streaming again (the caller repeats its grab); False =
+        reconnection disabled (reconnect_timeout_s: 0). SystemExit if the camera
+        does not come back within reconnect_timeout_s."""
+        if self.reconnect_s <= 0:
+            return False
+        print(f"[gc1020c] stream lost ({why}). Waiting up to {self.reconnect_s:.0f} s for "
+              "the camera to come back: check the cable, the power and the network adapter.")
+        t0 = time.time()
+        t_msg = t0
+        last_err = ""
+        while True:
+            self.stop()
+            try:
+                self._open()
+            except (SystemExit, Exception) as e:      # not KeyboardInterrupt: Ctrl-C still works
+                last_err = str(e.args[0] if e.args else e).strip()
+            else:
+                time.sleep(2.0)       # auto exposure / white balance settle again
+                print(f"[gc1020c] camera back after {time.time() - t0:.0f} s: streaming again.")
+                return True
+            now = time.time()
+            if now - t0 >= self.reconnect_s:
+                raise SystemExit(f"[gc1020c] the camera did not come back within "
+                                 f"{self.reconnect_s:.0f} s (last error: {last_err}). Reconnect "
+                                 "it and run again, or raise "
+                                 "acquisition.camera.gc1020c.reconnect_timeout_s.")
+            if now - t_msg >= 10.0:
+                print(f"[gc1020c] still waiting for the camera ({now - t0:.0f} s): "
+                      f"{last_err[:110]}")
+                t_msg = now
+            time.sleep(2.0)
 
     def settle(self, seconds):
         time.sleep(max(0.0, float(seconds)))   # grab() only uses frames newer than its call

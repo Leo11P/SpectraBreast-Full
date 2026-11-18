@@ -557,10 +557,36 @@ uv run spectra acquire --mode dry-run
 uv run spectra acquire --sample SB021
 ```
 
+With the GC1020C a live camera window is open during the acquisition
+(`acquisition.camera.gc1020c.live_view`, on by default): current pose, phase
+(moving / centring / settling / shot / saved), images saved and the focus value.
+Closing it does not stop the acquisition; `NO SIGNAL` means the camera is not
+streaming (see the reconnection above).
+
+If the sample is a validation phantom (`validation.phantoms`, picked by the sample
+name as in `spectra validate`, e.g. `T1_P1_R1` -> `T1`), Rerun also shows its STL
+(cassette + target) where the markers seen in the bootstrap place it: rigid fit
+of the corners of `validation.fixture_table` (CAD) onto them, RMS printed as
+`[phantom] ... corner RMS`. Display only: it does not change the poses.
+
+To set the focus without the robot: `uv run spectra acquire --mode live` opens a live window of the
+camera only (no robot, no hand-eye or intrinsics needed, nothing saved) with a
+`focus` value (sharpness of the green box): turn the lens focus ring until it is at
+its maximum. `q` / Esc quits, `r` resets the max.
+
+To check the plan before a full run: `uv run spectra full -c configs/default.yaml --preview`
+(also `spectra acquire --mode preview`, same as `dry-run`). The robot is read but
+does not move, all the planned poses are shown in Rerun, nothing is saved and
+vision / registration do not start.
+
+With the GC1020C, if the camera disconnects during a run the acquisition waits
+for it (`acquisition.camera.gc1020c.reconnect_timeout_s`, 600 s by default) and
+resumes at the same pose once it streams again. The RealSense is not covered.
+
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `-c`, `--config` PATH | `configs/default.yaml` | Unified YAML (needs an `acquisition:` section) |
-| `-m`, `--mode` TEXT | `run` | `run` \| `verify` \| `dry-run` \| `reset` (see `--verify` / `--dry-run` / `--reset` below) |
+| `-m`, `--mode` TEXT | `run` | `run` \| `verify` \| `dry-run` (= `preview`) \| `live` \| `reset` (see `--verify` / `--dry-run` / `--reset` below) |
 | `--sample` TEXT | from YAML | Override `sample_name`; output goes to `DATA/input_vision/<sample>/` |
 | `--ip` TEXT | `acquisition.robot.ip` | Robot controller IP |
 | `--no-viz` | off | Disable the Rerun viewer |
@@ -585,6 +611,7 @@ python spectra/acquisition/acquire.py --config configs/default.yaml --sample SB0
 | `--ip` TEXT | `acquisition.robot.ip` | Robot controller IP |
 | `--verify` | off | Check the transformation chain, robot does not move |
 | `--dry-run` | off | Bootstrap + pose generation, robot does not move |
+| `--live` | off | Live view of the camera only (focus check), no robot, saves nothing |
 | `--no-viz` | off | Disable the Rerun viewer |
 | `--overwrite` | off | Replace an existing acquisition for the same sample |
 | `--reset` | off | Reset robot errors and exit |

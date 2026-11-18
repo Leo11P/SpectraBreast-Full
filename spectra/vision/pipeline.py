@@ -38,7 +38,7 @@ from .align import (
 from .backends.types import RawReconstruction
 from .aruco import ArucoDetector, MarkerDetection, annotate_image
 from .config import ReconstructionConfig, RerunConfig, save_config, save_config_json
-from .inputs import build_backend_inputs, canonicalize_images_with_exif
+from .inputs import build_backend_inputs, canonicalize_images_with_exif, undistort_images_inplace
 from .io_utils import (
     clean_sfm_cache,
     prepare_run_dir,
@@ -498,6 +498,20 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
         cache_dir=canonical_rgb_dir,
     )
     backend_inputs.image_paths = canonical_paths
+
+    # Lens undistortion (vision.input.undistort): the copies above become ideal
+    # pinhole images with the SAME K, so intrinsics.npy stays valid and every
+    # later consumer (MASt3R, ArUco, validation, zoom crops) sees the same images.
+    if cfg.input.undistort:
+        und = undistort_images_inplace(
+            canonical_paths,
+            K=backend_inputs.K_orig_gt,
+            dist=backend_inputs.distortion_coeffs,
+            camera_params_dir=cfg.input.camera_params_dir,
+            report_path=run_dir / "undistortion.json",
+        )
+        if und.get("applied"):
+            backend_inputs.distortion_coeffs = np.zeros_like(backend_inputs.distortion_coeffs)
 
     if cfg.rerun.enabled and not HAS_RERUN:
         print(

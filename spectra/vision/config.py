@@ -102,6 +102,16 @@ class InputConfig(BaseModel):
             "None, the back-end estimates intrinsics."
         ),
     )
+    undistort: bool = Field(
+        default=True,
+        description=(
+            "Remap the input images to an ideal pinhole camera with the same K "
+            "before anything else (camera_parameters/intrinsics.npy + "
+            "distortions.npy; model from intrinsics_source.json: OpenCV for a "
+            "calibration, inverse Brown-Conrady for the RealSense factory "
+            "intrinsics). Skipped, with a message, without those files."
+        ),
+    )
 
 
 class OutputConfig(BaseModel):
