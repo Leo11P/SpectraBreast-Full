@@ -154,7 +154,7 @@ acquisition:
     # Camera on the flange: realsense (D456) | gc1020c (Prosilica GC1020C, Vimba X).
     # NB: in this repo only step2_traiettoria_per_punti.py reads `type` and the
     # gc1020c block below; acquire.py keeps using the RealSense keys at this level.
-    type: realsense
+    type: gc1020c
     width: 1280
     height: 800
     fps: 10
@@ -176,7 +176,7 @@ acquisition:
       # Prosilica GC1020C (GigE Vision). Needs Vimba X on the robot PC and the PC's
       # network adapter on the camera's subnet (README §1.7). Only one program at a
       # time can stream from it: close Vimba X Viewer / arv-viewer first.
-      id: null               # IP (e.g. "192.168.1.121") or Vimba X camera ID; null = the only camera
+      id: 192.168.1.121               # IP (e.g. "192.168.1.121") or Vimba X camera ID; null = the only camera
       width: 1024
       height: 768
       exposure_us: null      # null = auto exposure; a number = manual, in microseconds
@@ -401,7 +401,7 @@ vision:
     # PHYSICAL marker edge length in MILLIMETRES. Single source of truth for
     # the whole pipeline (acquisition bootstrap/servo included) — this sets the metric scale of the reconstruction,
     # and registration inherits it. Measure it properly.
-    marker_edge_length_mm:  9.97
+    marker_edge_length_mm:  7.7
     # Output frame: markers at z = 0, +Z towards the cameras, right-handed,
     # metres. Origin = centroid of the corners of `frame_marker_ids`; +X from
     # the centre of x_axis_marker_ids[0] to that of x_axis_marker_ids[1]

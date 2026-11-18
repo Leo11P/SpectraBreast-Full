@@ -97,7 +97,7 @@ def resolve_intrinsics(cfg, camera):
         return ac.resolve_intrinsics(cfg, camera)
     kind = cfg["camera"]["type"]
     path = cfg["camera"].get("intrinsics") or os.path.join(
-        cfg["_calib_dir"], "output", "intrinsics", "intrinsics_opencv.json")
+        cfg["_calib_dir"], "output", "calibration", "intrinsics_opencv.json")
     path = os.path.abspath(str(path))
     if not os.path.isfile(path):
         raise SystemExit(f"[intrinsics] la camera {kind} non ha intrinseche di fabbrica e "
@@ -715,6 +715,7 @@ def main():
             full_config, cfg)
         print("[waypoint]", cfg["waypoint_check"], flush=True)
     kind = setup_camera_cfg(cfg)          # [NUOVO] realsense | gc1020c (acquisition.camera.type)
+    cfg["_calib_dir"]=r"C:\Users\spflg\Desktop\SpectraBreast-Full\DATA\camera_calibration_gc1020c"
     cfg["camera"]["depth"] = False        # [MODIFICATO] solo video colore, niente depth
     print(f"[camera] {kind}", flush=True)
     if kind != "realsense" and not cfg.get("camera_box") and not args.preview_only:
