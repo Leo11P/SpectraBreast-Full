@@ -19,10 +19,10 @@ not the CAD, so the reconstruction error does not enter these numbers.
           corner: norm, in plane (xy) and in depth (z)
    FRE: the same errors with the homography fitted on ALL markers (what the
    registration stage reports), for comparison.
-3. Outputs in RESULTS/<date>/<sample>/validation/registration/: metrics.json,
+3. Outputs in RESULTS/<date>/<sample>/<model>/validation/registration/: metrics.json,
    overlay.png (detected corners vs the hold-out predictions), and a copy of
    the registration stage's Excel reports (<sample>_registration_errors.xlsx,
-   <sample>_sweep_resolution_summary.xlsx) from RESULTS/<date>/<sample>/registration/.
+   <sample>_sweep_resolution_summary.xlsx) from RESULTS/<date>/<sample>/<model>/registration/.
 
 Limits: every marker lies on the marker plane (z = 0), so the z error is the
 surface height at the markers vs the reconstructed corners; the error above
@@ -245,7 +245,9 @@ def validate_registration(cfg, vision_dir: Path, out_dir: Path) -> Dict[str, Any
     files.update(copy_registration_reports(rcfg.paths.output_dir, sample, out_dir))
     result = {
         "sample": sample, **_case_info(vcfg, sample),
-        "date": Path(out_dir).parents[2].name if len(Path(out_dir).parents) > 2 else None,
+        # out_dir = RESULTS/<date>/<sample>/<model>/validation/registration
+        "date": Path(out_dir).parents[3].name if len(Path(out_dir).parents) > 3 else None,
+        "model": Path(out_dir).parents[1].name if len(Path(out_dir).parents) > 1 else None,
         "vision_dir": str(vision_dir), "surface": str(rcfg.paths.mesh), "source": rcfg.source,
         "image": str(rcfg.paths.liveview_png if roi else rcfg.paths.hsi_hdr),
         "mode": "roi (LiveView PNG)" if roi else "single (HSI)",
@@ -280,12 +282,15 @@ SUMMARY_KEYS = [("tre", "err3d_mm"), ("tre", "err_xy_mm"), ("tre", "err_z_abs_mm
 
 
 def summarize(cfg) -> Path:
-    """Every validation/registration/metrics.json under results_root ->
+    """Every validation/registration/metrics.json under results_root (every
+    sample, every model) ->
     RESULTS/_validation/registration_summary.xlsx (+ .json)."""
     rows = []
-    for p in sorted(Path(cfg.results_root).glob("*/*/validation/registration/metrics.json")):
+    # RESULTS/<date>/<sample>/<model>/validation/registration/metrics.json
+    for p in sorted(Path(cfg.results_root).glob("*/*/*/validation/registration/metrics.json")):
         r = json.loads(p.read_text(encoding="utf-8"))
-        row = {"date": p.parents[3].name, "sample": r["sample"], "phantom": r.get("phantom"),
+        row = {"date": p.parents[4].name, "sample": r["sample"], "model": p.parents[2].name,
+               "phantom": r.get("phantom"),
                "pose": r.get("pose"), "rep": r.get("rep"), "source": r.get("source"),
                "n_markers": len(r["markers"]["used"])}
         for s, k in SUMMARY_KEYS:
@@ -295,7 +300,7 @@ def summarize(cfg) -> Path:
         rows.append(row)
     if not rows:
         raise SystemExit(f"[validation] no registration validation under {cfg.results_root}"
-                         "/*/*/validation/registration/: run `spectra validate -m registration` first")
+                         "/*/*/*/validation/registration/: run `spectra validate -m registration` first")
     out_dir = Path(cfg.results_root) / "_validation"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "registration_summary.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")

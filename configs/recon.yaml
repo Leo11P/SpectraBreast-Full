@@ -43,6 +43,8 @@ surface:
   min_neighbors: 3
   max_resolution: 2048
 
+backend: mast3r
+
 mast3r:
   model_name: naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric
   pipeline_variant: sfm

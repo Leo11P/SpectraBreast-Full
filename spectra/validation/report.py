@@ -37,13 +37,14 @@ def _date(name: str):
 
 def collect(results_root: Path, modality: str = "vision") -> List[dict]:
     newest: Dict[tuple, dict] = {}
-    for p in sorted(Path(results_root).glob(f"*/*/validation/{modality}/metrics.json")):
+    # RESULTS/<date>/<sample>/<model>/validation/<modality>/metrics.json
+    for p in sorted(Path(results_root).glob(f"*/*/*/validation/{modality}/metrics.json")):
         try:
             r = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             print(f"[validation] skipped {p}: {exc}")
             continue
-        r["date"] = p.parents[3].name
+        r["date"] = p.parents[4].name
         key = (r.get("sample"), r.get("model"))
         if key not in newest or _date(r["date"]) > _date(newest[key]["date"]):
             newest[key] = r
@@ -70,7 +71,7 @@ def row_of(r: dict) -> dict:
         h = m.get("height", {})
         if "slope_mm_per_mm" in h:
             row[f"{name}.height.slope_mm_per_mm"] = h["slope_mm_per_mm"]
-    for k in ("backend_s", "total_s"):
+    for k in ("backend_s", "total_s", "backend_peak_vram_gb"):
         if (r.get("timings") or {}).get(k) is not None:
             row[f"time.{k}"] = float(r["timings"][k])
     v = r.get("views") or {}
@@ -280,6 +281,8 @@ def write_sample_xlsx(path: Path, r: dict) -> str:
              f"{elev.get('min', float('nan')):.0f} - {elev.get('max', float('nan')):.0f}" if elev else None),
             ("Azimuth coverage (deg)", round(v["azimuth_coverage_deg"]) if "azimuth_coverage_deg" in v else None),
             ("Reconstruction time (s)", round((r.get("timings") or {}).get("backend_s") or 0) or None),
+            ("Reconstruction peak GPU memory (GB)",
+             round((r.get("timings") or {}).get("backend_peak_vram_gb") or 0, 2) or None),
             ("Warnings", len(r.get("warnings") or [])), ("Vision run", r.get("vision_dir"))]
     row = 3
     for k, x in info:
@@ -442,7 +445,7 @@ def summarize(cfg, modality: str = "vision") -> Path:
     results = collect(cfg.results_root, modality)
     if not results:
         raise SystemExit(f"[validation] no {modality} validation under {cfg.results_root}"
-                         f"/*/*/validation/{modality}/: run `spectra validate` first")
+                         f"/*/*/*/validation/{modality}/: run `spectra validate` first")
     rows = [row_of(r) for r in results]
     primary_of: Dict[str, str] = {}
     for r in results:

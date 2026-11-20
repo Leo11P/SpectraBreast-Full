@@ -1,4 +1,4 @@
-"""Spectra: unified pipeline (MASt3R-SfM + ArUco vision + HSI→mesh registration).
+"""Spectra: unified pipeline (3D reconstruction with a choice of model + ArUco vision + HSI→mesh registration).
 
 Public API
 ==========

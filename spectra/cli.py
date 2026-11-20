@@ -2,7 +2,7 @@
 
 Top-level commands::
 
-    spectra vision        # MASt3R-SfM + ArUco reconstruction (legacy `recon`)
+    spectra vision        # 3D reconstruction (vision.backend) + ArUco (legacy `recon`)
     spectra registration  # HSI→mesh registration (single/roi/batch/sweep)
     spectra full          # acquisition → vision → registration on one sample
                           # (the stages listed in `stages:`)
@@ -22,7 +22,9 @@ repo (top-level fields without a `vision:` wrapper) are still accepted by
 the `vision` and `recon` commands; the unified loader is only used when the
 YAML has a `vision:` sub-section (which is the new default).
 
-Outputs are grouped by run date: `RESULTS/<dd-mm-yyyy>/<sample>/<stage>/`.
+Outputs are grouped by run date, sample and reconstruction model:
+`RESULTS/<dd-mm-yyyy>/<sample>/<model>/<stage>/` (model = `<backend>[-<variant>]`,
+e.g. `mast3r-sfm`).
 `--date dd-mm-yyyy` targets a different day (useful to run registration
 against an earlier vision run); re-running on the same day overwrites that
 day's stage folder rather than creating a sibling.
@@ -210,20 +212,22 @@ def _missing(packages) -> list[str]:
     return [p for p in packages if importlib.util.find_spec(p) is None]
 
 
-def _require_local_processing(stages: List[str]) -> None:
+def _require_local_processing(stages: List[str], backend: Optional[str] = None) -> None:
     """mufasa.enabled is false: vision / registration run on this PC. Check,
-    before anything runs, that it has the `processing` extra (+ MASt3R) and,
-    for vision, a CUDA GPU."""
+    before anything runs, that it has the `processing` extra (+ what the
+    reconstruction model `backend` needs) and, for vision, a CUDA GPU."""
     missing = sorted({p for s in stages for p in _missing(_STAGE_PACKAGES.get(s, ()))})
+    hint = "uv sync --extra acquisition --extra processing"
     if "vision" in stages:
-        mast3r_dir = Path(__file__).resolve().parent.parent / "mast3r"
-        if not mast3r_dir.is_dir() and _missing(["mast3r"]):
-            missing.append("mast3r (clone it in the repo, README §1.3)")
+        from .vision.backends.registry import DEFAULT_BACKEND, backend_spec, missing_requirements
+
+        spec = backend_spec(backend or DEFAULT_BACKEND)
+        missing += [m for m in missing_requirements(spec.name) if m not in missing]
+        hint += f"  (model {spec.name}: {spec.install_hint})"
     if missing:
         print(f"[red]mufasa.enabled is false, so {' + '.join(stages)} must run on this PC, "
               f"but it lacks {missing}.[/red]\n"
-              "Either install them:  uv sync --extra acquisition --extra processing  "
-              "(+ MASt3R / ASMK, README §1.3)\n"
+              f"Either install them:  {hint}\n"
               "or set `mufasa.enabled: true` to run them on Mufasa.")
         raise typer.Exit(code=1)
     if "vision" in stages:
@@ -278,7 +282,7 @@ def _execute_vision(
         print("[bold]Dry-run — vision config resolved:[/bold]")
         print(cfg.vision.model_dump(mode="python"))
         return
-    _require_local_processing(["vision"])
+    _require_local_processing(["vision"], cfg.vision.backend)
     result = run_vision_stage(cfg)
     print(f"[green]Vision finished:[/green] {result['run_dir']}")
 
@@ -296,7 +300,7 @@ def vision_cmd(
     dry_run: bool = typer.Option(False, "--dry-run",
                                   help="Resolve paths and print the config without running."),
 ) -> None:
-    """Run only the MASt3R-SfM + ArUco vision stage (on Mufasa if mufasa.enabled)."""
+    """Run only the vision stage: 3D reconstruction with vision.backend + ArUco (on Mufasa if mufasa.enabled)."""
     _execute_vision(config, sample, date, set_override, dry_run)
 
 
@@ -437,11 +441,11 @@ def full_cmd(
     import time as _time
 
     from . import timing
-    from .orchestrator import today_folder
+    from .orchestrator import run_model, today_folder
 
     t_full0 = _time.time()
     tdir = timing.timing_dir(cfg.results_root, cfg.results_date or today_folder(),
-                             cfg.sample_name)
+                             cfg.sample_name, run_model(cfg))
     timing.reset(tdir / timing.LOCAL, sample=cfg.sample_name, stages=list(cfg.stages))
 
     # Everything that can fail is checked BEFORE the robot moves.
@@ -455,7 +459,7 @@ def full_cmd(
         timing.add(tdir / timing.LOCAL, "check Mufasa (before the robot moves)", t_full0,
                    _time.time(), where="this PC")
     elif compute:
-        _require_local_processing(compute)
+        _require_local_processing(compute, cfg.vision.backend)
 
     if acquire:
         t_acq0 = _time.time()
@@ -467,7 +471,7 @@ def full_cmd(
             raise typer.Exit(code=1)
 
     if not compute:
-        timing.write_xlsx(tdir, sample=cfg.sample_name, date=tdir.parent.parent.name)
+        timing.write_xlsx(tdir, sample=cfg.sample_name, date=cfg.results_date or today_folder())
         return
     if on_mufasa:
         # the download (and timing.xlsx) is finished by a background process
@@ -716,7 +720,7 @@ def validate_cmd(
     try:
         if what == "summary":
             if dry_run:
-                print(f"\\[dry-run] would summarise {cfg.results_root}/*/*/validation/")
+                print(f"\\[dry-run] would summarise {cfg.results_root}/*/*/*/validation/")
                 return
             missing = _missing(("openpyxl",))
             if missing:

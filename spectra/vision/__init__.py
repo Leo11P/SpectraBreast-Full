@@ -1,4 +1,5 @@
-"""MASt3R-SfM reconstruction with ArUco-stabilized metric alignment.
+"""3D reconstruction (model chosen with ``vision.backend``: MASt3R, ...) with
+ArUco-stabilized metric alignment.
 
 - `run_reconstruction(cfg)` — images → dense cloud, ArUco 2D/3D, surface, exports.
 - `ReconstructionConfig` / `load_config` — YAML configuration.

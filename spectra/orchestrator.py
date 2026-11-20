@@ -43,13 +43,18 @@ Inputs — stage first, sample second, for *every* mode including ``batch``::
 When several ``<sample>_*`` vision folders exist, the one whose suffix
 contains ``iphone`` wins; otherwise the first in alphabetical order.
 
-Outputs — grouped by run date (``dd-mm-yyyy``), then by sample::
+Outputs — grouped by run date (``dd-mm-yyyy``), then by sample, then by the
+reconstruction model (``<backend>[-<variant>]``, e.g. ``mast3r-sfm``: see
+``vision/backends/registry.py::model_tag``)::
 
-    RESULTS/<dd-mm-yyyy>/<sample>/vision/
-    RESULTS/<dd-mm-yyyy>/<sample>/registration/
-    RESULTS/<dd-mm-yyyy>/_batch/batch_summary.xlsx
+    RESULTS/<dd-mm-yyyy>/<sample>/<model>/vision/
+    RESULTS/<dd-mm-yyyy>/<sample>/<model>/registration/
+    RESULTS/<dd-mm-yyyy>/<sample>/<model>/validation/
+    RESULTS/<dd-mm-yyyy>/_batch/<model>/batch_summary.xlsx
 
-Re-running any command on the same day **overwrites** that day's folder
+Registration and validation work on the vision run of the model in the config
+(``vision.backend``), so two models run on the same day never share a folder.
+Re-running the SAME model on the same day **overwrites** that day's folder
 rather than creating a sibling. Pin a different day with
 ``results_date: "dd-mm-yyyy"`` in the YAML.
 
@@ -73,6 +78,7 @@ from .config import (
     UnifiedConfig,
 )
 from .vision.aruco import IMAGE_EXTENSIONS
+from .vision.backends.registry import model_tag
 
 
 # =============================================================================
@@ -105,6 +111,12 @@ def is_date_folder(name: str) -> bool:
 def run_root(results_root: Path, date: Optional[str] = None) -> Path:
     """``<results_root>/<dd-mm-yyyy>`` — the per-day root for all outputs."""
     return Path(results_root) / (date or today_folder())
+
+
+def run_model(cfg: UnifiedConfig) -> str:
+    """Name of the reconstruction model of ``cfg`` (``<backend>[-<variant>]``):
+    the folder level under the sample."""
+    return model_tag(cfg.vision)
 
 
 # ----- inputs ----------------------------------------------------------------
@@ -181,24 +193,30 @@ def default_liveview_png_path(data_root: Path, sample: str) -> Path:
 
 # ----- outputs ---------------------------------------------------------------
 
-def sample_output_dir(results_root: Path, sample: str, date: Optional[str] = None) -> Path:
-    return run_root(results_root, date) / sample
+def sample_output_dir(results_root: Path, sample: str, date: Optional[str] = None, *,
+                      model: str) -> Path:
+    """``<results_root>/<date>/<sample>/<model>``: everything of one sample
+    reconstructed with one model."""
+    return run_root(results_root, date) / sample / model
 
 
-def vision_output_dir(results_root: Path, sample: str, date: Optional[str] = None) -> Path:
-    return sample_output_dir(results_root, sample, date) / "vision"
+def vision_output_dir(results_root: Path, sample: str, date: Optional[str] = None, *,
+                      model: str) -> Path:
+    return sample_output_dir(results_root, sample, date, model=model) / "vision"
 
 
-def registration_output_dir(results_root: Path, sample: str, date: Optional[str] = None) -> Path:
-    return sample_output_dir(results_root, sample, date) / "registration"
+def registration_output_dir(results_root: Path, sample: str, date: Optional[str] = None, *,
+                            model: str) -> Path:
+    return sample_output_dir(results_root, sample, date, model=model) / "registration"
 
 
-def batch_summary_dir(results_root: Path, date: Optional[str] = None) -> Path:
-    return run_root(results_root, date) / "_batch"
+def batch_summary_dir(results_root: Path, date: Optional[str] = None, *, model: str) -> Path:
+    return run_root(results_root, date) / "_batch" / model
 
 
-def vision_mesh_path(results_root: Path, sample: str, date: Optional[str] = None) -> Path:
-    return vision_output_dir(results_root, sample, date) / "surface_mesh.ply"
+def vision_mesh_path(results_root: Path, sample: str, date: Optional[str] = None, *,
+                     model: str) -> Path:
+    return vision_output_dir(results_root, sample, date, model=model) / "surface_mesh.ply"
 
 
 def registration_surface_name(source: str) -> str:
@@ -206,8 +224,9 @@ def registration_surface_name(source: str) -> str:
     return "cloud.ply" if source == "cloud" else "surface_mesh.ply"
 
 
-def vision_aruco_path(results_root: Path, sample: str, date: Optional[str] = None) -> Path:
-    return vision_output_dir(results_root, sample, date) / "aruco_markers_3d.json"
+def vision_aruco_path(results_root: Path, sample: str, date: Optional[str] = None, *,
+                      model: str) -> Path:
+    return vision_output_dir(results_root, sample, date, model=model) / "aruco_markers_3d.json"
 
 
 # =============================================================================
@@ -227,18 +246,21 @@ def find_vision_dir(
     results_root: Path,
     sample: str,
     date: Optional[str] = None,
+    *,
+    model: str,
 ) -> tuple[Path, bool]:
-    """Locate the vision outputs registration should consume.
+    """Locate the vision outputs (of ``model``) registration should consume.
 
     Prefers the requested run date (today by default). If that folder has no
-    usable vision run, falls back to the most recent dated folder that does,
-    so a registration-only run still works the day after a vision run.
+    usable vision run of ``model``, falls back to the most recent dated folder
+    that has one, so a registration-only run still works the day after a
+    vision run. Never a run of another model.
 
     Returns ``(vision_dir, is_fallback)``. When nothing usable exists the
     canonical path for ``date`` is returned with ``is_fallback=False``, and
     the downstream validator reports it as missing.
     """
-    preferred = vision_output_dir(results_root, sample, date)
+    preferred = vision_output_dir(results_root, sample, date, model=model)
     if vision_dir_complete(preferred):
         return preferred, False
 
@@ -250,7 +272,7 @@ def find_vision_dir(
             reverse=True,
         )
         for day in dated:
-            candidate = day / sample / "vision"
+            candidate = day / sample / model / "vision"
             if candidate != preferred and vision_dir_complete(candidate):
                 return candidate, True
 
@@ -261,9 +283,11 @@ def vision_outputs_present(
     results_root: Path,
     sample: str,
     date: Optional[str] = None,
+    *,
+    model: str,
 ) -> bool:
-    """True iff a usable vision run exists for ``date`` (no fallback)."""
-    return vision_dir_complete(vision_output_dir(results_root, sample, date))
+    """True iff a usable vision run of ``model`` exists for ``date`` (no fallback)."""
+    return vision_dir_complete(vision_output_dir(results_root, sample, date, model=model))
 
 
 def check_marker_edge(aruco_json: Path, marker_edge_length_mm: float) -> None:
@@ -332,6 +356,7 @@ def resolve_unified_paths(
     """
     sample = cfg.sample_name
     date = cfg.results_date
+    model = run_model(cfg)
     overrides: dict[str, Any] = {}
 
     # ------- vision.input -------------------------------------------------
@@ -358,7 +383,7 @@ def resolve_unified_paths(
     # ------- vision.output ------------------------------------------------
     if _is_unset(cfg.vision.output.root):
         overrides["vision.output.root"] = str(
-            sample_output_dir(cfg.results_root, sample, date)
+            sample_output_dir(cfg.results_root, sample, date, model=model)
         )
     if _is_unset(cfg.vision.output.run_name):
         overrides["vision.output.run_name"] = "vision"
@@ -376,7 +401,7 @@ def resolve_unified_paths(
     # mistaken for a user-set path later on.
     if resolve_vision_handoff and (_is_unset(r_paths.mesh) or _is_unset(r_paths.aruco_json)):
         if vision_dir is None:
-            vision_dir, _ = find_vision_dir(cfg.results_root, sample, date)
+            vision_dir, _ = find_vision_dir(cfg.results_root, sample, date, model=model)
         vision_dir = Path(vision_dir)
         if _is_unset(r_paths.mesh):
             overrides["registration.paths.mesh"] = str(
@@ -388,7 +413,7 @@ def resolve_unified_paths(
 
     if _is_unset(r_paths.output_dir):
         overrides["registration.paths.output_dir"] = str(
-            registration_output_dir(cfg.results_root, sample, date)
+            registration_output_dir(cfg.results_root, sample, date, model=model)
         )
 
     # liveview_png: only auto-derive when the run actually needs it, so
@@ -461,7 +486,8 @@ def run_registration_stage(
     if cfg.registration.mode != "batch":
         # batch picks (and checks) each sample's vision run in discover_samples
         mesh_dir = Path(cfg.registration.paths.mesh).parent
-        expected = vision_output_dir(cfg.results_root, sample, cfg.results_date)
+        expected = vision_output_dir(cfg.results_root, sample, cfg.results_date,
+                                     model=run_model(cfg))
         if mesh_dir == expected:
             print(f"[orchestrator] Vision run used by registration: {mesh_dir}")
         else:
@@ -475,6 +501,7 @@ def run_registration_stage(
         data_root=cfg.data_root,
         results_root=cfg.results_root,
         results_date=cfg.results_date or today_folder(),
+        model=run_model(cfg),
         force_cpu=force_cpu,
         dry_run=dry_run,
     )
@@ -546,9 +573,12 @@ def run_full(
     cfg = resolve_unified_paths(cfg, resolve_vision_handoff=False)
     sample = sample_name or cfg.sample_name
     date = cfg.results_date or today_folder()
+    model = run_model(cfg)
+    vision_dir_today = vision_output_dir(cfg.results_root, sample, cfg.results_date, model=model)
 
     print("\n" + "=" * 68)
     print(f"  SPECTRA FULL — sample={sample!r}")
+    print(f"  model        : {model}")
     print(f"  data_root    : {cfg.data_root}")
     print(f"  results_root : {cfg.results_root}")
     print(f"  run date     : {date}")
@@ -566,22 +596,23 @@ def run_full(
     # this PC's part (acquisition, Mufasa) in validation/timing/timing.xlsx.
     from . import timing
 
-    tdir = timing.timing_dir(cfg.results_root, date, sample)
+    tdir = timing.timing_dir(cfg.results_root, date, sample, model)
     tfile = None if dry_run else tdir / timing.JOB
     where = "Mufasa" if os.environ.get("SLURM_JOB_ID") else "this PC"
     if tfile is not None:
         timing.reset(tfile, sample=sample, stages=list(cfg.stages))
 
     if do_vision:
-        if not force_vision and vision_outputs_present(cfg.results_root, sample, cfg.results_date):
+        if not force_vision and vision_outputs_present(cfg.results_root, sample, cfg.results_date,
+                                                       model=model):
             print(f"\n[orchestrator] Vision outputs already exist at "
-                  f"{vision_output_dir(cfg.results_root, sample, cfg.results_date)} "
+                  f"{vision_dir_today} "
                   f"— skipping vision stage.")
             print("  (use --force-vision to re-run and overwrite them)")
             out["skipped_vision"] = True
             out["vision"] = {
                 "skipped": True,
-                "run_dir": vision_output_dir(cfg.results_root, sample, cfg.results_date),
+                "run_dir": vision_dir_today,
             }
         else:
             if dry_run:
@@ -600,8 +631,7 @@ def run_full(
             # (just produced, or the one for this date that caused the skip).
             # No fallback to an older run: a missing output is an error.
             # Paths set explicitly by the user are still left untouched.
-            vision_dir = Path(out["vision"].get(
-                "run_dir", vision_output_dir(cfg.results_root, sample, cfg.results_date)))
+            vision_dir = Path(out["vision"].get("run_dir", vision_dir_today))
             needs_handoff = (_is_unset(cfg.registration.paths.mesh)
                              or _is_unset(cfg.registration.paths.aruco_json))
             surface = registration_surface_name(cfg.registration.source)
@@ -632,9 +662,8 @@ def run_full(
 
         # The vision run of this invocation; without vision, this date's run
         # else the most recent one (as for registration).
-        vision_dir = (Path(out["vision"].get(
-            "run_dir", vision_output_dir(cfg.results_root, sample, cfg.results_date)))
-            if do_vision else None)
+        vision_dir = (Path(out["vision"].get("run_dir", vision_dir_today))
+                      if do_vision else None)
         if dry_run:
             print("[orchestrator][dry-run] Would run validation stage.")
             out["validation"] = {"dry_run": True}
@@ -659,6 +688,7 @@ def run_full(
     print("=" * 68)
     print(f"  Sample        : {sample}")
     print(f"  Run date      : {date}")
+    print(f"  Model         : {model}")
     print(f"  Vision skipped: {out['skipped_vision']}")
     if "vision" in out and "run_dir" in out["vision"]:
         print(f"  Vision output : {out['vision']['run_dir']}")
@@ -685,6 +715,7 @@ __all__ = [
     "registration_output_dir",
     "resolve_unified_paths",
     "run_full",
+    "run_model",
     "run_registration_stage",
     "run_root",
     "run_vision_stage",

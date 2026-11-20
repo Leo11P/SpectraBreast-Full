@@ -10,7 +10,14 @@
 *.egg-info
 __pycache__
 
-DATA/
+DATA/*
+!DATA/camera_calibration_gc1020c/
+DATA/camera_calibration_gc1020c/*
+!DATA/camera_calibration_gc1020c/output/
+DATA/camera_calibration_gc1020c/output/*
+!DATA/camera_calibration_gc1020c/output/calibration/
+!DATA/camera_calibration_gc1020c/output/intrinsics/
+
 RESULTS/
 logs/
 
@@ -35,10 +42,6 @@ checkpoints/
 *.onnx
 
 # robot SDK, URDF, meshes
-spectra/acquisition/fairino/
-spectra/acquisition/fairino_description/
-fairino/
-fairino_description/
 *.urdf
 *.stl
 *.STL

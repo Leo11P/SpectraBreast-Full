@@ -40,7 +40,7 @@ from typing import Dict
 def read_vision_timings(vision_dir: Path) -> Optional[Dict[str, Any]]:
     """Rilegge <vision_dir>/timings.json. None se assente/illeggibile.
 
-    vision_dir = RESULTS/<dd-mm-yyyy>/<sample>/vision
+    vision_dir = RESULTS/<dd-mm-yyyy>/<sample>/<model>/vision
     """
     path = Path(vision_dir) / "timings.json"
     if not path.is_file():
@@ -52,8 +52,15 @@ def read_vision_timings(vision_dir: Path) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def _batch_model(model: Optional[str]) -> str:
+    if not model:
+        raise ValueError("Batch mode needs the reconstruction model (run_registration(model=...)), "
+                         "normally passed by the unified CLI / orchestrator.")
+    return model
+
+
 def _vision_dir_from_mesh(mesh_path) -> Optional[Path]:
-    """``.../<sample>/vision/surface_mesh.ply`` -> ``.../<sample>/vision``."""
+    """``.../<sample>/<model>/vision/surface_mesh.ply`` -> ``.../<sample>/<model>/vision``."""
     if mesh_path is None:
         return None
     return Path(mesh_path).parent
@@ -188,6 +195,7 @@ def run_registration(
     data_root: Optional[Path] = None,
     results_root: Optional[Path] = None,
     results_date: Optional[str] = None,
+    model: Optional[str] = None,
     force_cpu: bool = False,
     dry_run: bool = False,
 ) -> dict[str, Any]:
@@ -205,8 +213,12 @@ def run_registration(
     data_root, results_root, results_date :
         Required only for ``mode == "batch"`` (the batch discoverer scans
         ``data_root/input_registration/`` and writes per-sample outputs under
-        ``results_root/<results_date>/<sample>/registration``). ``results_date``
-        defaults to today.
+        ``results_root/<results_date>/<sample>/<model>/registration``).
+        ``results_date`` defaults to today.
+    model :
+        Reconstruction model whose vision runs batch mode uses
+        (``<backend>[-<variant>]``, see ``orchestrator.run_model``). Required
+        only for ``mode == "batch"``.
     force_cpu :
         If true, disables GPU raycasting even if torch/cupy are available.
     dry_run :
@@ -258,6 +270,7 @@ def run_registration(
                 results_date=results_date,
                 marker_edge_length_mm=cfg.detection.marker_edge_length_mm,
                 surface_name=registration_surface_name(cfg.source),
+                model=_batch_model(model),
             )
         print("\n[Dry-run] Configuration valid; pipeline NOT executed.")
         return {"dry_run": True}
@@ -287,6 +300,7 @@ def run_registration(
             results_root=Path(results_root),
             results_date=results_date,
             render_fn=render_orthographic_topview_gpu if use_gpu_render else None,
+            model=_batch_model(model),
         )
         return {"summary_xlsx": xlsx_path}
 

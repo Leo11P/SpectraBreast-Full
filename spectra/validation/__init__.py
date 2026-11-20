@@ -14,10 +14,13 @@ Modalities (one per protocol phase):
 
 Steps:
 
-    run      validate one sample (its vision run) -> RESULTS/<date>/<sample>/validation/<modality>/
-             with --all: every sample with a vision run whose name says its
-             phantom (validation.sample_pattern / cases), then the summary
-    summary  every validated sample under RESULTS -> RESULTS/_validation/<modality>_summary.xlsx
+    run      validate one sample (its vision run of the configured model,
+             vision.backend) -> RESULTS/<date>/<sample>/<model>/validation/<modality>/
+             with --all: every sample with a vision run of that model whose
+             name says its phantom (validation.sample_pattern / cases), then
+             the summary
+    summary  every validated sample, every model, under RESULTS ->
+             RESULTS/_validation/<modality>_summary.xlsx (one row per sample and model)
 
 Settings: ``validation:`` in the unified config. Data, fixed layout:
 
@@ -51,22 +54,25 @@ def data_dir(cfg) -> Path:
 
 
 def output_dir(cfg, modality: str = "vision") -> Path:
-    from ..orchestrator import sample_output_dir
+    from ..orchestrator import run_model, sample_output_dir
 
-    return sample_output_dir(cfg.results_root, cfg.sample_name, cfg.results_date) / "validation" / modality
+    return (sample_output_dir(cfg.results_root, cfg.sample_name, cfg.results_date,
+                              model=run_model(cfg)) / "validation" / modality)
 
 
 def run_validation_stage(cfg, vision_dir: Optional[Path] = None,
                          modalities=MODALITIES) -> dict[str, Any]:
     """Validate the sample of ``cfg``. ``vision_dir`` defaults to this date's
-    vision run, else the most recent one (same rule as registration)."""
+    vision run of the configured model, else the most recent one of that model
+    (same rule as registration)."""
     if cfg.validation is None:
         raise SystemExit("[validation] `validation:` section missing in the config")
     out: dict[str, Any] = {}
     if vision_dir is None:
-        from ..orchestrator import find_vision_dir
+        from ..orchestrator import find_vision_dir, run_model
 
-        vision_dir, fallback = find_vision_dir(cfg.results_root, cfg.sample_name, cfg.results_date)
+        vision_dir, fallback = find_vision_dir(cfg.results_root, cfg.sample_name, cfg.results_date,
+                                               model=run_model(cfg))
         if fallback:
             print(f"[validation] no vision run for this date: using {vision_dir}")
     if "vision" in modalities:
@@ -97,23 +103,26 @@ def is_case(vcfg, sample: str) -> bool:
 
 
 def find_cases(cfg) -> dict[str, Path]:
-    """{sample: vision run} of every validation case under results_root: the
-    run of results_date when set and present, else the most recent one."""
+    """{sample: vision run} of every validation case under results_root, with
+    the configured model (vision.backend): the run of results_date when set
+    and present, else the most recent one."""
     from datetime import datetime
 
-    from ..orchestrator import DATE_FOLDER_FORMAT, is_date_folder, vision_dir_complete
+    from ..orchestrator import DATE_FOLDER_FORMAT, is_date_folder, run_model, vision_dir_complete
 
+    model = run_model(cfg)
     root = Path(cfg.results_root)
     days = sorted((d for d in root.iterdir() if d.is_dir() and is_date_folder(d.name)),
                   key=lambda d: datetime.strptime(d.name, DATE_FOLDER_FORMAT)) if root.is_dir() else []
     runs: dict[str, list[Path]] = {}
     for day in days:                                   # oldest -> newest
         for sdir in sorted(p for p in day.iterdir() if p.is_dir()):
-            if is_case(cfg.validation, sdir.name) and vision_dir_complete(sdir / "vision"):
-                runs.setdefault(sdir.name, []).append(sdir / "vision")
+            vdir = sdir / model / "vision"
+            if is_case(cfg.validation, sdir.name) and vision_dir_complete(vdir):
+                runs.setdefault(sdir.name, []).append(vdir)
     cases: dict[str, Path] = {}
     for sample, vdirs in runs.items():
-        pinned = [v for v in vdirs if v.parent.parent.name == cfg.results_date]
+        pinned = [v for v in vdirs if v.parents[2].name == cfg.results_date]
         cases[sample] = pinned[0] if pinned else vdirs[-1]
     return cases
 
@@ -123,7 +132,10 @@ def run_all(cfg, modalities=MODALITIES) -> dict[str, Any]:
     reported and skipped."""
     cases = find_cases(cfg)
     if not cases:
-        raise SystemExit(f"[validation] no vision run of a validation case under {cfg.results_root} "
+        from ..orchestrator import run_model
+
+        raise SystemExit(f"[validation] no vision run of a validation case with model "
+                         f"{run_model(cfg)} under {cfg.results_root} "
                          "(names as validation.sample_pattern, e.g. T1_P1_R1, or validation.cases)")
     print(f"[validation] {len(cases)} cases: {', '.join(sorted(cases))}")
     done, failed = [], {}

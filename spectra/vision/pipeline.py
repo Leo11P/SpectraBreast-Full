@@ -1,5 +1,10 @@
 """Top-level orchestrator: detect ArUcos, run a back-end, align, surface.
 
+The back-end (the reconstruction model) is chosen with ``vision.backend`` and
+loaded through ``backends/registry.py``; everything here works on the
+``BackendInputs`` / ``RawReconstruction`` contract (``backends/types.py``) and
+never reads a model's own config section.
+
 Usage::
 
     from spectra import run_reconstruction, load_config
@@ -35,12 +40,14 @@ from .align import (
     markers_best_fit_plane_rms_m,
     per_view_marker_corner_rmse_px,
 )
+from .backends.common import weighted_voxel_downsample
+from .backends.registry import load_backend, model_tag
 from .backends.types import RawReconstruction
 from .aruco import ArucoDetector, MarkerDetection, annotate_image
 from .config import ReconstructionConfig, RerunConfig, save_config, save_config_json
 from .inputs import build_backend_inputs, canonicalize_images_with_exif, undistort_images_inplace
 from .io_utils import (
-    clean_sfm_cache,
+    clean_cache_dirs,
     prepare_run_dir,
     save_mesh_as_ply,
     save_pointcloud_as_ply,
@@ -235,89 +242,6 @@ def _write_aruco_markers_3d(
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def _network_zoom(mcfg, detections_per_view, image_paths) -> Dict[str, Any] | None:
-    """The central window of every image that MASt3R sees (vision.mast3r.zoom),
-    or None for the whole image (zoom 1, the default).
-
-    One window for every image: the servo centres the markers, and the sfm
-    shared intrinsics need a single camera. 'auto': the largest zoom
-    (<= zoom_max) whose window holds every detected marker corner with
-    zoom_margin around it. Extents are fractions of the half image from its
-    centre (1 = touches the border)."""
-    if mcfg.zoom != "auto" and float(mcfg.zoom) <= 1.0:
-        return None
-    from PIL import Image
-
-    sizes = set()
-    for p in image_paths:
-        with Image.open(p) as im:
-            sizes.add(im.size)
-    if len(sizes) != 1:
-        print(f"[yellow]vision.mast3r.zoom ignored: the images do not all have the same size "
-              f"({sorted(sizes)}).[/yellow]")
-        return None
-    W, H = sizes.pop()
-    ext: List[float | None] = []
-    for dets in detections_per_view:
-        if not dets:
-            ext.append(None)
-            continue
-        c = np.concatenate([np.asarray(d.corners_xy, dtype=np.float64).reshape(-1, 2) for d in dets])
-        ext.append(float(max(np.abs(c[:, 0] - W / 2).max() / (W / 2),
-                             np.abs(c[:, 1] - H / 2).max() / (H / 2))))
-    seen = [e for e in ext if e is not None]
-    need = [None if e is None else e * (1.0 + float(mcfg.zoom_margin)) for e in ext]
-    if mcfg.zoom == "auto":
-        if not seen:
-            print("[yellow]vision.mast3r.zoom auto: no ArUco marker detected, MASt3R gets the "
-                  "whole images.[/yellow]")
-            return None
-        zoom = min(float(mcfg.zoom_max), 1.0 / max(n for n in need if n is not None))
-        if zoom < 1.05:
-            print(f"[dim]vision.mast3r.zoom auto: the markers reach {max(seen):.2f} of the half "
-                  "image: no zoom.[/dim]")
-            return None
-    else:
-        zoom = float(mcfg.zoom)
-    # even sizes, rounded up so that the window holds what 'auto' asked for
-    w, h = (min(n, int(np.ceil(n / zoom / 2 - 1e-9)) * 2) for n in (W, H))
-    x0, y0 = (W - w) // 2, (H - h) // 2
-    half = min(w / W, h / H)                 # window half-size, fraction of the half image
-    return {
-        "mode": "auto" if mcfg.zoom == "auto" else "fixed",
-        "zoom_config": mcfg.zoom,
-        "zoom": float(W / w),
-        "crop_px": [int(x0), int(y0), int(w), int(h)],
-        "image_wh": [int(W), int(H)],
-        "margin": float(mcfg.zoom_margin),
-        "marker_extent_max": max(seen) if seen else None,
-        "limiting_view": int(np.argmax([-1.0 if e is None else e for e in ext])) if seen else None,
-        "views_at_risk": [i for i, n in enumerate(need) if n is not None and n > half + 1e-9],
-        "upsampled": bool(max(w, h) < int(mcfg.image_size)),
-    }
-
-
-def _write_network_crops(image_paths, crop, out_dir: Path) -> List[Path]:
-    """The zoom window of every image, as PNG (lossless) in ``out_dir``."""
-    from PIL import Image
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    x0, y0, w, h = (int(c) for c in crop)
-    out = []
-    for p in image_paths:
-        q = out_dir / (Path(p).stem + ".png")
-        with Image.open(p) as im:
-            im.convert("RGB").crop((x0, y0, x0 + w, y0 + h)).save(q)
-        out.append(q)
-    return out
-
-
-def _run_mast3r_backend(cfg: ReconstructionConfig, inputs) -> RawReconstruction:
-    from .backends.mast3r_backend import run_mast3r
-
-    return run_mast3r(cfg, inputs)
-
-
 def _refuse_with_ba_delta(
     point_map_world: np.ndarray,          # [V, Hn, Wn, 3] backend-scale world
     valid_masks: np.ndarray,              # [V, Hn, Wn] bool
@@ -361,32 +285,10 @@ def _refuse_with_ba_delta(
     fused_confidence = confidence_maps_network[valid_masks].astype(np.float32)
 
     if voxel_size > 0.0 and fused_points.shape[0] > 0:
-        # Simple confidence-weighted voxel downsample (kept local to avoid a
-        # backends -> pipeline cycle; mirrors the MASt3R back-end's helper).
-        keys = np.floor(fused_points / float(voxel_size)).astype(np.int64)
-        _, inv = np.unique(keys, axis=0, return_inverse=True)
-        inv = np.asarray(inv).reshape(-1)  # numpy>=2.0 may return shape [N,1] for axis=0
-        num_vox = int(inv.max()) + 1
-        weights = np.clip(fused_confidence.astype(np.float64), 1e-6, None)
-        weight_sum = np.bincount(inv, weights=weights, minlength=num_vox)
-        counts = np.bincount(inv, minlength=num_vox)
-
-        out_pts = np.zeros((num_vox, 3), dtype=np.float64)
-        out_cols = np.zeros((num_vox, 3), dtype=np.float64)
-        for d in range(3):
-            out_pts[:, d] = np.bincount(
-                inv, weights=weights * fused_points[:, d].astype(np.float64), minlength=num_vox
-            ) / np.maximum(weight_sum, 1e-12)
-            out_cols[:, d] = np.bincount(
-                inv, weights=weights * fused_colors[:, d].astype(np.float64), minlength=num_vox
-            ) / np.maximum(weight_sum, 1e-12)
-        out_conf = np.bincount(
-            inv, weights=fused_confidence.astype(np.float64), minlength=num_vox
-        ) / np.maximum(counts, 1)
-
-        fused_points = out_pts.astype(np.float32)
-        fused_colors = np.clip(out_cols, 0.0, 255.0).astype(np.uint8)
-        fused_confidence = out_conf.astype(np.float32)
+        # the same confidence-weighted voxel fusion the back-ends use
+        fused_points, fused_colors, fused_confidence = weighted_voxel_downsample(
+            fused_points, fused_colors, fused_confidence, voxel_size
+        )
 
     return refined_pm, fused_points, fused_colors, fused_confidence
 
@@ -413,21 +315,23 @@ def _fuse_point_maps_to_cloud(
 
 
 def _slice_raw_reconstruction(raw: RawReconstruction, keep_idx: np.ndarray) -> RawReconstruction:
-    """Restrict every per-view field to ``keep_idx`` and refresh ``fused_*`` from maps."""
+    """Restrict every per-view field to ``keep_idx`` and refresh ``fused_*`` from maps.
+
+    ``extra``: every entry with one element per view (array or list of length
+    V, as the contract asks) is sliced too; the others are kept as they are."""
     ki = np.asarray(keep_idx, dtype=np.int64)
+    V = int(raw.T_world_cam.shape[0])
     pm = raw.point_map_world[ki]
     vm = raw.valid_masks[ki]
     imgs = raw.images_network_uint8[ki]
     cmap = raw.confidence_maps_network[ki]
     fused_pts, fused_col, fused_cf = _fuse_point_maps_to_cloud(pm, vm, imgs, cmap)
     extra = dict(raw.extra)
-    geoms = extra.get("geometries")
-    if isinstance(geoms, list):
-        extra["geometries"] = [geoms[int(i)] for i in ki]
-    for key in ("T_world_cam_predicted", "intrinsics_predicted"):
-        arr = extra.get(key)
-        if isinstance(arr, np.ndarray) and arr.ndim >= 1 and arr.shape[0] == raw.T_world_cam.shape[0]:
-            extra[key] = arr[ki]
+    for key, val in raw.extra.items():
+        if isinstance(val, np.ndarray) and val.ndim >= 1 and val.shape[0] == V:
+            extra[key] = val[ki]
+        elif isinstance(val, (list, tuple)) and len(val) == V:
+            extra[key] = [val[int(i)] for i in ki]
     return replace(
         raw,
         fused_points=fused_pts,
@@ -487,7 +391,7 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
     )
 
     # Bake EXIF Orientation into pixel buffers once, then reuse those paths
-    # everywhere downstream. MASt3R and the ArUco
+    # everywhere downstream. The back-end and the ArUco
     # detector all open files via cv2 / PIL / torchvision, which ignore EXIF
     # by default — so mixing upright and rotated/mirrored raw buffers (as
     # iPhone JPEGs do within a single batch) would otherwise feed backends
@@ -501,7 +405,7 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
 
     # Lens undistortion (vision.input.undistort): the copies above become ideal
     # pinhole images with the SAME K, so intrinsics.npy stays valid and every
-    # later consumer (MASt3R, ArUco, validation, zoom crops) sees the same images.
+    # later consumer (back-end, ArUco, validation) sees the same images.
     if cfg.input.undistort:
         und = undistort_images_inplace(
             canonical_paths,
@@ -549,43 +453,28 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
     num_detections = sum(len(d) for d in detections_per_view)
     print(f"Detected [green]{num_detections}[/green] markers across {num_views} views.")
 
-    # MASt3R input zoom (vision.mast3r.zoom): the same central window of every
-    # image, saved to inputs_mast3r_zoom/ and read by MASt3R instead of the
-    # whole images. Off (whole image) by default.
-    zoom_info = _network_zoom(cfg.mast3r, detections_per_view, backend_inputs.image_paths)
-    if zoom_info is not None:
-        x0, y0, w, h = zoom_info["crop_px"]
-        backend_inputs.network_crop = (x0, y0, w, h)
-        backend_inputs.network_image_paths = _write_network_crops(
-            backend_inputs.image_paths, zoom_info["crop_px"], run_dir / "inputs_mast3r_zoom")
-        ext = zoom_info["marker_extent_max"]
-        print(
-            f"MASt3R input zoom [green]{zoom_info['zoom']:.2f}x[/green] ({zoom_info['mode']}): "
-            f"central {w}x{h} px of the {zoom_info['image_wh'][0]}x{zoom_info['image_wh'][1]} images "
-            f"(inputs_mast3r_zoom/)"
-            + ("" if ext is None else f"; the detected markers reach {ext:.2f} of the half image "
-               f"(view {zoom_info['limiting_view']})")
-        )
-        if zoom_info["views_at_risk"]:
-            print(
-                f"[yellow]Zoom {zoom_info['zoom']:.2f}x: in views {zoom_info['views_at_risk']} the "
-                f"detected markers x (1 + zoom_margin) go beyond the window: the sample may be cut. "
-                "Lower vision.mast3r.zoom or use 'auto'.[/yellow]"
-            )
-        if zoom_info["upsampled"]:
-            print(
-                f"[yellow]Zoom {zoom_info['zoom']:.2f}x: the window is smaller than image_size "
-                f"({cfg.mast3r.image_size} px): MASt3R gets an upsampled image, no detail is gained.[/yellow]"
-            )
+    # The back-end may use the detections (e.g. MASt3R's input zoom) and save
+    # what it fed the network in the run folder.
+    backend_inputs.aruco_detections = detections_per_view
+    backend_inputs.work_dir = run_dir
 
-    _log_step("Step 3/6 - Running MASt3R-SfM")
-    _timer.begin("Step 3/6 - MASt3R-SfM backend")
-    raw = _run_mast3r_backend(cfg, backend_inputs)
-    raw.alignment_info = {**(raw.alignment_info or {}),
-                          "network_zoom": zoom_info or {"zoom": 1.0, "mode": "off"}}
+    model = model_tag(cfg)
+    _log_step(f"Step 3/6 - Running the reconstruction backend ({model})")
+    # the label keeps the word "backend": the validation reads its time from it
+    _timer.begin(f"Step 3/6 - Reconstruction backend ({model})")
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    raw = load_backend(cfg.backend)(cfg, backend_inputs)
+    # peak GPU memory of the back-end (torch allocations of this process)
+    backend_peak_vram_gb = (float(torch.cuda.max_memory_allocated()) / 1e9
+                            if torch.cuda.is_available() else None)
+    raw.alignment_info = {**(raw.alignment_info or {}), "backend_peak_vram_gb": backend_peak_vram_gb}
     print(
-        f"Backend produced [green]{raw.fused_points.shape[0]:,}[/green] fused points; "
+        f"Backend [green]{raw.backend_name}[/green]"
+        + (f" ({raw.variant})" if raw.variant else "")
+        + f" produced [green]{raw.fused_points.shape[0]:,}[/green] fused points; "
         f"frame = [green]{raw.frame_description}[/green]"
+        + (" (metric)" if raw.metric_frame else "")
     )
 
     aligned_cloud = raw.fused_points
@@ -599,19 +488,15 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
     aruco_geometric_qc: Dict[str, Any] | None = None
     view_rejection_meta: Dict[str, Any] | None = None
 
-    # The backend frame is metric only if the backend actually reconstructed
-    # with the robot poses (dense variant). The sfm variant estimates its own
-    # cameras at an arbitrary scale even when pose files are loaded, so there
-    # the ArUco edge length must set the scale.
-    poses_known = (
-        bool((raw.alignment_info or {}).get("gt_poses_used", False))
-        and backend_inputs.K_orig_gt is not None
-    )
+    # The backend frame is metric only if the backend says so (e.g. it
+    # reconstructed on the robot poses with the calibrated K). Otherwise its
+    # cameras are at an arbitrary scale, even when pose files are loaded, and
+    # the ArUco markers set the scale.
+    poses_known = bool(raw.metric_frame)
     if backend_inputs.T_world_cam_gt is not None and not poses_known:
         print(
-            f"[dim]Robot poses loaded but not used by the backend "
-            f"(pipeline_variant={cfg.mast3r.pipeline_variant}): the metric scale "
-            f"comes from the ArUco edge length ({cfg.aruco.marker_edge_length_mm:g} mm).[/dim]"
+            f"[dim]Robot poses loaded but the backend frame is not metric ({model}): "
+            f"the metric scale comes from the ArUco markers.[/dim]"
         )
 
     use_ba = bool(cfg.aruco.bundle_adjustment) and (num_detections > 0)
@@ -681,7 +566,7 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
             # places the ArUco plane at Z=0. Step (1) is the key invariant that
             # makes every detected ArUco corner reproject to the stable 3D corner.
             if ba is not None and ba.marker_corners_m:
-                voxel_size = float(cfg.mast3r.voxel_size)
+                voxel_size = float(raw.voxel_size)
                 (
                     refined_point_maps,
                     refused_points,
@@ -959,7 +844,7 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
             aruco_alignment=aruco_alignment,
             aligned_markers_in_output_frame=aligned_markers_in_output_frame,
             annotated_rgb_per_view=annotated_rgb_per_view,
-            confidence_percentile=cfg.mast3r.confidence_percentile,
+            confidence_percentile=raw.confidence_percentile,
             rerun_cfg=cfg.rerun,
         )
         # Waiting only makes sense with a live viewer and a real terminal: under
@@ -988,8 +873,9 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
     except OSError as exc:
         print(f"[yellow]Could not write vision timings.json: {exc}[/yellow]")
 
-    if cfg.output.clean_sfm_cache and clean_sfm_cache(cfg.output.root):
-        print("[dim]Removed intermediate .mast3r_sfm_cache/[/dim]")
+    if cfg.output.clean_sfm_cache:
+        for removed in clean_cache_dirs(raw.cache_dirs):
+            print(f"[dim]Removed intermediate {removed.name}/[/dim]")
 
     print(f"[green]Done in {time.time() - t0:.1f} s. Outputs: {run_dir}[/green]")
 
@@ -1009,6 +895,7 @@ def run_reconstruction(cfg: ReconstructionConfig) -> ReconstructionResult:
         ),
         metadata={
             "backend": raw.backend_name,
+            "model": model,
             "run_name": run_name,
             "duration_s": time.time() - t0,
             **({"view_rejection": view_rejection_meta} if view_rejection_meta is not None else {}),
@@ -1159,6 +1046,10 @@ def _write_outputs(
 
     metadata = {
         "backend": raw.backend_name,
+        "variant": raw.variant,
+        # <backend>[-<variant>]: also the name of the results folder
+        "model": model_tag(cfg),
+        "metric_frame": bool(raw.metric_frame),
         "frame_description": raw.frame_description,
         "num_images": int(raw.T_world_cam.shape[0]),
         "num_cloud_points": int(aligned_cloud.shape[0]),

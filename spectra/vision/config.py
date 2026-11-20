@@ -11,7 +11,11 @@ Typical usage::
     cfg = load_config("configs/default.yaml")
     cfg = cfg.with_overrides({"aruco.min_views_per_marker": 3})
 
-The pipeline is **MASt3R-SfM** only (images → dense cloud + ArUco 2D/3D). Optional
+The reconstruction model is chosen with ``backend`` (e.g. ``backend: mast3r``);
+each model has its OWN section (``mast3r:``, ...) with everything it needs
+(input size, zoom, thresholds, fusion). Switching model = changing ``backend``;
+the other sections stay in the YAML and are ignored. The rest of the pipeline
+(ArUco, alignment, surface, outputs) does not depend on the model. Optional
 ``pose_dir`` and ``camera_params_dir`` are supported when available.
 
 CLI overrides use dotted paths, e.g. ``--set aruco.min_views_per_marker=3``.
@@ -36,6 +40,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .aruco import ARUCO_DICTIONARIES
+from .backends.registry import BACKENDS, DEFAULT_BACKEND
 
 #: The ONLY file the ArUco marker edge length is read from
 #: (``vision.aruco.marker_edge_length_mm``): the repo's configs/default.yaml, or
@@ -138,8 +143,9 @@ class OutputConfig(BaseModel):
     clean_sfm_cache: bool = Field(
         default=True,
         description=(
-            "Delete the intermediate `.mast3r_sfm_cache/` folder under `root` "
-            "once the run finishes. It is large and never read again."
+            "Delete the back-end's intermediate cache folders (MASt3R-SfM: "
+            "`.mast3r_sfm_cache/` under `root`) once the run finishes. They are "
+            "large and never read again."
         ),
     )
 
@@ -357,6 +363,9 @@ class SurfaceConfig(BaseModel):
 
 
 class Mast3rConfig(BaseModel):
+    """``vision.mast3r``: everything the MASt3R back-end needs (read only by
+    ``backends/mast3r_backend.py``)."""
+
     model_config = ConfigDict(extra="forbid")
 
     model_name: str = Field(
@@ -455,6 +464,180 @@ class Mast3rConfig(BaseModel):
     confidence_percentile: float = Field(default=99.0, ge=0.0, le=100.0)
 
 
+class FeedForwardConfig(BaseModel):
+    """Fields shared by the sections of the feed-forward multi-view models
+    (vggt_omega, pi3, da3, mapanything): same input zoom as MASt3R, principal
+    point centring, fusion relative to the model's (arbitrary) scale."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    zoom: float | Literal["auto"] = Field(
+        default=1.0,
+        description=(
+            "Input zoom, as vision.mast3r.zoom: the model gets the central 1/zoom "
+            "of every image (same window for all, sized on the ArUco detections "
+            "with 'auto'), then its own resize. 1 = whole image."
+        ),
+    )
+    zoom_max: float = Field(default=2.5, ge=1.0)
+    zoom_margin: float = Field(default=0.9, ge=0.0)
+    center_principal_point: bool = Field(
+        default=True,
+        description=(
+            "Centre the input window on the calibrated principal point (when "
+            "camera_parameters/intrinsics.npy exists): these models' cameras "
+            "have it at the image centre. A few pixels of border are lost."
+        ),
+    )
+    voxel_size_rel: float = Field(
+        default=0.006, ge=0.0,
+        description=(
+            "Fusion voxel as a fraction of the median depth (the model's scale is "
+            "arbitrary): 0.006 ~ 1.2 mm at 200 mm. 0 = no voxel fusion."
+        ),
+    )
+    max_points: int = Field(default=2_000_000, ge=1)
+    confidence_percentile: float = Field(
+        default=99.0, ge=0.0, le=100.0, description="Rerun colour map of the confidence.")
+
+    @field_validator("zoom")
+    @classmethod
+    def _check_zoom(cls, value):
+        if value != "auto" and float(value) < 1.0:
+            raise ValueError(f"zoom must be >= 1 (1 = whole image) or 'auto', got {value!r}")
+        return value
+
+
+class VggtOmegaConfig(FeedForwardConfig):
+    """``vision.vggt_omega``: everything the VGGT-Omega back-end needs (read
+    only by ``backends/vggt_omega_backend.py``). Feed-forward on all the views
+    at once; no robot poses or intrinsics in input."""
+
+    variant: Literal["512", "416"] = Field(
+        default="512",
+        description=(
+            "Released checkpoint: '512' = vggt_omega_1b_512.pt (authors: for "
+            "in-the-wild use), '416' = vggt_omega_1b_416_reproduce.pt (authors: "
+            "the reference for benchmarks). Sets the input resolution too. It is "
+            "part of the results folder name (vggt_omega-512 / vggt_omega-416)."
+        ),
+    )
+    checkpoint: Optional[str] = Field(
+        default=None,
+        description=(
+            "null = the variant's checkpoint from the (gated) Hugging Face repo "
+            "facebook/VGGT-Omega, cached in HF_HOME. Or a local .pt path, or "
+            "'<hf user>/<hf repo>/<file>'."
+        ),
+    )
+    image_resolution: Optional[int] = Field(
+        default=None, ge=16,
+        description="Input resolution (multiple of 16); null = the variant's (512 / 416).",
+    )
+    resize_mode: Literal["balanced", "max_size"] = Field(
+        default="balanced",
+        description=(
+            "The model's resize: 'balanced' ~ image_resolution^2 pixels (e.g. "
+            "624x416 for 3:2 at 512); 'max_size' = long side image_resolution "
+            "(fewer pixels, less memory)."
+        ),
+    )
+    conf_percentile: float = Field(
+        default=20.0, ge=0.0, lt=100.0,
+        description="Points below this percentile of the depth confidence are dropped (authors' demo: 20).",
+    )
+    filter_depth_edges: bool = Field(
+        default=True, description="Drop points at depth discontinuities (flying points), as the authors' demo.",
+    )
+    depth_edge_rtol: float = Field(default=0.03, gt=0.0)
+    autocast: bool = Field(default=True, description="bf16/fp16 autocast of the backbone on CUDA (as released).")
+
+
+class Pi3Config(FeedForwardConfig):
+    """``vision.pi3``: Pi3 / Pi3X (read only by ``backends/pi3_backend.py``).
+    Pi3X can be conditioned on the calibrated intrinsics and the robot poses."""
+
+    variant: Literal["x", "base"] = Field(
+        default="x",
+        description="'x' = Pi3X (yyfz233/Pi3X, authors' recommendation), 'base' = original Pi3 (yyfz233/Pi3).",
+    )
+    conditioning: Literal["none", "k", "kpose"] = Field(
+        default="none",
+        description=(
+            "Pi3X only. 'k' = calibrated intrinsics in input, 'kpose' = + robot "
+            "camera poses. Part of the results folder name (pi3-x-kpose)."
+        ),
+    )
+    checkpoint: Optional[str] = Field(
+        default=None, description="null = the variant's Hugging Face repo; or a local folder / .safetensors.")
+    pixel_limit: int = Field(
+        default=255000, ge=14 * 14,
+        description="Input pixels (authors' loader: 255000, sides multiple of 14).")
+    conf_threshold: float = Field(
+        default=0.1, ge=0.0, lt=1.0,
+        description="Points with sigmoid(confidence) below it are dropped (authors' example: 0.1).")
+    filter_depth_edges: bool = Field(default=True, description="Drop flying points at depth edges.")
+    depth_edge_rtol: float = Field(default=0.03, gt=0.0)
+
+
+class Da3Config(FeedForwardConfig):
+    """``vision.da3``: Depth Anything 3 (read only by ``backends/da3_backend.py``).
+    It can be conditioned on the calibrated intrinsics + robot poses together."""
+
+    variant: Literal["nested-giant-large-1.1", "giant-1.1", "large-1.1"] = Field(
+        default="nested-giant-large-1.1",
+        description=(
+            "Checkpoint depth-anything/DA3<VARIANT> (CC BY-NC 4.0): 'nested-giant-"
+            "large-1.1' (any-view giant + metric depth, the authors' strongest), "
+            "'giant-1.1', 'large-1.1'."
+        ),
+    )
+    conditioning: Literal["none", "kpose"] = Field(
+        default="none",
+        description=(
+            "'kpose' = calibrated intrinsics + robot poses in input; the output is "
+            "then in the robot frame at the robot scale (authors' "
+            "align_to_input_ext_scale)."
+        ),
+    )
+    checkpoint: Optional[str] = Field(default=None, description="null = the variant's Hugging Face repo; or a local folder.")
+    process_res: int = Field(default=504, ge=14, description="Long side of the input (authors: 504); sides multiple of 14.")
+    ref_view_strategy: Literal["saddle_balanced", "saddle_sim_range", "first", "middle"] = Field(
+        default="saddle_balanced", description="Reference view selection (authors' default).")
+    use_ray_pose: bool = Field(default=False, description="Cameras from the ray head instead of the camera decoder.")
+    conf_percentile: float = Field(
+        default=40.0, ge=0.0, lt=100.0,
+        description="Points below this percentile of the confidence are dropped (authors' export: 40).")
+    filter_depth_edges: bool = Field(default=True, description="Drop flying points at depth edges.")
+    depth_edge_rtol: float = Field(default=0.03, gt=0.0)
+
+
+class MapAnythingConfig(FeedForwardConfig):
+    """``vision.mapanything``: MapAnything (read only by
+    ``backends/mapanything_backend.py``). It can be conditioned on the
+    calibrated intrinsics and the robot poses."""
+
+    variant: Literal["nc", "apache"] = Field(
+        default="nc",
+        description=(
+            "'nc' = facebook/map-anything (CC BY-NC 4.0), 'apache' = "
+            "facebook/map-anything-apache (Apache 2.0, trained on less data)."
+        ),
+    )
+    conditioning: Literal["none", "k", "kpose"] = Field(
+        default="none",
+        description="'k' = calibrated intrinsics in input, 'kpose' = + robot poses (metric).",
+    )
+    checkpoint: Optional[str] = Field(default=None, description="null = the variant's Hugging Face repo; or a local folder.")
+    resolution_set: Literal[518, 512, 504] = Field(
+        default=518, description="Authors' fixed resolutions per aspect ratio (518: 4:3 -> 518x392).")
+    mask_edges: bool = Field(default=True, description="Authors' edge mask (normals + depth).")
+    apply_confidence_mask: bool = Field(default=False, description="Authors' confidence mask (default off).")
+    conf_percentile: float = Field(
+        default=10.0, ge=0.0, lt=100.0, description="With apply_confidence_mask: percentile dropped (authors: 10).")
+    use_amp: bool = Field(default=True, description="bf16 inference (authors' recommendation).")
+
+
 class RerunConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -544,8 +727,34 @@ class ReconstructionConfig(BaseModel):
     output: OutputConfig = Field(default_factory=OutputConfig)
     aruco: ArucoConfig = Field(default_factory=ArucoConfig)
     surface: SurfaceConfig = Field(default_factory=SurfaceConfig)
+    #: Reconstruction model (backends/registry.py). Its section below holds all
+    #: its parameters; the sections of the other models are ignored.
+    backend: str = Field(
+        default=DEFAULT_BACKEND,
+        description=f"Reconstruction model: one of {sorted(BACKENDS)}.",
+    )
+    # One section per model (a new back-end adds its own here).
     mast3r: Mast3rConfig = Field(default_factory=Mast3rConfig)
+    vggt_omega: VggtOmegaConfig = Field(default_factory=VggtOmegaConfig)
+    pi3: Pi3Config = Field(default_factory=Pi3Config)
+    da3: Da3Config = Field(default_factory=Da3Config)
+    mapanything: MapAnythingConfig = Field(default_factory=MapAnythingConfig)
     rerun: RerunConfig = Field(default_factory=RerunConfig)
+
+    @field_validator("backend")
+    @classmethod
+    def _check_backend(cls, value: str) -> str:
+        key = str(value or DEFAULT_BACKEND).strip().lower()
+        if key not in BACKENDS:
+            raise ValueError(f"backend {value!r} unknown; available: {sorted(BACKENDS)}")
+        return key
+
+    @model_validator(mode="after")
+    def _check_backend_section(self) -> "ReconstructionConfig":
+        if not isinstance(getattr(self, self.backend, None), BaseModel):
+            raise ValueError(f"backend {self.backend!r} has no `{self.backend}:` section "
+                             "in ReconstructionConfig (vision/config.py)")
+        return self
 
     @model_validator(mode="after")
     def _resolve_paths(self) -> "ReconstructionConfig":
@@ -636,6 +845,11 @@ __all__ = [
     "ArucoConfig",
     "InputConfig",
     "Mast3rConfig",
+    "VggtOmegaConfig",
+    "Pi3Config",
+    "Da3Config",
+    "MapAnythingConfig",
+    "FeedForwardConfig",
     "OutputConfig",
     "ReconstructionConfig",
     "RerunConfig",

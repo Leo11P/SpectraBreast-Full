@@ -2,7 +2,7 @@
 
 This module exposes three top-level dataclasses:
 
-- :class:`VisionConfig`        — MASt3R-SfM + ArUco 3D reconstruction (legacy
+- :class:`VisionConfig`        — 3D reconstruction (``vision.backend``) + ArUco (legacy
                                  ``ReconstructionConfig``, kept as an alias for
                                  backward compatibility).
 - :class:`RegistrationConfig`  — HSI→mesh registration + spectral point cloud.
@@ -202,10 +202,11 @@ class RegistrationBatch(BaseModel):
     Batch discovery scans ``data_root/input_registration/`` for every
     ``<sample>/<sample>_raw.hdr`` — the same stage-first layout used by
     ``single`` / ``roi`` / ``sweep``. Mesh and ArUco JSON come from that
-    sample's vision run under ``results_root/<dd-mm-yyyy>/<sample>/vision/``.
+    sample's vision run under ``results_root/<dd-mm-yyyy>/<sample>/<model>/vision/``
+    (model = ``vision.backend`` + variant, e.g. ``mast3r-sfm``).
     Per-sample output goes to
-    ``results_root/<dd-mm-yyyy>/<sample>/registration/``; the aggregate Excel
-    goes to ``results_root/<dd-mm-yyyy>/_batch/batch_summary.xlsx``.
+    ``results_root/<dd-mm-yyyy>/<sample>/<model>/registration/``; the aggregate
+    Excel goes to ``results_root/<dd-mm-yyyy>/_batch/<model>/batch_summary.xlsx``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -520,7 +521,7 @@ class MufasaConfig(BaseModel):
     #: The download runs in a process detached from the terminal: closing it
     #: does not stop it (needs ssh_key_path). false: downloaded by this terminal.
     detach_pull: bool = True
-    #: Downloaded after the job, relative to RESULTS/<date>/<sample>/ on Mufasa
+    #: Downloaded after the job, relative to RESULTS/<date>/<sample>/<model>/ on Mufasa
     #: ("dir/glob"); everything else stays on Mufasa. validation/timing/* always.
     pull_patterns: List[str] = Field(default_factory=lambda: [
         "registration/*.xlsx", "registration/*.rrd", "registration/*.rbl",
@@ -556,7 +557,7 @@ class UnifiedConfig(BaseModel):
     data_root: Path = Path("DATA")
     results_root: Path = Path("RESULTS")
     #: Run-date folder inserted between ``results_root`` and ``sample_name``:
-    #: ``RESULTS/<dd-mm-yyyy>/<sample>/{vision,registration}``. ``None`` means
+    #: ``RESULTS/<dd-mm-yyyy>/<sample>/<model>/{vision,registration}``. ``None`` means
     #: today. Pin an older date to re-run registration against that day's
     #: vision outputs.
     results_date: Optional[str] = None

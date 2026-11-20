@@ -4,7 +4,7 @@ acquisition to the download of the results.
 
 Standard library only (+ openpyxl for the Excel), so the standalone scripts
 of spectra/acquisition/ load it by path. Two files per sample, in
-RESULTS/<dd-mm-yyyy>/<sample>/validation/timing/:
+RESULTS/<dd-mm-yyyy>/<sample>/<model>/validation/timing/:
 
     timing_local.json   written on THIS PC: acquisition, upload to Mufasa,
                         SLURM queue and job, download
@@ -32,8 +32,10 @@ JOB = "timing_job.json"
 XLSX = "timing.xlsx"
 
 
-def timing_dir(results_root, date: str, sample: str) -> Path:
-    return Path(results_root) / date / sample / "validation" / "timing"
+def timing_dir(results_root, date: str, sample: str, model: str) -> Path:
+    """``<results_root>/<date>/<sample>/<model>/validation/timing`` (``model``:
+    the reconstruction model, ``<backend>[-<variant>]``, see orchestrator)."""
+    return Path(results_root) / date / sample / model / "validation" / "timing"
 
 
 def _read(path: Path) -> dict:

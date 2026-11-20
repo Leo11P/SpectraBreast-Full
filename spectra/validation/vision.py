@@ -88,6 +88,9 @@ def _read_vision_run(vision_dir: Path) -> dict:
         for p in t.get("phases", []):
             if "backend" in p.get("label", "").lower():
                 timings["backend_s"] = p.get("seconds")
+    vram = (meta.get("alignment_info") or {}).get("backend_peak_vram_gb")
+    if vram is not None:
+        timings["backend_peak_vram_gb"] = vram
     return {"meta": meta, "frame": frame, "corners": corners,
             "edge_mm": float(aruco.get("edge_length_m", float("nan"))) * 1000.0,
             "used_ids": [int(i) for i in aruco.get("used_marker_ids", corners)],
@@ -362,14 +365,17 @@ def validate_vision(cfg, vision_dir: Path, out_dir: Path) -> Dict[str, Any]:
     scale_from = al_meta.get("scale_from", "markers")
     nz = (meta.get("alignment_info") or {}).get("network_zoom") or {}
     zoomed = float(nz.get("zoom") or 1.0) > 1.0
+    # meta["model"] = <backend>[-<variant>] (runs before it: backend + sfm variant)
     model = vcfg.model_label or "-".join(str(x) for x in (
-        meta.get("backend"), (meta.get("alignment_info") or {}).get("pipeline_variant"),
+        meta.get("model") or "-".join(str(x) for x in (
+            meta.get("backend"), (meta.get("alignment_info") or {}).get("pipeline_variant")) if x),
         "centers" if scale_from == "centers" else None,
         None if not zoomed else "zoomauto" if nz.get("mode") == "auto"
         else f"zoom{float(nz.get('zoom_config') or nz['zoom']):g}") if x)
     result = {
         "sample": sample, **case, "model": model,
-        "date": Path(out_dir).parents[2].name if len(Path(out_dir).parents) > 2 else None,
+        # out_dir = RESULTS/<date>/<sample>/<model>/validation/vision
+        "date": Path(out_dir).parents[3].name if len(Path(out_dir).parents) > 3 else None,
         "vision_dir": str(vision_dir), "units": "mm",
         "primary_alignment": primary,
         "roi_box_cad_mm": box, "sample_spacing_mm": s, "source": opt.source,

@@ -14,15 +14,16 @@ satisfies ALL of:
 5. If ``cfg.batch.sample_regex`` is set, ``<sample>`` matches it.
 
 …the batch runs the per-sample registration pipeline. The vision run is the
-one for ``results_date`` (today by default), falling back to the most recent
-dated run that has both handoff files.
+one of the configured reconstruction model (``vision.backend``) for
+``results_date`` (today by default), falling back to the most recent dated
+run of that model that has both handoff files.
 
 This is the same stage-first layout used by ``single`` / ``roi`` / ``sweep``,
 so one dataset feeds every mode.
 
-Outputs go to ``<results_root>/<dd-mm-yyyy>/<sample>/registration/``. After
-every sample an aggregate Excel is written to
-``<results_root>/<dd-mm-yyyy>/_batch/batch_summary.xlsx``.
+Outputs go to ``<results_root>/<dd-mm-yyyy>/<sample>/<model>/registration/``.
+After every sample an aggregate Excel is written to
+``<results_root>/<dd-mm-yyyy>/_batch/<model>/batch_summary.xlsx``.
 
 The structure of the Excel (columns, conditional formatting) is identical to
 the legacy ``SpectraBreast-Registration/batch.py`` so existing analysis
@@ -84,6 +85,8 @@ def discover_samples(
     results_date: Optional[str] = None,
     marker_edge_length_mm: Optional[float] = None,
     surface_name: str = "surface_mesh.ply",
+    *,
+    model: str,
 ) -> list[dict]:
     """Return one dict per ready-to-run sample under ``data_root``.
 
@@ -93,12 +96,14 @@ def discover_samples(
         DATA/input_registration/<sample>/<sample>_raw.hdr
         DATA/input_registration/<sample>/<sample>_raw.png   # ROI only
 
-    Mesh and ArUco JSON come from the vision run for ``results_date`` (today
-    by default), falling back to the most recent dated run that has them, so
-    a batch launched the day after a set of vision runs still finds them.
+    Mesh and ArUco JSON come from the vision run of ``model`` (the
+    reconstruction model, ``<backend>[-<variant>]``) for ``results_date``
+    (today by default), falling back to the most recent dated run of that
+    model that has them, so a batch launched the day after a set of vision
+    runs still finds them.
     With ``marker_edge_length_mm``, a sample whose vision run was built with a
     different marker edge length is skipped (see ``check_marker_edge``).
-    Outputs go to ``<results_root>/<results_date>/<sample>/registration/``.
+    Outputs go to ``<results_root>/<results_date>/<sample>/<model>/registration/``.
     """
     from ..orchestrator import check_marker_edge, find_vision_dir, registration_output_dir
 
@@ -124,7 +129,7 @@ def discover_samples(
 
         hdr = entry / f"{sample}_raw.hdr"
         png = entry / f"{sample}_raw.png"
-        vision_dir, is_fallback = find_vision_dir(results_root, sample, results_date)
+        vision_dir, is_fallback = find_vision_dir(results_root, sample, results_date, model=model)
         if is_fallback:
             print(f"[batch] WARNING {sample}: no vision run for this date, using {vision_dir}")
         mesh = vision_dir / surface_name
@@ -155,7 +160,8 @@ def discover_samples(
             "mesh_path":         str(mesh),
             "aruco_path":        str(aruco),
             "liveview_png_path": str(png) if roi_mode else None,
-            "output_dir":        str(registration_output_dir(results_root, sample, results_date)),
+            "output_dir":        str(registration_output_dir(results_root, sample, results_date,
+                                                         model=model)),
         })
 
     print(f"\n[batch] Scanned: {data_root}")
@@ -521,12 +527,16 @@ def run_batch(
     results_root: Path,
     results_date: Optional[str] = None,
     render_fn=None,
+    *,
+    model: str,
 ) -> str:
-    """Discover every ready sample under ``data_root`` and run them all.
+    """Discover every ready sample under ``data_root`` and run them all, on the
+    vision runs of ``model``.
 
     Per-sample outputs go to
-    ``<results_root>/<results_date>/<sample>/registration/``; the aggregate
-    Excel goes to ``<results_root>/<results_date>/_batch/batch_summary.xlsx``.
+    ``<results_root>/<results_date>/<sample>/<model>/registration/``; the
+    aggregate Excel goes to
+    ``<results_root>/<results_date>/_batch/<model>/batch_summary.xlsx``.
     ``results_date`` defaults to today.
     """
     from ..orchestrator import batch_summary_dir, registration_surface_name, today_folder
@@ -539,6 +549,7 @@ def run_batch(
     print(f"  data_root    : {data_root}")
     print(f"  results_root : {results_root}")
     print(f"  run date     : {results_date}")
+    print(f"  model        : {model}")
     print(f"  ROI mode     : {'YES' if roi_mode else 'NO'}")
 
     pairs = discover_samples(
@@ -549,6 +560,7 @@ def run_batch(
         results_date=results_date,
         marker_edge_length_mm=cfg.detection.marker_edge_length_mm,
         surface_name=registration_surface_name(cfg.source),
+        model=model,
     )
     if not pairs:
         print("\n[batch] No ready samples found. Exiting.")
@@ -582,7 +594,7 @@ def run_batch(
             )
         rows.append(row)
 
-    out_path = str(batch_summary_dir(results_root, results_date) / "batch_summary.xlsx")
+    out_path = str(batch_summary_dir(results_root, results_date, model=model) / "batch_summary.xlsx")
     _write_batch_summary_xlsx(rows, out_path)
 
     n_ok = sum(1 for r in rows if r["status"] == "ok")

@@ -193,18 +193,23 @@ def prepare_run_dir(
     return run_dir, run_dir.name
 
 
-def clean_sfm_cache(root: Path) -> bool:
-    """Delete ``<root>/.mast3r_sfm_cache`` if present. True if something went.
+def clean_cache_dirs(cache_dirs) -> list[Path]:
+    """Delete the back-end's intermediate folders (``RawReconstruction.cache_dirs``,
+    e.g. MASt3R-SfM's ``.mast3r_sfm_cache``). Returns the ones removed.
 
-    The MASt3R-SfM cache is large intermediate state that is never read after
-    a run completes. Removing it here means local runs behave like the SLURM
-    job, which cleaned it in the wrapper script.
+    They are large intermediate state never read after a run completes.
+    Removing them here means local runs behave like the SLURM job, which
+    cleaned them in the wrapper script.
     """
-    cache_dir = Path(root) / ".mast3r_sfm_cache"
-    if not cache_dir.is_dir():
-        return False
-    shutil.rmtree(cache_dir, ignore_errors=True)
-    return not cache_dir.exists()
+    removed = []
+    for cache_dir in cache_dirs or []:
+        cache_dir = Path(cache_dir)
+        if not cache_dir.is_dir():
+            continue
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        if not cache_dir.exists():
+            removed.append(cache_dir)
+    return removed
 
 
 def update_most_recent_symlink(root: Path, run_dir: Path) -> Path:
@@ -223,7 +228,7 @@ def update_most_recent_symlink(root: Path, run_dir: Path) -> Path:
 
 
 __all__ = [
-    "clean_sfm_cache",
+    "clean_cache_dirs",
     "prepare_run_dir",
     "save_mesh_as_ply",
     "save_pointcloud_as_ply",

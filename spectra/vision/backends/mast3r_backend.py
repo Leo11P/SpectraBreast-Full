@@ -1,88 +1,37 @@
-"""MASt3R back-end: pair inference, pose refinement, dense fusion.
+"""MASt3R back-end (``vision.backend: mast3r``): pair inference, pose
+refinement, dense fusion.
 
-Lifted from ``mast3r_pipeline.py::main`` and restructured as a pure function
-returning a `RawReconstruction` that the orchestrator can align and feed to
-`spectra.surface.reconstruct_surface`.
+Two variants (``vision.mast3r.pipeline_variant``): ``sfm`` (MASt3R-SfM, its
+own cameras at an arbitrary scale) and ``dense`` (DUSt3R modular global
+alignment on the robot poses + calibrated K: metric frame). Everything it needs
+(input size, zoom, thresholds, fusion) is read from ``vision.mast3r``; it
+returns a `RawReconstruction` (see ``types.py`` for the contract).
 """
 
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
-import cv2
 import numpy as np
 import torch
 from PIL import Image
 from PIL.ImageOps import exif_transpose
 
 from ..config import Mast3rConfig, ReconstructionConfig
+from .common import (
+    ImageGeometry,
+    colors_on_network_grid,
+    fuse_points,
+    network_zoom,
+    pad_view_maps_for_stacking,
+    report_network_zoom,
+    write_network_crops,
+)
 from .types import BackendInputs, RawReconstruction
 
-
-@dataclass(frozen=True)
-class ImageGeometry:
-    original_height: int
-    original_width: int
-    resized_height: int
-    resized_width: int
-    network_height: int
-    network_width: int
-    scale_x: float
-    scale_y: float
-    crop_left: float
-    crop_top: float
-
-    def original_to_network_intrinsics(self, K_orig: np.ndarray) -> np.ndarray:
-        A = np.array(
-            [
-                [self.scale_x, 0.0, -self.crop_left],
-                [0.0, self.scale_y, -self.crop_top],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float32,
-        )
-        return A @ K_orig.astype(np.float32)
-
-    def network_to_original_intrinsics(self, K_net: np.ndarray) -> np.ndarray:
-        """Invert `original_to_network_intrinsics`: pulls K back into original pixel coords."""
-        A_inv = np.array(
-            [
-                [1.0 / self.scale_x, 0.0, self.crop_left / self.scale_x],
-                [0.0, 1.0 / self.scale_y, self.crop_top / self.scale_y],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float32,
-        )
-        return A_inv @ K_net.astype(np.float32)
-
-    def network_to_original(self, uv_net: np.ndarray) -> np.ndarray:
-        uv_orig = uv_net.astype(np.float32).copy()
-        uv_orig[:, 0] = (uv_orig[:, 0] + self.crop_left) / self.scale_x
-        uv_orig[:, 1] = (uv_orig[:, 1] + self.crop_top) / self.scale_y
-        return uv_orig
-
-    def network_grid_to_original(self) -> tuple[np.ndarray, np.ndarray]:
-        uu, vv = np.meshgrid(
-            np.arange(self.network_width, dtype=np.float32),
-            np.arange(self.network_height, dtype=np.float32),
-        )
-        uu = (uu + self.crop_left) / self.scale_x
-        vv = (vv + self.crop_top) / self.scale_y
-        return uu, vv
-
-    def warp_network_map_to_original(self, map_net: np.ndarray) -> np.ndarray:
-        canvas = np.zeros((self.resized_height, self.resized_width), dtype=np.float32)
-        left = int(round(self.crop_left))
-        top = int(round(self.crop_top))
-        canvas[top : top + self.network_height, left : left + self.network_width] = map_net.astype(np.float32)
-        return cv2.resize(
-            canvas,
-            (self.original_width, self.original_height),
-            interpolation=cv2.INTER_LINEAR,
-        )
+ZOOM_DIR = "inputs_mast3r_zoom"
 
 
 def _compute_image_geometry(image: torch.Tensor, image_size: int, patch_size: int, square_ok: bool = False,
@@ -129,36 +78,6 @@ def _compute_image_geometry(image: torch.Tensor, image_size: int, patch_size: in
         crop_left=crop_left,
         crop_top=crop_top,
     )
-
-
-def _weighted_voxel_downsample(
-    points: np.ndarray,
-    colors: np.ndarray,
-    confidence: np.ndarray,
-    voxel_size: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if len(points) == 0 or voxel_size <= 0:
-        return points, colors, confidence
-
-    keys = np.floor(points / voxel_size).astype(np.int64)
-    uniq, inv = np.unique(keys, axis=0, return_inverse=True)
-    counts = np.bincount(inv, minlength=len(uniq))
-    weights = np.clip(confidence.astype(np.float64), 1e-6, None)
-    weight_sum = np.bincount(inv, weights=weights, minlength=len(uniq))
-
-    out_pts = np.zeros((len(uniq), 3), dtype=np.float64)
-    out_cols = np.zeros((len(uniq), 3), dtype=np.float64)
-    out_conf = np.bincount(inv, weights=confidence.astype(np.float64), minlength=len(uniq)) / np.maximum(counts, 1)
-
-    for d in range(3):
-        out_pts[:, d] = np.bincount(inv, weights=weights * points[:, d], minlength=len(uniq)) / np.maximum(
-            weight_sum, 1e-12
-        )
-        out_cols[:, d] = np.bincount(inv, weights=weights * colors[:, d], minlength=len(uniq)) / np.maximum(
-            weight_sum, 1e-12
-        )
-
-    return out_pts.astype(np.float32), np.clip(out_cols, 0, 255).astype(np.uint8), out_conf.astype(np.float32)
 
 
 def _pairs_share_same_network_shape(pairs) -> bool:
@@ -543,35 +462,26 @@ def _read_image_rgb_with_exif(path: Path) -> torch.Tensor:
     return torch.from_numpy(np.transpose(arr, (2, 0, 1)))  # [3, H, W]
 
 
-def _pad_view_maps_for_stacking(
-    point_map_world: List[np.ndarray],
-    valid_masks: List[np.ndarray],
-    images_network_uint8: List[np.ndarray],
-    confidence_maps_network: List[np.ndarray],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Pad per-view maps to a common [V, Hmax, Wmax, ...] shape.
+def _network_inputs(mcfg: Mast3rConfig, inputs: BackendInputs):
+    """(files MASt3R reads, zoom window (x0, y0, w, h) or None, zoom info).
 
-    Mixed portrait/landscape inputs can produce heterogeneous network shapes.
-    We pad each view to the global max shape and keep padded regions invalid.
-    """
-    max_h = max(int(mask.shape[0]) for mask in valid_masks)
-    max_w = max(int(mask.shape[1]) for mask in valid_masks)
-
-    point_map_world_np = np.full((len(point_map_world), max_h, max_w, 3), np.nan, dtype=np.float32)
-    valid_masks_np = np.zeros((len(valid_masks), max_h, max_w), dtype=bool)
-    images_net_np = np.zeros((len(images_network_uint8), max_h, max_w, 3), dtype=np.uint8)
-    conf_maps_np = np.zeros((len(confidence_maps_network), max_h, max_w), dtype=np.float32)
-
-    for idx, (pts, mask, rgb, conf) in enumerate(
-        zip(point_map_world, valid_masks, images_network_uint8, confidence_maps_network)
-    ):
-        h, w = int(mask.shape[0]), int(mask.shape[1])
-        point_map_world_np[idx, :h, :w, :] = pts.astype(np.float32, copy=False)
-        valid_masks_np[idx, :h, :w] = mask.astype(bool, copy=False)
-        images_net_np[idx, :h, :w, :] = rgb.astype(np.uint8, copy=False)
-        conf_maps_np[idx, :h, :w] = conf.astype(np.float32, copy=False)
-
-    return point_map_world_np, valid_masks_np, images_net_np, conf_maps_np
+    vision.mast3r.zoom > 1 or 'auto': the same central window of every image,
+    sized on the ArUco detections, saved to <run>/inputs_mast3r_zoom/ and read
+    instead of the whole images. Off (whole image) with zoom 1."""
+    zoom_info = network_zoom(
+        mcfg.zoom, mcfg.zoom_max, mcfg.zoom_margin, mcfg.image_size,
+        inputs.aruco_detections, inputs.image_paths, config_key="vision.mast3r.zoom",
+    )
+    if zoom_info is None:
+        return [str(p) for p in inputs.image_paths], None, {"zoom": 1.0, "mode": "off"}
+    if inputs.work_dir is None:
+        raise RuntimeError("vision.mast3r.zoom needs BackendInputs.work_dir (the run folder).")
+    crop = tuple(int(c) for c in zoom_info["crop_px"])
+    out_dir = Path(inputs.work_dir) / ZOOM_DIR
+    paths = write_network_crops(inputs.image_paths, crop, out_dir)
+    report_network_zoom(zoom_info, mcfg.image_size, ZOOM_DIR,
+                        config_key="vision.mast3r.zoom", model="MASt3R")
+    return [str(p) for p in paths], crop, zoom_info
 
 
 def _resolve_scene_graph(scene_graph: str, num_views: int) -> str:
@@ -601,7 +511,7 @@ def _run_mast3r_sfm(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReco
     mcfg: Mast3rConfig = cfg.mast3r
     # MASt3R reads the zoom crops when vision.mast3r.zoom is on; colours and
     # geometry refer to the whole images.
-    filelist = [str(path) for path in (inputs.network_image_paths or image_paths)]
+    filelist, crop, zoom_info = _network_inputs(mcfg, inputs)
     orig_images = [_read_image_rgb_with_exif(path) for path in image_paths]  # [3, H, W] uint8
 
     model = AsymmetricMASt3R.from_pretrained(mcfg.model_name).to(device)
@@ -610,7 +520,7 @@ def _run_mast3r_sfm(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReco
     imgs_mast3r = load_images(filelist, size=mcfg.image_size, verbose=True, patch_size=patch_size)
     geometries = [
         _compute_image_geometry(image, image_size=mcfg.image_size, patch_size=patch_size, square_ok=False,
-                                crop=inputs.network_crop)
+                                crop=crop)
         for image in orig_images
     ]
 
@@ -692,10 +602,7 @@ def _run_mast3r_sfm(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReco
         pts3d = pts3d_t.detach().cpu().numpy().astype(np.float32).reshape(Hn, Wn, 3)
 
         rgb_orig = image.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
-        uu_orig, vv_orig = geom.network_grid_to_original()
-        u_idx = np.clip(np.round(uu_orig).astype(np.int32), 0, geom.original_width - 1)
-        v_idx = np.clip(np.round(vv_orig).astype(np.int32), 0, geom.original_height - 1)
-        cols_full = rgb_orig[v_idx, u_idx].astype(np.uint8)
+        cols_full = colors_on_network_grid(geom, rgb_orig)
 
         valid = (conf_map >= float(mcfg.sfm_min_conf_thr)) & np.isfinite(pts3d).all(axis=-1)
         if not np.any(valid):
@@ -712,21 +619,11 @@ def _run_mast3r_sfm(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReco
     if not any(len(p) > 0 for p in all_pts_list):
         raise RuntimeError("MASt3R-SfM dense extraction produced no valid points.")
 
-    fused_points = np.concatenate(all_pts_list, axis=0)
-    fused_colors = np.concatenate(all_cols_list, axis=0)
-    fused_confidence = np.concatenate(all_conf_list, axis=0)
+    fused_points, fused_colors, fused_confidence = fuse_points(
+        all_pts_list, all_cols_list, all_conf_list, mcfg.voxel_size, mcfg.max_points
+    )
 
-    if mcfg.voxel_size > 0.0:
-        fused_points, fused_colors, fused_confidence = _weighted_voxel_downsample(
-            fused_points, fused_colors, fused_confidence, mcfg.voxel_size
-        )
-    if len(fused_points) > mcfg.max_points:
-        keep = np.argsort(fused_confidence)[-mcfg.max_points:][::-1]
-        fused_points = fused_points[keep]
-        fused_colors = fused_colors[keep]
-        fused_confidence = fused_confidence[keep]
-
-    point_map_world_np, valid_masks_np, images_net_np, conf_maps_np = _pad_view_maps_for_stacking(
+    point_map_world_np, valid_masks_np, images_net_np, conf_maps_np = pad_view_maps_for_stacking(
         point_map_world=point_map_world,
         valid_masks=valid_masks,
         images_network_uint8=images_network_uint8,
@@ -759,12 +656,18 @@ def _run_mast3r_sfm(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReco
         confidence_maps_network=conf_maps_np,
         frame_description="sfm",
         backend_name="mast3r",
+        variant="sfm",
+        # sparse_global_alignment estimates its own cameras at an arbitrary
+        # scale: robot poses, if loaded, are NOT used here.
+        metric_frame=False,
+        voxel_size=float(mcfg.voxel_size),
+        confidence_percentile=float(mcfg.confidence_percentile),
+        cache_dirs=[cache_dir],
         alignment_info={
             "pipeline_variant": "sfm",
             "scene_graph": scene_graph,
-            # sparse_global_alignment estimates its own cameras at an arbitrary
-            # scale: robot poses, if loaded, are NOT used here.
             "gt_poses_used": False,
+            "network_zoom": zoom_info,
         },
         extra={
             "pipeline_variant": "sfm",
@@ -810,11 +713,11 @@ def run_mast3r(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReconstru
 
     # MASt3R reads the zoom crops when vision.mast3r.zoom is on; colours and
     # geometry refer to the whole images.
-    filelist = [str(path) for path in (inputs.network_image_paths or image_paths)]
+    filelist, crop, zoom_info = _network_inputs(mcfg, inputs)
     imgs_mast3r = load_images(filelist, size=mcfg.image_size, verbose=True, patch_size=patch_size)
     geometries = [
         _compute_image_geometry(image, image_size=mcfg.image_size, patch_size=patch_size, square_ok=False,
-                                crop=inputs.network_crop)
+                                crop=crop)
         for image in orig_images
     ]
     K_network = (
@@ -932,10 +835,7 @@ def run_mast3r(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReconstru
         zip(pts3d_list, conf_list, mask_list, geometries, orig_images)
     ):
         rgb_orig = image.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
-        uu_orig, vv_orig = geom.network_grid_to_original()
-        u_idx = np.clip(np.round(uu_orig).astype(np.int32), 0, geom.original_width - 1)
-        v_idx = np.clip(np.round(vv_orig).astype(np.int32), 0, geom.original_height - 1)
-        cols_full = rgb_orig[v_idx, u_idx].astype(np.uint8)
+        cols_full = colors_on_network_grid(geom, rgb_orig)
 
         valid = mask & np.isfinite(pts3d).all(axis=-1)
         if not np.any(valid):
@@ -955,22 +855,11 @@ def run_mast3r(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReconstru
     if not any(len(p) > 0 for p in all_pts_list):
         raise RuntimeError("MASt3R fusion produced no valid points.")
 
-    fused_points = np.concatenate(all_pts_list, axis=0)
-    fused_colors = np.concatenate(all_cols_list, axis=0)
-    fused_confidence = np.concatenate(all_conf_list, axis=0)
+    fused_points, fused_colors, fused_confidence = fuse_points(
+        all_pts_list, all_cols_list, all_conf_list, mcfg.voxel_size, mcfg.max_points
+    )
 
-    if mcfg.voxel_size > 0.0:
-        fused_points, fused_colors, fused_confidence = _weighted_voxel_downsample(
-            fused_points, fused_colors, fused_confidence, mcfg.voxel_size
-        )
-
-    if len(fused_points) > mcfg.max_points:
-        keep = np.argsort(fused_confidence)[-mcfg.max_points:][::-1]
-        fused_points = fused_points[keep]
-        fused_colors = fused_colors[keep]
-        fused_confidence = fused_confidence[keep]
-
-    point_map_world_np, valid_masks_np, images_net_np, conf_maps_np = _pad_view_maps_for_stacking(
+    point_map_world_np, valid_masks_np, images_net_np, conf_maps_np = pad_view_maps_for_stacking(
         point_map_world=point_map_world,
         valid_masks=valid_masks,
         images_network_uint8=images_network_uint8,
@@ -1008,7 +897,17 @@ def run_mast3r(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReconstru
         confidence_maps_network=conf_maps_np,
         frame_description=("gt-aligned" if have_gt_poses else "mst"),
         backend_name="mast3r",
-        alignment_info={"pose_refinement": pose_stats, "gt_poses_used": bool(have_gt_poses)},
+        variant="dense",
+        # metric only when reconstructed on the robot poses WITH the calibrated K
+        metric_frame=bool(have_gt_poses and have_gt_intrinsics),
+        voxel_size=float(mcfg.voxel_size),
+        confidence_percentile=float(mcfg.confidence_percentile),
+        alignment_info={
+            "pipeline_variant": "dense",
+            "pose_refinement": pose_stats,
+            "gt_poses_used": bool(have_gt_poses),
+            "network_zoom": zoom_info,
+        },
         extra={
             "have_gt_poses": bool(have_gt_poses),
             "have_gt_intrinsics": bool(have_gt_intrinsics),
@@ -1021,4 +920,7 @@ def run_mast3r(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReconstru
     )
 
 
-__all__ = ["ImageGeometry", "run_mast3r"]
+#: entry point used by the registry (backends/registry.py)
+run = run_mast3r
+
+__all__ = ["ImageGeometry", "run", "run_mast3r"]

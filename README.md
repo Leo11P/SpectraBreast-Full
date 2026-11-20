@@ -48,6 +48,23 @@ reconstruction against 3D-printed phantoms.
 Dependency management is `uv`. Install it first if needed:
 <https://docs.astral.sh/uv/#installation>.
 
+The 3D reconstruction model is chosen with `vision.backend` (`mast3r`,
+`vggt_omega`, `pi3`, `da3`, `mapanything`). Each model runs in **its own virtual environment** with the
+`processing` extra plus the model's extra (`pyproject.toml`):
+
+| `vision.backend` | Environment | uv extras | Model code |
+| --- | --- | --- | --- |
+| `mast3r` | `.venv` | `processing`, `mast3r` | clone in `mast3r/` (§1.2) |
+| `vggt_omega` | `.venv-vggt_omega` | `processing`, `vggt-omega` | installed by the extra (git, pinned commit) |
+| `pi3` | `.venv-pi3` | `processing`, `pi3` | idem |
+| `da3` | `.venv-da3` | `processing`, `da3` | idem (Python 3.10-3.12) |
+| `mapanything` | `.venv-mapanything` | `processing`, `mapanything` | idem |
+
+On Mufasa `bash Setup_env.sh <model>` builds it (§2.2) and every job runs in the
+environment of the model in its config. Locally, select it with
+`UV_PROJECT_ENVIRONMENT`, e.g.
+`UV_PROJECT_ENVIRONMENT=.venv-vggt_omega uv sync --extra processing --extra vggt-omega`.
+
 MASt3R and ASMK are **not** pip dependencies — they are cloned *inside* the repo
 at fixed paths. `spectra/vision/backends/mast3r_backend.py` appends
 `<repo_root>/mast3r` to `sys.path` at runtime, so the location is not
@@ -87,14 +104,28 @@ Both `mast3r/` and `asmk/` are in `.gitignore` and are never committed.
 ### 1.3 Create the environment
 
 ```bash
-uv sync --extra processing                         # core + vision/registration deps + torch (cu130 index)
+uv sync --extra processing --extra mast3r          # core + vision/registration deps + torch (cu130 index) + MASt3R's packages
 uv run pip install -r mast3r/requirements.txt
 uv run pip install -r mast3r/dust3r/requirements.txt
 ```
 
 The `processing` extra (torch, open3d, trimesh, ...) is what vision and
-registration need; the core alone is the light robot-PC install (§1.7). A plain
-`uv sync` removes the extra again: always pass `--extra processing` here.
+registration need whatever the model; the core alone is the light robot-PC
+install (§1.7). A plain `uv sync` removes the extras again: always pass them.
+
+VGGT-Omega (`vision.backend: vggt_omega`), in its own environment:
+
+```bash
+UV_PROJECT_ENVIRONMENT=.venv-vggt_omega uv sync --extra processing --extra vggt-omega
+```
+
+The other models the same way (`--extra pi3`, `--extra da3`, `--extra mapanything`,
+each in its `.venv-<model>`). Some of their pins would break this environment;
+`pyproject.toml` (`[tool.uv] override-dependencies`) keeps numpy 2, never installs
+`opencv-python` / `opencv-python-headless` (they clash with
+`opencv-contrib-python`, `cv2.aruco`) nor `xformers` (optional in DA3), and keeps
+`rerun-sdk>=0.30` (MapAnything pins 0.24). `torchaudio` (pulled by MapAnything)
+comes from the same PyTorch index as torch.
 
 ### 1.4 Build and install ASMK
 
@@ -151,6 +182,30 @@ vision:
   mast3r:
     model_name: checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth
 ```
+
+**VGGT-Omega weights** — the Hugging Face repo `facebook/VGGT-Omega` is gated
+(FAIR Noncommercial Research License): request access on
+<https://huggingface.co/facebook/VGGT-Omega>, then log in once in the model's
+environment (`uv run hf auth login`, same `HF_HOME` as the jobs). The
+checkpoint of `vision.vggt_omega.variant` is then downloaded on first use into
+`$HF_HOME` (`Setup_env.sh vggt_omega` does it already):
+
+| `variant` | Checkpoint | Input | Authors' note |
+| --- | --- | --- | --- |
+| `512` (default) | `vggt_omega_1b_512.pt` | 512 | in-the-wild use |
+| `416` | `vggt_omega_1b_416_reproduce.pt` | 416 | reference for benchmarks |
+
+A local file works too: `vision.vggt_omega.checkpoint: checkpoints/vggt_omega_1b_512.pt`.
+
+**Pi3 / DA3 / MapAnything weights** — public Hugging Face repos, downloaded on
+first use into `$HF_HOME` (`Setup_env.sh <model>` already fetches the default
+variant). `checkpoint` may point at a local copy instead.
+
+| `vision.backend` | `variant` -> repo | Licence of the weights |
+| --- | --- | --- |
+| `pi3` | `x` -> `yyfz233/Pi3X` (default), `base` -> `yyfz233/Pi3` | see the repos (code BSD-3-Clause) |
+| `da3` | `nested-giant-large-1.1` (default), `giant-1.1`, `large-1.1` -> `depth-anything/DA3...-1.1` | CC BY-NC 4.0 |
+| `mapanything` | `nc` -> `facebook/map-anything` (default), `apache` -> `facebook/map-anything-apache` | CC BY-NC 4.0 / Apache 2.0 |
 
 **Retrieval checkpoint** — only needed when `vision.mast3r.scene_graph` contains
 `retrieval` (e.g. `retrieval-20-1`). With the default `scene_graph: auto` it is
@@ -287,15 +342,22 @@ git clone https://github.com/jenicek/asmk.git mast3r/asmk
 ### 2.2 Run the setup script
 
 ```bash
-bash Setup_env.sh        # run on the LOGIN node, NOT via sbatch
+bash Setup_env.sh                # = mast3r -> .venv        (run on the LOGIN node, NOT via sbatch)
+bash Setup_env.sh vggt_omega     #          -> .venv-vggt_omega
 ```
 
+Once per model you use (and again after a change of `pyproject.toml`).
 `Setup_env.sh` assumes the repo is exactly at `~/SpectraBreast-Full`. It
-installs `uv` if absent (no `sudo` needed), checks that `mast3r/` and
-`mast3r/asmk/` exist, runs `uv sync --extra processing`, installs the MASt3R and dust3r
-requirements, cythonizes and installs ASMK, then smoke-tests `torch`, CUDA
-visibility and `import spectra`. This one script replaces the manual pip
-commands from §1.3–§1.5.
+installs `uv` if absent (no `sudo` needed) and runs
+`uv sync --extra processing --extra <model>` in the model's environment. For
+`mast3r` it then checks that `mast3r/` and `mast3r/asmk/` exist, installs the
+MASt3R and dust3r requirements, cythonizes and installs ASMK (replacing the
+manual pip commands from §1.3–§1.5); for `vggt_omega` it downloads the
+weights (§1.6; `VGGT_VARIANTS="512 416"` for both). It ends with a smoke test
+of `torch`, CUDA visibility, `import spectra`, the model's packages and
+`cv2.aruco`. Jobs sent with `mufasa.enabled: true` run in the environment of
+`vision.backend` and refuse to start if it is missing; `run_spectra.sh` takes it
+from `BACKEND=<model> sbatch run_spectra.sh`.
 
 
 ### 2.3 MASt3R weights
@@ -362,7 +424,7 @@ DATA/
 Samples are optionally filtered by `registration.batch.sample_regex`, and any
 sample missing its `.hdr`, `surface_mesh.ply` or `aruco_markers_3d.json` is
 skipped (with a printed reason). Mesh and ArUco JSON are read from
-`RESULTS/<dd-mm-yyyy>/<sample>/vision/` for `results_date` (today by default),
+`RESULTS/<dd-mm-yyyy>/<sample>/<model>/vision/` for `results_date` (today by default),
 falling back to the most recent dated run that has both files.
 
 ### 3.3 Pose file format
@@ -485,8 +547,8 @@ checks that the rest can run: SSH login + repo on Mufasa, or a CUDA GPU here.
 | `--no-viz` | off | Acquisition: disable the Rerun viewer |
 | `--dry-run` | off | Print the plan (and the Mufasa run config), run nothing |
 
-**Vision is skipped automatically** when both `RESULTS/<dd-mm-yyyy>/<sample>/vision/surface_mesh.ply`
-and `RESULTS/<dd-mm-yyyy>/<sample>/vision/aruco_markers_3d.json` already exist
+**Vision is skipped automatically** when both `RESULTS/<dd-mm-yyyy>/<sample>/<model>/vision/surface_mesh.ply`
+and `RESULTS/<dd-mm-yyyy>/<sample>/<model>/vision/aruco_markers_3d.json` already exist
 for `results_date` (today by default), unless the acquisition just ran. Use
 `--force-vision` to override. Which stages run at all is also gated by the
 `stages:` list in the YAML — `spectra vision` and `spectra registration` ignore it.
@@ -631,7 +693,7 @@ same layout as here:
 ```
 <repo_dir>/DATA/input_vision/<sample>/          inputs, kept between jobs
 <repo_dir>/DATA/input_registration/<sample>/
-<repo_dir>/RESULTS/<dd-mm-yyyy>/<sample>/
+<repo_dir>/RESULTS/<dd-mm-yyyy>/<sample>/<model>/
     vision/  registration/                      results (all of them stay here)
     _job/    run_config.yaml, job.slurm, slurm-<jobid>.out
 ```
@@ -651,11 +713,11 @@ re-runs: `RESULTS/` on Mufasa is shared between jobs), waits for the job and
 downloads only `mufasa.pull_patterns` of the stages that ran — by default the
 registration Excel reports and the spectral Rerun recording
 (`registration/*.xlsx`, `*.rrd`, `*.rbl`) — into the local
-`RESULTS/<dd-mm-yyyy>/<sample>/` (plus `validation/registration/*` and
+`RESULTS/<dd-mm-yyyy>/<sample>/<model>/` (plus `validation/registration/*` and
 `validation/timing/*`, §9.6). The download is done by a process detached from
 the terminal (`mufasa.detach_pull: true`, needs `ssh_key_path`): closing the
 terminal, or Ctrl-C, stops only the waiting, not the download. Its log is
-`RESULTS/<dd-mm-yyyy>/<sample>/_job/pull_<jobid>.log`; it retries for an hour
+`RESULTS/<dd-mm-yyyy>/<sample>/<model>/_job/pull_<jobid>.log`; it retries for an hour
 if the connection drops. In `spectra full`, without the HSI cube
 (here or on Mufasa) only Vision runs. CLI overrides (`--sample`, `--date`,
 `--mode`, `--set`) travel with the job. Paths set by hand in the YAML
@@ -686,7 +748,7 @@ at `mufasa.repo_dir` with `Setup_env.sh` done. The QOS allow one job at a time
 The marker edge length is set only in `configs/default.yaml`
 (`vision.aruco.marker_edge_length_mm`; any other config or `--set` that sets it
 is rejected). Each submitted run carries its own copy of the local config,
-`RESULTS/<dd-mm-yyyy>/<sample>/_job/run_config.yaml` on Mufasa (without the
+`RESULTS/<dd-mm-yyyy>/<sample>/<model>/_job/run_config.yaml` on Mufasa (without the
 `acquisition:`, `calibration:` and `mufasa:` sections, so the job never submits
 again, and with `results_date` pinned to the submission day), and the job points
 `SPECTRA_DEFAULT_CONFIG` at it: for that run it is the default config, so the
@@ -781,53 +843,65 @@ aren't needed — a full run's `RESULTS/` can be several GB.
 
 ## 7. Outputs
 
-Everything goes under `RESULTS/<dd-mm-yyyy>/<sample>/`, one subfolder per
-stage. The date folder is the run day (or `results_date` when set); re-running
-the same stage on the same day overwrites it.
+Everything goes under `RESULTS/<dd-mm-yyyy>/<sample>/<model>/`, one subfolder per
+stage. `<model>` is the reconstruction model, `vision.backend` plus its variant
+(`mast3r-sfm`, `mast3r-dense`, ...): two models run on the same sample on the
+same day never overwrite each other, and registration / validation use the
+vision run of the model set in the config. The date folder is the run day (or
+`results_date` when set); re-running the same stage with the same model on the
+same day overwrites it.
+
+The model is chosen with `vision.backend` (default `mast3r`); each model has
+its own section in the config (`vision.mast3r`, ...) with all its parameters,
+so switching model means changing only that key. Results saved before the
+model level existed (`RESULTS/<dd-mm-yyyy>/<sample>/vision/`, ...) are moved
+into it by `python scripts/migrate_results_layout.py` (dry run; `--apply` to
+move; `--model mast3r-sfm` for folders whose model cannot be read).
 
 ```
 RESULTS/
 └── <dd-mm-yyyy>/
-    ├── _batch/batch_summary.xlsx               aggregate Excel (batch mode only)
+    ├── _batch/<model>/batch_summary.xlsx         aggregate Excel (batch mode only)
     └── SB021/
-        ├── vision/
-        │   ├── surface_mesh.ply                    ← consumed by Registration
-        │   ├── aruco_markers_3d.json               ← consumed by Registration
-        │   ├── cloud.ply                           fused RGB point cloud (CloudCompare)
-        │   ├── cloud.npz                            points / colors / confidence
-        │   ├── surface.ply                         surface point cloud, with normals
-        │   ├── surface.npz                         surface arrays
-        │   ├── camera_poses_output_frame.npy       [V,4,4] camera poses, output frame
-        │   ├── intrinsics_original_frame.npy       [V,3,3] K at original resolution
-        │   ├── intrinsics_network_frame.npy        [V,3,3] K at network resolution
-        │   ├── sim3_to_output_frame.npy            4×4 Sim(3), backend → output frame
-        │   ├── aruco_bundle_adjustment.json        per-marker/per-view reproj RMSE (if BA on)
-        │   ├── reconstruction_metadata.json        run summary — read this first
-        │   ├── timings.json                        per-phase wall-clock
-        │   ├── run.yaml / run.json                 fully resolved config for this run
-        │   ├── aruco_detections/
-        │   │   ├── json/                           per-image 2D detections
-        │   │   └── annotated/                      images with markers drawn
-        │   └── rerun/
-        │       └── spectra.rrd                     Rerun recording (if rerun.save_rrd)
-        │
-        ├── registration/
-        │   ├── spectral_pointcloud_SB021.ply             spectral cloud (export.ply)
-        │   ├── spectral_pointcloud_SB021_xyz.bin         float32 memmap, (N,3)
-        │   ├── spectral_pointcloud_SB021_spectra.bin     float32 memmap, (N,bands)
-        │   ├── spectral_pointcloud_SB021_wavelengths.npy wavelengths in nm
-        │   ├── spectral_pointcloud_SB021_meta.npy        int64 [N,3,N,bands] — memmap shapes
-        │   ├── spectral.rrd                              Rerun: band + PCA views (if rerun.enabled)
-        │   ├── spectral.rbl                              Rerun layout (if rerun.save_rbl)
-        │   ├── SB021_registration_errors.xlsx            2D/3D errors + Timings sheet
-        │   ├── SB021_registration.png                    HSI + render overlay with ArUco
-        │   ├── SB021_coverage.png                        HSI → mesh coverage map
-        │   ├── SB021_render_pc_topview.png               orthographic top-view render
-        │   ├── SB021_render_pc_depth.npy                 depth map for that render
-        │   └── SB021_render_pc_turbo.png                 TURBO-colormapped depth
-        │
-        └── .mast3r_sfm_cache/                      intermediate SfM cache, safe to delete
-                                                    (removed automatically when vision.output.clean_sfm_cache: true)
+        └── mast3r-sfm/                         <model>: vision.backend + variant, one folder per model
+            ├── vision/
+            │   ├── surface_mesh.ply                    ← consumed by Registration
+            │   ├── aruco_markers_3d.json               ← consumed by Registration
+            │   ├── cloud.ply                           fused RGB point cloud (CloudCompare)
+            │   ├── cloud.npz                            points / colors / confidence
+            │   ├── surface.ply                         surface point cloud, with normals
+            │   ├── surface.npz                         surface arrays
+            │   ├── camera_poses_output_frame.npy       [V,4,4] camera poses, output frame
+            │   ├── intrinsics_original_frame.npy       [V,3,3] K at original resolution
+            │   ├── intrinsics_network_frame.npy        [V,3,3] K at network resolution
+            │   ├── sim3_to_output_frame.npy            4×4 Sim(3), backend → output frame
+            │   ├── aruco_bundle_adjustment.json        per-marker/per-view reproj RMSE (if BA on)
+            │   ├── reconstruction_metadata.json        run summary — read this first
+            │   ├── timings.json                        per-phase wall-clock
+            │   ├── run.yaml / run.json                 fully resolved config for this run
+            │   ├── aruco_detections/
+            │   │   ├── json/                           per-image 2D detections
+            │   │   └── annotated/                      images with markers drawn
+            │   └── rerun/
+            │       └── spectra.rrd                     Rerun recording (if rerun.save_rrd)
+            │
+            ├── registration/
+            │   ├── spectral_pointcloud_SB021.ply             spectral cloud (export.ply)
+            │   ├── spectral_pointcloud_SB021_xyz.bin         float32 memmap, (N,3)
+            │   ├── spectral_pointcloud_SB021_spectra.bin     float32 memmap, (N,bands)
+            │   ├── spectral_pointcloud_SB021_wavelengths.npy wavelengths in nm
+            │   ├── spectral_pointcloud_SB021_meta.npy        int64 [N,3,N,bands] — memmap shapes
+            │   ├── spectral.rrd                              Rerun: band + PCA views (if rerun.enabled)
+            │   ├── spectral.rbl                              Rerun layout (if rerun.save_rbl)
+            │   ├── SB021_registration_errors.xlsx            2D/3D errors + Timings sheet
+            │   ├── SB021_registration.png                    HSI + render overlay with ArUco
+            │   ├── SB021_coverage.png                        HSI → mesh coverage map
+            │   ├── SB021_render_pc_topview.png               orthographic top-view render
+            │   ├── SB021_render_pc_depth.npy                 depth map for that render
+            │   └── SB021_render_pc_turbo.png                 TURBO-colormapped depth
+            │
+            └── .mast3r_sfm_cache/                      intermediate SfM cache, safe to delete
+                                                        (removed automatically when vision.output.clean_sfm_cache: true)
 ```
 
 ### 7.1 Output frame
@@ -890,6 +964,38 @@ records it; the crops MASt3R saw are in `<run>/inputs_mast3r_zoom/`. Above 2.5
 (1280-px images) the window is only upsampled. Note that `mast3r.voxel_size`
 is in the units of the cloud it is applied to: metres after bundle adjustment
 or with `dense` (1.2 mm with 0.0012), which can throw away the detail gained.
+
+### 7.4 Reconstruction models (`vision.backend`)
+
+The model is a back-end (`spectra/vision/backends/<model>_backend.py`, listed in
+`backends/registry.py`) with its own config section; everything before it
+(EXIF, undistortion, ArUco detection) and after it (ArUco Sim3/BA, view
+rejection, surface, outputs, registration, validation) is the same for every
+model. `reconstruction_metadata.json` records `model`, `variant`,
+`metric_frame` and, in `alignment_info`, the back-end's own details and its
+peak GPU memory (`backend_peak_vram_gb`, also in the validation summary).
+
+| | `mast3r` | `vggt_omega` | `pi3` | `da3` | `mapanything` |
+| --- | --- | --- | --- | --- | --- |
+| Method | pairwise + global alignment | feed-forward | feed-forward | feed-forward | feed-forward |
+| Variants (folder name) | `sfm`, `dense` | `512`, `416` | `x`, `base` | `nested-giant-large-1.1`, `giant-1.1`, `large-1.1` | `nc`, `apache` |
+| Calibrated K / robot poses in input | `dense` | no | `conditioning`: `k`, `kpose` (Pi3X) | `conditioning`: `kpose` | `conditioning`: `k`, `kpose` |
+| Input resize | 512 long side | ~512² px, x16 | ~255k px, x14 | 504 long side, x14 | 518x392 (4:3) |
+| Points kept | conf threshold | conf percentile 20 + edges | sigmoid(conf) > 0.1 + edges | conf percentile 40 + edges | model mask (+ edges) |
+| Fusion voxel | `voxel_size` (cloud units) | `voxel_size_rel` x median depth | idem | idem | idem |
+
+Metric scale: always from the ArUco markers except `mast3r` `dense`; the
+models' own scale (approximately metric for Pi3X, DA3 nested, MapAnything; the
+robot's with `kpose`) shows in `aruco_markers_3d.json` → `scale_input_to_meters`
+(1 = already metric). With `conditioning` (`k` / `kpose`) the calibrated K is
+also the K of the output.
+
+Feed-forward models: the input zoom follows the same rule as `mast3r.zoom`;
+their cameras have the principal point at the image centre, so with the
+calibrated K the input window is centred on the calibrated principal point
+(`center_principal_point`) and cropped to the network aspect ratio (square
+pixels); their scale is arbitrary, hence the relative voxel; each model's
+resize and point filter follow its authors' code.
 
 ---
 
@@ -1071,7 +1177,7 @@ distance and elevation (mean / min / max), azimuth coverage.
 ### 9.4 Outputs
 
 ```
-RESULTS/<dd-mm-yyyy>/<sample>/validation/vision/
+RESULTS/<dd-mm-yyyy>/<sample>/<model>/validation/vision/
 ├── metrics.json      every number above + the vision run used
 ├── metrics.xlsx      the same, readable: Summary (case + metrics per alignment + checks),
 │                     Bersagli, Error vs height, Views, Markers, Warnings
@@ -1114,7 +1220,7 @@ The markers lie at z = 0: the error above the marker plane (parallax of the
 HSI camera) is not measured here.
 
 ```
-RESULTS/<dd-mm-yyyy>/<sample>/validation/registration/
+RESULTS/<dd-mm-yyyy>/<sample>/<model>/validation/registration/
 ├── metrics.json      TRE / FRE summaries, per marker, per corner, checks
 └── overlay.png       detected corners (green) vs hold-out predictions (red)
 RESULTS/_validation/registration_summary.xlsx (+ .json)
@@ -1128,7 +1234,7 @@ reports (`<sample>_registration_errors.xlsx`,
 ### 9.6 Timing
 
 Every `spectra full` (and every job sent to Mufasa) records how long each phase
-and sub-phase took, in `RESULTS/<dd-mm-yyyy>/<sample>/validation/timing/`:
+and sub-phase took, in `RESULTS/<dd-mm-yyyy>/<sample>/<model>/validation/timing/`:
 
 | Phase | Sub-phases | Where |
 | --- | --- | --- |
